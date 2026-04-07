@@ -1,6 +1,37 @@
 # SDD: Known Limitations — Implementation Paths
 
-> Three technical debts to resolve. Each has a clear fix.
+> Gaps to close for production use and Flamecast integration.
+
+## Integration Shape
+
+durable-acp-rs plugs into Flamecast transparently as the conductor layer:
+
+```
+Flamecast SessionService.startSession()
+  → runtime provider spawns:
+      sacp-conductor agent \
+        "durable-state-proxy --stream-url ..." \
+        "peer-mcp-proxy" \
+        "npx claude-agent-acp"
+  → AcpBridge connects via stdio (unchanged — sees standard ACP agent)
+  → DurableStateProxy persists all ACP traffic to durable stream
+  → PeerMcpProxy injects agent-to-agent tools
+
+Flamecast reads state from durable stream (replaces FlamecastStorage):
+  GET /streams/durable-acp-state          → full state replay
+  GET /streams/durable-acp-state?live=sse → real-time subscription
+  REST API /api/v1/connections            → session list
+  REST API /api/v1/prompt-turns/{id}/*    → chunks, SSE streaming
+
+What Flamecast cuts:
+  FlamecastStorage (PGLite/Postgres) → durable stream + StreamDB
+  Event bus                          → StreamDb::subscribe_changes()
+  Session metadata tables            → ConnectionRow + PromptTurnRow in stream
+  Permission brokering logic         → DurableStateProxy intercepts
+  (gains) Agent-to-agent messaging   → PeerMcpProxy (free, automatic)
+```
+
+The gaps below are what's needed to make this integration complete.
 
 ## 1. In-Memory Storage
 
