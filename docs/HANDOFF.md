@@ -147,11 +147,17 @@ client transport → conductor queue → proxy chain (correct path). See
 trait-based API that the v1 RFD explicitly replaces. Should use
 `sacp::Client.builder().connect_with()` like `dashboard.rs` already does.
 
-**1d. Evaluate `agent_router.rs` against conductor config pattern**
+**1d. Move to subprocess-per-agent, eliminate `AgentRouter`**
+
+The in-process multi-agent model (N `ConductorImpl` on one `LocalSet`)
+was a premature optimization that adds significant complexity:
+- Custom `AgentRouter` with channels + oneshot + bridge tasks
+- `TuiState` with `Arc<Mutex>` for cross-task sharing
+- `LocalSet` + tick timer to interleave conductors with iocraft
+- 794 lines in `dashboard.rs` that should be ~200
 
 The [cookbook](https://github.com/agentclientprotocol/rust-sdk/blob/main/src/agent-client-protocol-cookbook/src/lib.rs#L783-L855)
-shows the paved road: proxies as standalone binaries, chained via
-`agent-client-protocol-conductor --config conductor.json`:
+shows the paved road: each agent = a conductor subprocess:
 
 ```json
 {
@@ -163,19 +169,16 @@ shows the paved road: proxies as standalone binaries, chained via
 }
 ```
 
-In this model, `AgentRouter` is unnecessary — each proxy runs as a
-subprocess, peering goes through HTTP, and the conductor handles routing.
+**Target architecture:**
+- Package `DurableStateProxy` as standalone proxy binary
+- Package `PeerMcpProxy` as standalone proxy binary
+- Each agent runs as a conductor subprocess (standard pattern)
+- Dashboard = thin TUI over REST API + SSE (no in-process wiring)
+- Peering = HTTP (already works via `PeerMcpProxy` fallback)
+- Delete `AgentRouter`, `TuiState` mutex, `LocalSet` wiring
 
-Our in-process model (dashboard) uses `AgentRouter` as a performance
-optimization (~0ms vs ~0.1ms loopback HTTP). Two paths forward:
-
-- **Standard mode**: Package proxies as standalone binaries, use conductor
-  config. No `AgentRouter`. Peering via HTTP. Composable, ecosystem-native.
-- **Performance mode**: Keep programmatic `ConductorImpl` + `AgentRouter`
-  for the dashboard's in-process multi-agent case.
-
-Both should be supported. The `AgentRouter` stays for in-process, but the
-standalone proxy binaries unlock the standard conductor config workflow.
+The ~0.1ms HTTP loopback overhead is noise vs seconds of LLM inference.
+The architectural simplicity and composability are worth it.
 
 **1e. Remove manual JSON deserialization workaround**
 
