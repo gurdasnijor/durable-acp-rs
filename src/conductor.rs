@@ -231,7 +231,7 @@ impl ConnectTo<Conductor> for DurableStateProxy {
     }
 }
 
-fn drive_queue(app: Arc<AppState>, cx: sacp::ConnectionTo<Conductor>) -> Result<(), sacp::Error> {
+pub fn drive_queue(app: Arc<AppState>, cx: sacp::ConnectionTo<Conductor>) -> Result<(), sacp::Error> {
     cx.clone().spawn(async move {
         loop {
             let Some(queued) = app.take_next_prompt().await else {

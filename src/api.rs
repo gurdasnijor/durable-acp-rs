@@ -11,6 +11,7 @@ use futures::stream::Stream;
 use sacp::Agent;
 use serde::{Deserialize, Serialize};
 
+
 use crate::app::AppState;
 use crate::state::{ChunkRow, CollectionChange, ConnectionRow, PromptTurnRow, PromptTurnState};
 
@@ -93,14 +94,72 @@ async fn submit_prompt(
         return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
     };
 
-    // Pre-generate the prompt_turn_id so we can return it immediately
+    // Pre-generate the prompt_turn_id and record the prompt turn before sending.
+    // The proxy's notification handler will record chunks as the agent streams.
     let prompt_turn_id = uuid::Uuid::new_v4().to_string();
-    app.set_next_prompt_turn_id(prompt_turn_id.clone()).await;
+    let request = PromptRequest::new(body.session_id.clone(), vec![ContentBlock::from(body.text)]);
 
-    let request = PromptRequest::new(body.session_id, vec![ContentBlock::from(body.text)]);
-    tokio::spawn(async move {
-        let _ = cx.send_request_to(Agent, request).block_task().await;
-    });
+    // Record the prompt turn in state (same as enqueue_prompt does)
+    let turn = crate::state::PromptTurnRow {
+        prompt_turn_id: prompt_turn_id.clone(),
+        logical_connection_id: app.logical_connection_id.clone(),
+        session_id: body.session_id.clone(),
+        request_id: prompt_turn_id.clone(),
+        text: request.prompt.first().and_then(|b| {
+            if let ContentBlock::Text(t) = b { Some(t.text.clone()) } else { None }
+        }),
+        state: PromptTurnState::Active,
+        position: None,
+        stop_reason: None,
+        started_at: crate::app::now_ms(),
+        completed_at: None,
+    };
+    app.write_state_event("prompt_turn", "insert", &prompt_turn_id, Some(&turn))
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Map session → prompt_turn so the notification handler records chunks
+    app.session_to_prompt_turn
+        .write()
+        .await
+        .insert(body.session_id, prompt_turn_id.clone());
+
+    // Send to the agent. Response notifications flow back through the proxy
+    // chain and get recorded as chunks by the DurableStateProxy.
+    let app2 = app.clone();
+    let turn_id = prompt_turn_id.clone();
+    cx.clone().spawn(async move {
+        let result = cx.send_request_to(Agent, request).block_task().await;
+        match &result {
+            Ok(response) => {
+                let _ = app2
+                    .record_chunk(
+                        &turn_id,
+                        crate::state::ChunkType::Stop,
+                        serde_json::json!({ "stopReason": response.stop_reason }).to_string(),
+                    )
+                    .await;
+                let _ = app2
+                    .finish_prompt_turn(
+                        &turn_id,
+                        format!("{:?}", response.stop_reason).to_lowercase(),
+                        PromptTurnState::Completed,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                let _ = app2
+                    .record_chunk(&turn_id, crate::state::ChunkType::Error, error.to_string())
+                    .await;
+                let _ = app2
+                    .finish_prompt_turn(&turn_id, error.to_string(), PromptTurnState::Broken)
+                    .await;
+            }
+        }
+        Ok(())
+    })
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
     Ok(Json(PromptAccepted {
         queued: true,
         prompt_turn_id,
