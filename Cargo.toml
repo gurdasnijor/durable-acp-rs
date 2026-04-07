@@ -56,3 +56,7 @@ path = "src/bin/install.rs"
 [[bin]]
 name = "agents"
 path = "src/bin/agents.rs"
+
+[[bin]]
+name = "dashboard"
+path = "src/bin/dashboard.rs"
