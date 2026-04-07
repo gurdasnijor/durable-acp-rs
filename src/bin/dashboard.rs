@@ -178,15 +178,13 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
     let mut selected_agent = hooks.use_state(|| 0usize);
     let mut input_buf = hooks.use_state(|| String::new());
     let mut should_exit = hooks.use_state(|| false);
-    let mut input_focused = hooks.use_state(|| true);
 
     let agent_count = props.agent_names.len();
     let dash = props.dash.clone();
 
     hooks.use_terminal_events(move |event| match event {
         TerminalEvent::Key(KeyEvent { code, kind, .. }) if kind != KeyEventKind::Release => {
-            if input_focused.get() {
-                match code {
+            match code {
                     KeyCode::Enter => {
                         let text = input_buf.to_string();
                         if !text.is_empty() {
@@ -223,7 +221,6 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                     KeyCode::Esc => should_exit.set(true),
                     _ => {}
                 }
-            }
         }
         _ => {}
     });
@@ -317,14 +314,9 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
             }
 
             // Input bar
-            View(border_style: BorderStyle::Round, border_color: if input_focused.get() { active } else { border }, margin_top: 1) {
+            View(border_style: BorderStyle::Round, border_color: active, margin_top: 1) {
                 View(padding_left: 1, width: 100pct) {
-                    Text(content: format!("[{}] > ", selected_name), color: active)
-                    TextInput(
-                        has_focus: input_focused.get(),
-                        value: input_buf.to_string(),
-                        on_change: move |v| input_buf.set(v),
-                    )
+                    Text(content: format!("[{}] > {}_", selected_name, input_buf.to_string()), color: active)
                 }
             }
         }
