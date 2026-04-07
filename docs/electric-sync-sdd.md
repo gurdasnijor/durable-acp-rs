@@ -1,334 +1,189 @@
-# SDD: Electric Sync — DS Stream → Postgres → Electric → Clients
+# SDD: Client Integration — StreamDB + Durable Sessions
 
-> Replaces W6 (file storage), W7/W7a/W7b/W7c (event subscribers) with
-> infrastructure that already exists in `durable-streams-server`.
+> Replaces W6/W7 with the native durable streams client stack that
+> already exists in `distributed-acp`.
 
-## The Idea
+## The Realization
 
-The DS server is the source of truth. Everything else is derived:
+The integration layer is **already built**. The `@durable-acp/state` and
+`@durable-acp/client` packages in `~/gurdasnijor/distributed-acp/` provide
+exactly what we need:
 
 ```
-DurableStateProxy                DS Server              Sync Service           Postgres              Electric SQL           Clients
-─────────────────                ─────────              ────────────           ────────              ────────────           ───────
-intercepts ACP ──POST──► append-only stream
-                                   │
-                              SSE broadcast ──────► subscribes via SSE
-                                   │                     │
-                              direct SSE clients    INSERT into session_events
-                              (dashboard TUI,            │
-                               peer agents)         Postgres stores
-                                                    (durable, queryable)
-                                                         │
-                                                    WAL replication ──► Shape API
-                                                                           │
-                                                                      ShapeStream ──► DurableACPClient (TS)
-                                                                                      Flamecast React hooks
-                                                                                      
-                                                    pg_notify trigger ──► Webhook worker ──► HTTP POST
-                                                    SQL queries ──► Analytics, Grafana
+durable-acp-rs (Rust)                @durable-acp/state (TypeScript)
+─────────────────────                ────────────────────────────────
+DurableStateProxy                    createDurableACPDB({ stateStreamUrl })
+  writes STATE-PROTOCOL events         subscribes to same stream via SSE
+  to DS server                         materializes into TanStack DB collections
+                                       reactive queries via useLiveQuery
+
+Same stream. Same protocol. Same schema.
 ```
 
-## What It Delivers
+## What Already Exists
 
-| SDD Workstream | Custom Rust Code | With Electric Sync |
-|---|---|---|
-| W6: File-backed storage | `FileStorage` impl (~100 lines) | Postgres via sync service (0 Rust lines) |
-| W7: EventSubscriber trait | Trait + manager (~100 lines) | Not needed — Electric IS the subscriber |
-| W7a: WebSocket subscriber | `WsSubscriber` (~200 lines) | Electric Shape API (HTTP streaming) |
-| W7b: Webhooks | `WebhookSubscriber` (~100 lines) | Postgres trigger + `pg_notify` + tiny worker |
-| W7c: Generalized SSE | Custom axum SSE (~50 lines) | DS server SSE already works + Electric |
-| **Total** | **~550 lines custom Rust** | **~200 lines sync service + webhook worker** |
+### `@durable-acp/state` (`distributed-acp/packages/durable-acp-state/`)
 
-Plus we get for free:
-- SQL queries over all session data
-- Grafana dashboards
-- Postgres full-text search over chunks
-- Analytics (prompt count, token usage, agent performance)
-- Backup/restore via pg_dump
-
-## Components
-
-### 1. DS Server (already running)
-
-No changes. The embedded `durable-streams-server` already:
-- Accepts POST (append to stream)
-- Serves GET (read from offset)
-- Streams SSE (`?live=sse&offset=N`)
-- Handles producer idempotency
-
-### 2. Sync Service (reference impl exists)
-
-The [durable-streams-server repo](https://thesampaton.github.io/durable-streams-rust-server/architecture/sync.html)
-provides a reference sync service (`e2e/sync/sync.mjs`) that does exactly
-this: subscribes to a DS stream via SSE, parses events, INSERTs into
-Postgres. We deploy it, not write it.
-
-Configuration only — point it at our DS stream URL and Postgres:
-
-```bash
-DS_STREAM_URL=http://localhost:4437/streams/durable-acp-state
-DATABASE_URL=postgresql://localhost/durable_acp
-```
-
-The sync service handles SSE parsing, offset tracking, reconnection,
-and Postgres insertion. Zero custom code needed.
-
-### 3. Postgres Schema
-
-```sql
--- All STATE-PROTOCOL events land here
-CREATE TABLE session_events (
-  id BIGSERIAL PRIMARY KEY,
-  stream_name TEXT NOT NULL,
-  event_type TEXT NOT NULL,        -- "connection", "prompt_turn", "chunk", "permission", "terminal"
-  event_key TEXT NOT NULL,         -- logical_connection_id, prompt_turn_id, chunk_id, etc.
-  operation TEXT NOT NULL,         -- "insert", "update", "delete"
-  payload JSONB NOT NULL,          -- the full value object
-  ds_offset TEXT,                  -- DS stream offset for resumption
-  received_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Indexes for common queries
-CREATE INDEX idx_session_events_type ON session_events(event_type);
-CREATE INDEX idx_session_events_key ON session_events(event_key);
-CREATE INDEX idx_session_events_type_key ON session_events(event_type, event_key);
-
--- Materialized views for fast access (optional)
-CREATE VIEW connections AS
-  SELECT DISTINCT ON (event_key)
-    event_key as logical_connection_id,
-    payload
-  FROM session_events
-  WHERE event_type = 'connection'
-  ORDER BY event_key, id DESC;
-
-CREATE VIEW latest_chunks AS
-  SELECT event_key as chunk_id,
-    payload->>'promptTurnId' as prompt_turn_id,
-    payload->>'type' as chunk_type,
-    payload->>'content' as content,
-    (payload->>'seq')::int as seq
-  FROM session_events
-  WHERE event_type = 'chunk'
-  ORDER BY (payload->>'seq')::int;
-
--- Webhook registration
-CREATE TABLE webhooks (
-  id SERIAL PRIMARY KEY,
-  url TEXT NOT NULL,
-  secret TEXT,
-  event_types TEXT[] DEFAULT '{}',
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Webhook trigger
-CREATE OR REPLACE FUNCTION notify_webhook() RETURNS TRIGGER AS $$
-BEGIN
-  PERFORM pg_notify('webhook_events', row_to_json(NEW)::text);
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER session_event_webhook
-  AFTER INSERT ON session_events
-  FOR EACH ROW EXECUTE FUNCTION notify_webhook();
-```
-
-### 4. Electric SQL
-
-Reads the Postgres WAL, exposes Shape API:
-
-```bash
-# Docker compose
-electric:
-  image: electricsql/electric
-  environment:
-    DATABASE_URL: postgresql://...
-  ports:
-    - "3000:3000"
-```
-
-TypeScript clients subscribe to shapes:
+Schema + StreamDB factory:
 
 ```typescript
-import { ShapeStream } from "@electric-sql/client";
-
-// All chunks for a specific prompt turn
-const chunks = new ShapeStream({
-  url: `${electricUrl}/v1/shape`,
-  params: {
-    table: "session_events",
-    where: `event_type = 'chunk' AND event_key LIKE 'turn-abc%'`
-  }
+// Schema maps STATE-PROTOCOL entity types to Zod validators
+const durableACPState = createStateSchema({
+  connections:     { type: "connection",      primaryKey: "logicalConnectionId", schema: z.object({...}) },
+  promptTurns:     { type: "prompt_turn",     primaryKey: "promptTurnId",        schema: z.object({...}) },
+  chunks:          { type: "chunk",           primaryKey: "chunkId",             schema: z.object({...}) },
+  permissions:     { type: "permission",      primaryKey: "requestId",           schema: z.object({...}) },
+  terminals:       { type: "terminal",        primaryKey: "terminalId",          schema: z.object({...}) },
+  pendingRequests: { type: "pending_request", primaryKey: "requestId",           schema: z.object({...}) },
+  runtimeInstances:{ type: "runtime_instance",primaryKey: "instanceId",          schema: z.object({...}) },
 });
 
-chunks.subscribe((messages) => {
-  for (const msg of messages) {
-    if (msg.headers.operation === "insert") {
-      console.log("New chunk:", msg.value.payload.content);
-    }
-  }
+// StreamDB factory — connects to DS stream, materializes state
+const db = createDurableACPDB({
+  stateStreamUrl: "http://localhost:4437/streams/durable-acp-state"
 });
+await db.preload();
+
+// Typed reactive collections (TanStack DB)
+db.collections.connections     // Collection<ConnectionRow>
+db.collections.promptTurns     // Collection<PromptTurnRow>
+db.collections.chunks          // Collection<ChunkRow>
+db.collections.permissions     // Collection<PermissionRow>
 ```
 
-### 5. Webhook Worker (~50 lines)
+Derived collections:
+- `createQueuedTurnsCollection({ promptTurns })` — state === "queued"
+- `createActiveTurnsCollection({ promptTurns })` — state === "active"
+- `createPendingPermissionsCollection({ permissions })` — state === "pending"
 
-Listens to `pg_notify`, POSTs to registered URLs:
+### `@durable-acp/client` (`distributed-acp/packages/durable-acp-client/`)
 
-```javascript
-// webhook-worker.mjs
-const pg = new Client(process.env.DATABASE_URL);
-await pg.connect();
-await pg.query("LISTEN webhook_events");
-
-const webhooks = await pg.query("SELECT * FROM webhooks");
-
-pg.on("notification", async (msg) => {
-  const event = JSON.parse(msg.payload);
-  
-  for (const webhook of webhooks.rows) {
-    if (webhook.event_types.length === 0 || 
-        webhook.event_types.includes(event.event_type)) {
-      const body = JSON.stringify(event.payload);
-      const sig = hmac(webhook.secret, body);
-      await fetch(webhook.url, {
-        method: "POST",
-        headers: { 
-          "Content-Type": "application/json",
-          "X-Webhook-Signature": sig 
-        },
-        body
-      });
-    }
-  }
-});
-```
-
-### 6. TypeScript Client (DurableACPClient)
+High-level client wrapping StreamDB:
 
 ```typescript
-import { ShapeStream } from "@electric-sql/client";
+const client = new DurableACPClient({
+  stateStreamUrl: "http://localhost:4437/streams/durable-acp-state",
+  serverUrl: "http://localhost:4438",
+  connectionId: "..."
+});
 
-class DurableACPClient {
-  private electricUrl: string;
-  private dsUrl: string;
+// Reactive collections (auto-sync from stream)
+client.connections
+client.promptTurns
+client.chunks
+client.queuedTurns        // derived
+client.activeTurns        // derived
+client.pendingPermissions // derived
 
-  // Reactive collections via Electric shapes
-  connections = new ShapeStream({
-    url: `${this.electricUrl}/v1/shape`,
-    params: { table: "session_events", where: "event_type = 'connection'" }
-  });
+// Commands (POST to REST API)
+await client.prompt("hello")
+await client.cancel()
+await client.pause()
+await client.resume()
+await client.resolvePermission(requestId, optionId)
 
-  promptTurns = new ShapeStream({
-    url: `${this.electricUrl}/v1/shape`,
-    params: { table: "session_events", where: "event_type = 'prompt_turn'" }
-  });
+// Subscriptions
+client.subscribePromptTurns(callback)
+client.subscribeChunks(callback)
+```
 
-  chunks = new ShapeStream({
-    url: `${this.electricUrl}/v1/shape`,
-    params: { table: "session_events", where: "event_type = 'chunk'" }
-  });
+## What This Means
 
-  permissions = new ShapeStream({
-    url: `${this.electricUrl}/v1/shape`,
-    params: { table: "session_events", where: "event_type = 'permission'" }
-  });
+### No custom subscriber system needed
 
-  // Commands go through DS server REST API
-  async prompt(text: string) {
-    await fetch(`${this.dsUrl}/api/v1/connections/${this.connId}/prompt`, {
-      method: "POST",
-      body: JSON.stringify({ sessionId: this.sessionId, text })
-    });
+The StreamDB client subscribes to the DS stream via SSE, parses
+STATE-PROTOCOL events, and materializes them into reactive TanStack DB
+collections. This IS the subscriber — `StreamDb::subscribe_changes()`
+on the TypeScript side. We don't need to build W7 (EventSubscriber trait),
+W7a (WebSocket subscriber), or W7c (generalized SSE) for the TypeScript
+read path.
+
+### No file-backed storage needed for the client path
+
+StreamDB materializes state in-memory on the client side from the stream.
+The DS server is the source of truth. File-backed storage (W6) is still
+useful for the Rust side (survive restarts), but the TypeScript client
+doesn't need Postgres or files — it replays from the stream on connect.
+
+### Flamecast integration is straightforward
+
+```typescript
+// Before: Flamecast uses FlamecastStorage (PGLite/Postgres)
+class PgLiteStorage implements FlamecastStorage {
+  async listAllSessions() { return db.select().from(sessions); }
+}
+
+// After: Flamecast uses DurableACPClient
+class DurableACPStorage implements FlamecastStorage {
+  constructor(private client: DurableACPClient) {}
+  async listAllSessions() {
+    return this.client.connections.map(toSessionMeta);
   }
-
-  async cancel() { /* POST to DS API */ }
-  async pause() { /* POST to DS API */ }
-  async resolvePermission(id: string, optionId: string) { /* POST to DS API */ }
 }
 ```
 
-## How It Integrates with Flamecast
+The event bus becomes `client.subscribePromptTurns()`.
+React hooks become `useLiveQuery` from TanStack DB.
 
-```
-Flamecast React UI
-  → DurableACPClient (uses Electric ShapeStream)
-    → Reactive collections auto-update on every agent response
-    → No custom WebSocket, no event bus, no polling
+## What We Still Need
 
-Flamecast cuts:
-  FlamecastStorage (PGLite)  → Postgres (via sync service)
-  Event bus                  → Electric ShapeStream
-  Custom WS protocol         → Electric Shape API (HTTP)
-  Session metadata tables    → session_events table (one table, all state)
-
-Flamecast keeps:
-  AcpBridge (connects to conductor subprocess)
-  React UI (rewire hooks to DurableACPClient)
-  Runtime providers (spawn conductor with proxies)
-```
-
-## What We Still Build in Rust
-
-The durable-acp-rs codebase still owns:
-- `DurableStateProxy` — intercepts ACP, writes to DS stream
-- `PeerMcpProxy` — agent-to-agent MCP tools
-- `AppState` + `StreamDB` — in-memory materialization for the REST API
-- REST API — prompt submission, queue management, registry
-- Dashboard TUI — reads from REST API + SSE (direct from DS server)
-
-We do NOT build:
-- File-backed storage (Postgres handles durability)
-- WebSocket subscriber (Electric handles reactive sync)
-- Webhook subscriber (Postgres trigger handles it)
-- Custom SSE generalization (DS server SSE + Electric)
-
-## Docker Compose (dev stack)
-
-```yaml
-services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: durable_acp
-      POSTGRES_PASSWORD: secret
-    command: ["postgres", "-c", "wal_level=logical"]
-    ports: ["5432:5432"]
-
-  electric:
-    image: electricsql/electric
-    environment:
-      DATABASE_URL: postgresql://postgres:secret@postgres/durable_acp
-    ports: ["3000:3000"]
-    depends_on: [postgres]
-
-  sync-service:
-    build: ./sync-service
-    environment:
-      DS_STREAM_URL: http://host.docker.internal:4437/streams/durable-acp-state
-      DATABASE_URL: postgresql://postgres:secret@postgres/durable_acp
-    depends_on: [postgres]
-
-  webhook-worker:
-    build: ./webhook-worker
-    environment:
-      DATABASE_URL: postgresql://postgres:secret@postgres/durable_acp
-    depends_on: [postgres]
-```
-
-## Effort
-
-| Component | New Code | Effort |
+| Need | Solution | Effort |
 |---|---|---|
-| Postgres schema (SQL) | ~40 lines | 0.5 day |
-| Sync service | 0 lines (deploy reference impl) | config only |
-| Webhook worker (JS) | ~50 lines | 0.5 day |
-| Docker compose | ~30 lines | included |
-| DurableACPClient (TS) with Electric | ~100 lines | 1 day |
-| **Total** | **~220 lines** | **~2 days** |
+| Verify schema compat | Compare Rust `state.rs` types with TS `schema.ts` Zod schemas | 0.5 day |
+| Publish `@durable-acp/state` | npm publish from `distributed-acp` monorepo | config only |
+| Publish `@durable-acp/client` | npm publish from `distributed-acp` monorepo | config only |
+| Point client at Rust DS server | Change `stateStreamUrl` to conductor's port | 1 line |
+| Webhooks | DS server SSE → tiny webhook forwarder (or Postgres if analytics needed) | 0.5 day |
+| Rust-side file storage (W6) | `FileStorage` impl for restart survival | 0.5 day |
 
-Compared to W6+W7 custom Rust: ~550 lines, ~4 days.
+### Schema compatibility check
 
-Saves ~2 days, eliminates ~550 lines of custom Rust, AND gives us
-SQL queries, Grafana, full-text search, analytics, backup/restore —
-none of which the custom approach provides.
+The Rust `state.rs` types must produce JSON that matches the Zod schemas
+in `@durable-acp/state/schema.ts`. Key fields to verify:
+
+| Rust (`state.rs`) | TypeScript (`schema.ts`) | Match? |
+|---|---|---|
+| `ConnectionRow.logical_connection_id` | `logicalConnectionId` | camelCase ✅ (serde rename) |
+| `PromptTurnRow.prompt_turn_id` | `promptTurnId` | camelCase ✅ |
+| `ChunkRow.chunk_type` → `"type"` | `type` | ✅ (serde rename) |
+| `ConnectionState::Created` | `"created"` | ✅ (snake_case serde) |
+
+The Rust types use `#[serde(rename_all = "camelCase")]` which matches
+the TypeScript Zod schemas. Should be compatible out of the box.
+
+## Architecture (updated)
+
+```
+durable-acp-rs (Rust)                    TypeScript Clients
+───────────────────                     ──────────────────
+DurableStateProxy                        @durable-acp/state
+  → writes STATE-PROTOCOL                  → createDurableACPDB(stateStreamUrl)
+  → to DS Server (:4437)                   → subscribes via SSE
+                                           → materializes into TanStack DB
+REST API (:4438)                           → reactive collections
+  → prompt, cancel, pause               
+  → queue, permissions                   @durable-acp/client
+                                           → wraps StreamDB + REST commands
+            │                              → subscriptions, derived queries
+            │                              
+            ▼                            Flamecast React UI
+     DS Stream (SSE)  ◄─────────────────── useLiveQuery hooks
+     (source of truth)                     DurableACPClient
+
+                                         Webhooks (optional)
+     DS Stream (SSE)  ──► tiny forwarder ──► HTTP POST to URLs
+```
+
+## What This Replaces from Workstreams
+
+| Workstream | Before | After |
+|---|---|---|
+| W6: File storage | Custom `FileStorage` Rust impl | Still needed for Rust-side restart survival |
+| W7: EventSubscriber trait | Custom Rust trait + manager | Not needed — StreamDB IS the subscriber |
+| W7a: WebSocket subscriber | Custom `WsSubscriber` | Not needed — StreamDB uses SSE directly |
+| W7b: Webhooks | Custom `WebhookSubscriber` | Tiny SSE→HTTP forwarder (~50 lines) |
+| W7c: Generalized SSE | Custom axum SSE | Not needed — DS server SSE already works |
+| W8: Flamecast TS client | Build from scratch | Already exists — `@durable-acp/client` |
+
+**Net effect:** W7/W7a/W7c/W8 are eliminated. W6 stays (Rust-side).
+W7b becomes a tiny script. The TypeScript integration layer is done.
