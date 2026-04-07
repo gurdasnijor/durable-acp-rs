@@ -1,15 +1,14 @@
 # Durable ACP — Project Index
 
-> Single entry point. Read this first, then follow the SDDs in order.
+> Single entry point. Read this, then pick up any workstream whose
+> dependencies are met.
 
 ## What This Is
 
-A Rust multi-agent orchestrator built on [ACP](https://agentclientprotocol.com)
-(Agent Client Protocol). Runs AI coding agents with durable state persistence,
-agent-to-agent messaging, and a TUI dashboard. Uses the
-[`sacp`](https://crates.io/crates/sacp) conductor framework and
-[durable streams](https://github.com/durable-streams/durable-streams) for
-state.
+A Rust multi-agent orchestrator built on [ACP](https://agentclientprotocol.com).
+Runs AI coding agents with durable state persistence, agent-to-agent
+messaging, and a TUI dashboard. Uses [`sacp`](https://crates.io/crates/sacp)
+conductor framework + [durable streams](https://github.com/durable-streams/durable-streams).
 
 **Repo:** https://github.com/gurdasnijor/durable-acp-rs
 
@@ -25,117 +24,202 @@ state.
 ## Target Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Dashboard (thin TUI, ~200 lines)                           │
-│  Spawns N conductor subprocesses, REST API + SSE client     │
-└──────────┬──────────────────────────────────────────────────┘
-           │ spawns per agent
-┌──────────▼──────────────────────────────────────────────────┐
-│  sacp-conductor subprocess (per agent)                      │
-│  Config: { proxies: [...], agent: {...} }                   │
-│                                                             │
-│  ┌─ Proxy Chain ──────────────────────────────────────────┐ │
-│  │  DurableStateProxy (standalone binary)                 │ │
-│  │    intercepts → persists to durable stream             │ │
-│  │  PeerMcpProxy (standalone binary)                      │ │
-│  │    injects list_agents + prompt_agent MCP tools        │ │
-│  │  Agent (npx/uvx/binary from ACP registry)              │ │
-│  └────────────────────────────────────────────────────────┘ │
-│                                                             │
-│  Durable Streams Server (shared, one per dashboard)         │
-│  REST API (shared)                                          │
-│  StreamDB (materialized collections)                        │
-└─────────────────────────────────────────────────────────────┘
-           │ peering (HTTP)
-┌──────────▼──────────────────────────────────────────────────┐
-│  Other conductor subprocesses                               │
-│  PeerMcpProxy → prompt_agent → HTTP POST/SSE to peer API   │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  Clients                                                            │
+│  Dashboard TUI │ Flamecast React UI │ REST/WS/SSE clients          │
+└───────┬────────────────┬─────────────────────┬─────────────────────┘
+        │                │                     │
+        │         ┌──────▼──────┐       ┌──────▼──────┐
+        │         │ WS /ws      │       │ SSE /stream │
+        │         │ (Flamecast  │       │ Webhooks    │
+        │         │  protocol)  │       │             │
+        │         └──────┬──────┘       └──────┬──────┘
+        │                │                     │
+┌───────▼────────────────▼─────────────────────▼─────────────────────┐
+│  Control Plane (durable-acp-rs)                                     │
+│                                                                     │
+│  REST API ──── SubscriberManager ──── StreamDb                      │
+│  Session CRUD     │  │  │          subscribe_changes()              │
+│  Prompt/Cancel   WS SSE Webhook                                    │
+│  Permissions                                                        │
+│  Queue mgmt                                                        │
+│  Agent templates                                                    │
+│  File system                                                        │
+│  Terminal I/O                                                       │
+└───────┬─────────────────────────────────────────────────────────────┘
+        │ spawns per agent
+┌───────▼─────────────────────────────────────────────────────────────┐
+│  sacp-conductor subprocess                                          │
+│  ┌─ Proxy Chain ──────────────────────────────────────────────────┐ │
+│  │  DurableStateProxy (standalone binary)                         │ │
+│  │    intercepts all ACP → persists to durable stream             │ │
+│  │  PeerMcpProxy (standalone binary)                              │ │
+│  │    injects list_agents + prompt_agent MCP tools                │ │
+│  │  Agent (npx/uvx/binary, local/TCP/WS transport)                │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  Durable Streams Server (:4437) ──► FileStorage (persistent)        │
+│  StreamDB (materialized collections in memory)                      │
+└─────────────────────────────────────────────────────────────────────┘
+        │ peering (HTTP between conductors)
+        │ DurableACPClient (TypeScript, subscribes via WS/SSE)
 ```
 
-**Key principle:** Each proxy is a standalone binary. The conductor
-config chains them. The dashboard is a thin client over REST API + SSE.
-No custom in-process wiring.
+**Key principles:**
+- Each proxy is a standalone binary, chained via conductor config
+- Dashboard is a thin client over REST + SSE (no in-process wiring)
+- Durable stream is the single source of truth
+- `DurableACPClient` (TypeScript) is the integration point for Flamecast
 
-## Execution Sequence
+## Workstreams
 
-Work these SDDs in order. Each builds on the previous.
+12 workstreams extracted from all SDDs. Each is independently executable
+once dependencies are met.
 
-### Phase 1: SDK Alignment (~2-3 days)
+### Dependency Graph
 
-Align with ACP ecosystem paved roads before building new features.
+```
+                    ┌──────────────┐
+                    │ W1: sacp-proxy│
+                    │ migration    │
+                    └──────┬───────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+       ┌───────────┐ ┌───────────┐ ┌──────────┐
+       │W2: proxy  │ │W3: dash   │ │W4: API   │
+       │binaries   │ │subprocess │ │fix       │
+       └─────┬─────┘ └─────┬─────┘ └──────────┘
+             │              │
+             ▼              ▼
+       ┌───────────────────────┐
+       │W5: conductor config   │
+       └───────────┬───────────┘
+                   │
+      ┌────────────┼────────────────┐
+      ▼            ▼                ▼
+ ┌────────┐  ┌──────────┐   ┌────────────┐
+ │W6: file│  │W7: event │   │W9: plug-   │
+ │storage │  │subscribers│   │gable xport│
+ └────────┘  └────┬─────┘   └─────┬──────┘
+                  │               │
+            ┌─────┼─────┐        ▼
+            ▼     ▼     ▼  ┌──────────┐
+         ┌────┐┌────┐┌────┐│W10:      │
+         │W7a ││W7b ││W7c ││runtime   │
+         │ WS ││Hook││SSE ││providers │
+         └──┬─┘└────┘└────┘└──────────┘
+            │
+            ▼
+     ┌────────────┐
+     │W8: FC API  │
+     │+ TS client │
+     └────────────┘
 
-| # | Task | SDD | Effort |
-|---|---|---|---|
-| 1.1 | Migrate proxies to `sacp-proxy` v3.0.0 | [sdk-alignment.md](sdk-alignment.md) | ~1-2 days |
-| 1.2 | Package proxies as standalone binaries | [sdk-alignment.md](sdk-alignment.md) | ~0.5 day |
-| 1.3 | Move dashboard to subprocess-per-agent | [sdk-alignment.md](sdk-alignment.md) | ~1 day |
-| 1.4 | Remove `AgentRouter`, `TuiState` mutex, `LocalSet` wiring | [sdk-alignment.md](sdk-alignment.md) | included |
-| 1.5 | Fix API prompt routing (use conductor config) | [sdk-alignment.md](sdk-alignment.md) | included |
+Independent: W6 (storage), W11 (filesystem), W12 (terminals)
+```
 
-### Phase 2: Close Gaps (~4.5 days)
+### Track A: SDK Alignment (critical path, ~3 days)
 
-Fill remaining feature gaps needed for Flamecast integration.
+| W# | Task | Effort | Depends | SDD |
+|---|---|---|---|---|
+| W1 | Migrate to `sacp-proxy` v3.0.0 | 1-2d | — | [sdk-alignment.md](sdk-alignment.md) §1.1 |
+| W2 | Standalone proxy binaries | 0.5d | W1 | [sdk-alignment.md](sdk-alignment.md) §1.2 |
+| W3 | Dashboard → subprocess model | 1d | W2 | [sdk-alignment.md](sdk-alignment.md) §1.3 |
+| W4 | API prompt routing fix | 0.5d | W1 | [known-limitations-sdd.md](known-limitations-sdd.md) §2 |
+| W5 | Conductor config support | 0.5d | W2 | [sdk-alignment.md](sdk-alignment.md) §1.2 |
 
-| # | Task | SDD | Effort |
-|---|---|---|---|
-| 2.1 | File-backed durable streams storage | [known-limitations-sdd.md](known-limitations-sdd.md) §1 | ~0.5 day |
-| 2.2 | WebSocket multiplexing (Flamecast protocol) | [event-subscribers-sdd.md](event-subscribers-sdd.md) | ~1.5 days |
-| 2.3 | Webhooks (HTTP POST + HMAC) | [event-subscribers-sdd.md](event-subscribers-sdd.md) | ~0.5 day |
-| 2.4 | File system access endpoints | [known-limitations-sdd.md](known-limitations-sdd.md) §4 | ~0.5 day |
-| 2.5 | Terminal management API | [known-limitations-sdd.md](known-limitations-sdd.md) §5 | ~1 day |
-| 2.6 | Session CRUD API (Flamecast-compatible) | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) Phase 1 | ~0.5 day |
+**Delivers:** Clean architecture. `conductor.rs` ~150 lines, `dashboard.rs` ~200 lines. Delete `agent_router.rs`. Proxies work with standard `sacp-conductor` ecosystem.
 
-### Phase 3: Flamecast Integration (~3 days)
+### Track B: Infrastructure (parallelizable, ~4 days)
 
-Connect to Flamecast React UI and cut its backend.
+| W# | Task | Effort | Depends | SDD |
+|---|---|---|---|---|
+| W6 | File-backed storage | 0.5d | — | [known-limitations-sdd.md](known-limitations-sdd.md) §1 |
+| W7 | EventSubscriber trait + manager | 0.5d | — | [event-subscribers-sdd.md](event-subscribers-sdd.md) |
+| W7a | WebSocket subscriber (Flamecast protocol) | 1.5d | W7 | [event-subscribers-sdd.md](event-subscribers-sdd.md) |
+| W7b | Webhook subscriber (HMAC) | 0.5d | W7 | [event-subscribers-sdd.md](event-subscribers-sdd.md) |
+| W7c | Generalized SSE endpoints | 0.5d | W7 | [event-subscribers-sdd.md](event-subscribers-sdd.md) |
+| W11 | File system access API | 0.5d | — | [known-limitations-sdd.md](known-limitations-sdd.md) §4 |
+| W12 | Terminal management API | 1d | — | [known-limitations-sdd.md](known-limitations-sdd.md) §5 |
 
-| # | Task | SDD | Effort |
-|---|---|---|---|
-| 3.1 | Permission resolution API | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) Phase 2 | ~0.5 day |
-| 3.2 | Agent templates API | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) Phase 4 | ~0.5 day |
-| 3.3 | Pluggable transports (TCP/WS) | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) Transports | ~1 day |
-| 3.4 | Runtime providers (Docker/E2B) | [known-limitations-sdd.md](known-limitations-sdd.md) §6 | ~1 day |
+**Delivers:** Persistent storage, real-time events via WS/webhook/SSE, filesystem and terminal access. All Flamecast feature gaps closed.
 
-### Phase 4: Polish
+### Track C: Integration (depends on A + B, ~4-6 days)
 
-| # | Task | Notes |
+| W# | Task | Effort | Depends | SDD |
+|---|---|---|---|---|
+| W8 | Flamecast API + TS client | 2-3d | W7a | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) |
+| W9 | Pluggable transports (TCP/WS) | 1d | W2 | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) |
+| W10 | Runtime providers (Docker/E2B) | 2-3d | W9 | [known-limitations-sdd.md](known-limitations-sdd.md) §6 |
+
+**Delivers:** Flamecast React UI points at durable-acp-rs. `FlamecastStorage` → `DurableStreamStorage`. Remote agents via TCP/WS. Docker/E2B sandboxes.
+
+### Recommended Sequence (single developer)
+
+```
+Week 1: W1 → W2 → W3 + W4     SDK alignment (clears tech debt)
+Week 2: W6 + W7 → W7a + W7b   Storage + event subscribers
+Week 3: W8 + W11 + W12         Flamecast API + missing features
+Week 4: W9 → W10               Transports + runtime providers
+```
+
+## Flamecast Integration Shape
+
+durable-acp-rs plugs into Flamecast as the conductor layer:
+
+```
+Flamecast SessionService.startSession()
+  → spawns: sacp-conductor agent \
+      "durable-state-proxy --stream-url ..." \
+      "peer-mcp-proxy" \
+      "npx claude-agent-acp"
+  → AcpBridge connects via stdio (unchanged)
+  → DurableStateProxy persists → Durable Stream
+  → PeerMcpProxy injects peer tools
+
+Flamecast reads from durable stream (replaces FlamecastStorage):
+  DurableACPClient (TypeScript) subscribes via WS/SSE
+  → reactive collections: connections, promptTurns, chunks, permissions
+  → commands: prompt, cancel, pause, resume, resolvePermission
+```
+
+**What Flamecast cuts:**
+- `FlamecastStorage` (PGLite/Postgres) → `DurableStreamStorage` adapter
+- Event bus → `StreamDb::subscribe_changes()` via `DurableACPClient`
+- Session metadata tables → `ConnectionRow` + `PromptTurnRow` in stream
+- `@flamecast/psql` package → delete
+
+**What Flamecast gains:**
+- MCP peering across all sessions (automatic, free)
+- Durable sessions (replay from stream offset)
+- Stream-based observability (any HTTP client subscribes)
+
+## SDDs
+
+| Doc | Phase | What It Covers |
 |---|---|---|
-| 4.1 | Dashboard scrollable output | iocraft `ScrollView` keyboard |
-| 4.2 | Permission UX in dashboard | Verify channel wiring e2e |
-| 4.3 | Dead code cleanup | `Output` enum, `AgentHandle`, warnings |
-| 4.4 | Editor integration testing | Zed, VS Code as ACP clients |
-
-## SDDs (read in order)
-
-| Doc | Status | What It Covers |
-|---|---|---|
-| [sdk-alignment.md](sdk-alignment.md) | 🔜 Phase 1 | `sacp-proxy` v3.0.0, standalone proxy binaries, subprocess-per-agent, dashboard simplification |
-| [known-limitations-sdd.md](known-limitations-sdd.md) | 🔜 Phase 1-2 | File storage, API routing, terminal API, filesystem API, runtime providers |
-| [event-subscribers-sdd.md](event-subscribers-sdd.md) | 🔜 Phase 2 | Unified WebSocket + webhook + SSE subscriber model |
-| [flamecast-integration-sdd.md](flamecast-integration-sdd.md) | 🔜 Phase 2-3 | Flamecast API compatibility, pluggable transports, what to cut |
-| [multi-agent-conductor-sdd.md](multi-agent-conductor-sdd.md) | ✅ Done | Single-process multi-agent (being replaced by subprocess model in Phase 1) |
+| [sdk-alignment.md](sdk-alignment.md) | Track A | `sacp-proxy` v3.0.0, standalone binaries, subprocess model |
+| [known-limitations-sdd.md](known-limitations-sdd.md) | Track A+B | Storage, API routing, filesystem, terminals, runtime providers |
+| [event-subscribers-sdd.md](event-subscribers-sdd.md) | Track B | WebSocket + webhook + SSE unified subscriber model |
+| [flamecast-integration-sdd.md](flamecast-integration-sdd.md) | Track C | Flamecast API, TS client, pluggable transports |
+| [workstreams.md](workstreams.md) | Reference | Detailed per-workstream specs + dependency analysis |
+| [multi-agent-conductor-sdd.md](multi-agent-conductor-sdd.md) | ✅ Done | In-process model (superseded by subprocess in Track A) |
 
 ## Key References
 
-- [ACP Protocol](https://agentclientprotocol.com/protocol/overview)
-- [Conductor Spec](https://agentclientprotocol.github.io/symposium-acp/conductor.html)
-- [Proxy Chains RFD](https://agentclientprotocol.com/rfds/proxy-chains)
-- [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp)
-- [Rust SDK v1 RFD](https://agentclientprotocol.com/rfds/rust-sdk-v1)
-- [ACP Cookbook](https://github.com/agentclientprotocol/rust-sdk/tree/main/src/agent-client-protocol-cookbook)
-- [Agent Registry](https://agentclientprotocol.com/registry)
-- [Durable Streams Protocol](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md)
-- [Flamecast](https://github.com/anthropics/flamecast) (`~/smithery/flamecast`)
+- [ACP Protocol](https://agentclientprotocol.com/protocol/overview) · [Conductor Spec](https://agentclientprotocol.github.io/symposium-acp/conductor.html) · [Proxy Chains RFD](https://agentclientprotocol.com/rfds/proxy-chains)
+- [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp) · [Rust SDK v1 RFD](https://agentclientprotocol.com/rfds/rust-sdk-v1) · [ACP Cookbook](https://github.com/agentclientprotocol/rust-sdk/tree/main/src/agent-client-protocol-cookbook)
+- [Agent Registry](https://agentclientprotocol.com/registry) · [Durable Streams Protocol](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) · [Flamecast](~/smithery/flamecast)
 
 ## Project Structure
 
 ```
 src/
   main.rs              Conductor CLI (editor integration)
-  conductor.rs         DurableStateProxy + conductor wiring (~400 lines → ~150 after Phase 1)
+  conductor.rs         DurableStateProxy + wiring → ~150 lines after W1
   peer_mcp.rs          PeerMcpProxy (list_agents, prompt_agent)
-  agent_router.rs      In-process peer routing (delete in Phase 1)
+  agent_router.rs      In-process routing → delete after W3
   acp_registry.rs      ACP registry CDN client
   registry.rs          Local peer registry
   app.rs               AppState, queue, chunk recording
@@ -143,17 +227,10 @@ src/
   durable_streams.rs   Embedded durable streams server
   api.rs               REST API (axum)
   bin/
-    dashboard.rs       TUI dashboard (~794 lines → ~200 after Phase 1)
-    agents.rs          Config manager + registry picker (iocraft)
-    chat.rs            Single-agent interactive chat
-    run.rs             Headless multi-agent runner (migrate to v1 API)
+    dashboard.rs       TUI → ~200 lines after W3
+    agents.rs          Config manager + registry picker
+    chat.rs            Single-agent chat
+    run.rs             Headless runner → migrate in W3
     peer.rs            Agent-to-agent CLI (HTTP)
-docs/
-  index.md             This file
-  sdk-alignment.md     Phase 1: SDK paved roads
-  known-limitations-sdd.md    Gaps + fixes
-  event-subscribers-sdd.md    WS/webhook/SSE
-  flamecast-integration-sdd.md  Flamecast API + transports
-  multi-agent-conductor-sdd.md  In-process model (superseded by Phase 1)
 agents.toml            Agent configuration
 ```
