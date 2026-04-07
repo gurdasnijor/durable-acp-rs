@@ -1,8 +1,6 @@
 //! MCP proxy that exposes `list_agents` and `prompt_agent` tools to the agent.
 //!
-//! Add this proxy to the conductor chain so that any agent running under
-//! durable-acp-rs can discover and message peer agents registered in the
-//! local registry.
+//! Peers communicate via HTTP REST API — no in-process routing.
 
 use anyhow::Result;
 use futures::StreamExt as _;
@@ -12,9 +10,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::registry;
+use crate::state::ChunkType;
 
 // ---------------------------------------------------------------------------
-// MCP tool parameter / return types
+// MCP tool types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -22,11 +21,8 @@ struct ListAgentsInput {}
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct AgentInfo {
-    /// Registered name of the agent
     name: String,
-    /// HTTP API base URL (e.g. http://127.0.0.1:4438)
     api_url: String,
-    /// Logical connection ID (UUID)
     logical_connection_id: String,
 }
 
@@ -44,7 +40,7 @@ struct PromptAgentInput {
 }
 
 // ---------------------------------------------------------------------------
-// Internal HTTP types (mirrors api.rs response shapes)
+// HTTP peer communication
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -64,100 +60,50 @@ struct PromptAccepted {
 #[derive(Deserialize)]
 struct ChunkEvent {
     #[serde(rename = "type")]
-    chunk_type: crate::state::ChunkType,
+    chunk_type: ChunkType,
     content: String,
 }
 
-// ---------------------------------------------------------------------------
-// HTTP helper
-// ---------------------------------------------------------------------------
-
-/// Submit a prompt to a peer agent. Tries in-process routing first,
-/// falls back to HTTP if the agent isn't in the same process.
-async fn call_peer(http: &reqwest::Client, api_url: &str, name: &str, text: &str) -> Result<String> {
-    // Try in-process routing first
-    if let Some(router) = crate::agent_router::global_router() {
-        if let Some(result) = router.prompt(name, text).await {
-            return result.map_err(|e| anyhow::anyhow!(e));
-        }
-    }
-    // Fall back to HTTP
-    call_peer_http(http, api_url, text).await
-}
-
 /// Submit a prompt to a peer agent via HTTP REST API.
-async fn call_peer_http(http: &reqwest::Client, api_url: &str, text: &str) -> Result<String> {
-    // 1. Find an attached connection with an active session.
+pub async fn call_peer_http(http: &reqwest::Client, api_url: &str, text: &str) -> Result<String> {
     let connections: Vec<ConnectionInfo> = http
         .get(format!("{api_url}/api/v1/connections"))
-        .send()
-        .await?
-        .json()
-        .await?;
+        .send().await?.json().await?;
 
-    let conn = connections
-        .iter()
+    let conn = connections.iter()
         .find(|c| c.state == "attached")
         .or(connections.first())
         .ok_or_else(|| anyhow::anyhow!("no connections on peer agent at {api_url}"))?;
 
-    let session_id = conn
-        .latest_session_id
-        .as_deref()
+    let session_id = conn.latest_session_id.as_deref()
         .ok_or_else(|| anyhow::anyhow!("peer at {api_url} has no active session"))?;
 
-    // 2. Submit the prompt.
     let accepted: PromptAccepted = http
-        .post(format!(
-            "{api_url}/api/v1/connections/{}/prompt",
-            conn.logical_connection_id
-        ))
-        .json(&serde_json::json!({
-            "sessionId": session_id,
-            "text": text,
-        }))
-        .send()
-        .await?
-        .json()
-        .await?;
+        .post(format!("{api_url}/api/v1/connections/{}/prompt", conn.logical_connection_id))
+        .json(&serde_json::json!({ "sessionId": session_id, "text": text }))
+        .send().await?.json().await?;
 
-    // 3. Stream the response via SSE until Stop or Error chunk.
     let response = http
-        .get(format!(
-            "{api_url}/api/v1/prompt-turns/{}/stream",
-            accepted.prompt_turn_id
-        ))
+        .get(format!("{api_url}/api/v1/prompt-turns/{}/stream", accepted.prompt_turn_id))
         .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await?;
+        .send().await?;
 
     let mut buf = String::new();
     let mut output = String::new();
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-
-        // Consume complete SSE events (separated by blank lines).
-        while let Some(event_end) = buf.find("\n\n") {
-            let event = buf[..event_end].to_string();
-            buf = buf[event_end + 2..].to_string();
-
+        buf.push_str(&String::from_utf8_lossy(&chunk?));
+        while let Some(end) = buf.find("\n\n") {
+            let event = buf[..end].to_string();
+            buf = buf[end + 2..].to_string();
             for line in event.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data.is_empty() {
-                        continue;
-                    }
+                if let Some(data) = line.strip_prefix("data:").map(str::trim) {
                     if let Ok(ev) = serde_json::from_str::<ChunkEvent>(data) {
-                        use crate::state::ChunkType;
                         match ev.chunk_type {
                             ChunkType::Text => output.push_str(&ev.content),
                             ChunkType::Stop => return Ok(output),
-                            ChunkType::Error => {
-                                anyhow::bail!("peer agent returned error: {}", ev.content)
-                            }
+                            ChunkType::Error => anyhow::bail!("peer error: {}", ev.content),
                             _ => {}
                         }
                     }
@@ -165,7 +111,6 @@ async fn call_peer_http(http: &reqwest::Client, api_url: &str, text: &str) -> Re
             }
         }
     }
-
     Ok(output)
 }
 
@@ -173,10 +118,6 @@ async fn call_peer_http(http: &reqwest::Client, api_url: &str, text: &str) -> Re
 // Proxy component
 // ---------------------------------------------------------------------------
 
-/// A conductor proxy that exposes two MCP tools to the wrapped agent:
-///
-/// - `list_agents` — enumerate peers from the local registry
-/// - `prompt_agent` — send a prompt to a named peer and return the response
 pub struct PeerMcpProxy;
 
 impl ConnectTo<Conductor> for PeerMcpProxy {
@@ -185,9 +126,8 @@ impl ConnectTo<Conductor> for PeerMcpProxy {
 
         let server = McpServer::builder("peer")
             .instructions(
-                "Tools for discovering and messaging peer durable-acp agents running on \
-                 this machine. Use list_agents to find peers, then prompt_agent to send \
-                 a message and receive its complete response.",
+                "Tools for discovering and messaging peer durable-acp agents. \
+                 Use list_agents to find peers, then prompt_agent to send a message.",
             )
             .tool_fn(
                 "list_agents",
@@ -196,37 +136,25 @@ impl ConnectTo<Conductor> for PeerMcpProxy {
                     let reg = registry::read_registry()
                         .map_err(|e| sacp::util::internal_error(e.to_string()))?;
                     Ok(ListAgentsOutput {
-                        agents: reg
-                            .agents
-                            .into_iter()
-                            .map(|e| AgentInfo {
-                                name: e.name,
-                                api_url: e.api_url,
-                                logical_connection_id: e.logical_connection_id,
-                            })
-                            .collect(),
+                        agents: reg.agents.into_iter().map(|e| AgentInfo {
+                            name: e.name,
+                            api_url: e.api_url,
+                            logical_connection_id: e.logical_connection_id,
+                        }).collect(),
                     })
                 },
                 sacp::tool_fn!(),
             )
             .tool_fn(
                 "prompt_agent",
-                "Send a text prompt to a named peer agent and return its complete text \
-                 response. Blocks until the agent finishes its turn (up to 120 s).",
+                "Send a text prompt to a named peer agent and return its complete response (up to 120s).",
                 async move |input: PromptAgentInput, _cx| {
                     let reg = registry::read_registry()
                         .map_err(|e| sacp::util::internal_error(e.to_string()))?;
-                    let entry = reg
-                        .agents
-                        .into_iter()
+                    let entry = reg.agents.into_iter()
                         .find(|e| e.name == input.name)
-                        .ok_or_else(|| {
-                            sacp::util::internal_error(format!(
-                                "no agent named '{}' in registry",
-                                input.name
-                            ))
-                        })?;
-                    call_peer(&http, &entry.api_url, &input.name, &input.text)
+                        .ok_or_else(|| sacp::util::internal_error(format!("no agent named '{}'", input.name)))?;
+                    call_peer_http(&http, &entry.api_url, &input.text)
                         .await
                         .map_err(|e| sacp::util::internal_error(e.to_string()))
                 },

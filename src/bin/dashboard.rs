@@ -1,36 +1,27 @@
-//! Multi-agent TUI dashboard — single process, N conductors.
+//! Multi-agent TUI dashboard — subprocess per agent.
 //!
-//! Runs all agents from agents.toml in one process with in-process
-//! conductors. The TUI acts as Terminal Client for all agents.
+//! Spawns each agent as a conductor subprocess, bootstraps via ACP client
+//! (Initialize + NewSession), then uses REST API for prompts/streaming.
+//!
+//! Doubles as a minimal integration test harness: proves a thin ACP client
+//! can wire up conductors with no in-process glue.
 //!
 //! Usage:
 //!   cargo run --bin dashboard
 //!   cargo run --bin dashboard -- --agent claude-acp
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::{
-    InitializeRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, ContentBlock, ContentChunk,
-};
+use agent_client_protocol::{self as acp, Agent as _};
 use anyhow::{Context, Result, bail};
 use clap::Parser as ClapParser;
 use iocraft::prelude::*;
-use sacp::{Client, Dispatch, SessionMessage, on_receive_request};
-use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
-use sacp_tokio::AcpAgent;
 use serde::Deserialize;
-use tokio::io::duplex;
-use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use durable_acp_rs::app::AppState;
-use durable_acp_rs::conductor::DurableStateProxy;
-use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
-use durable_acp_rs::peer_mcp::PeerMcpProxy;
+use durable_acp_rs::state::{ChunkRow, ChunkType};
 
 // ---------------------------------------------------------------------------
 // CLI + Config
@@ -52,7 +43,6 @@ struct Cli {
 #[derive(Debug, Clone, Deserialize)]
 struct AgentConfig {
     name: String,
-    #[allow(dead_code)]
     port: u16,
     agent: Option<String>,
     command: Option<Vec<String>>,
@@ -70,39 +60,48 @@ fn default_ss() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Channel types
+// Minimal ACP client — auto-approves permissions
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-enum Output {
-    Ready,
-    Text(String),
-    ToolCall(String),
-    Thinking,
-    Stop,
-    Error(String),
-    Permission(PermReq),
-}
-
-#[derive(Debug, Clone)]
-struct PermReq {
-    title: String,
-    options: Vec<(String, String)>, // (option_id, name)
-}
-
-// ---------------------------------------------------------------------------
-// Agent handle
-// ---------------------------------------------------------------------------
-
-struct AgentHandle {
+struct DashboardClient {
+    #[allow(dead_code)]
     name: String,
-    prompt_tx: mpsc::UnboundedSender<String>,
-    output_rx: mpsc::UnboundedReceiver<Output>,
-    perm_tx: mpsc::UnboundedSender<Option<String>>, // None = deny, Some(id) = approve
+}
+
+#[async_trait::async_trait(?Send)]
+impl acp::Client for DashboardClient {
+    async fn request_permission(
+        &self,
+        args: acp::RequestPermissionRequest,
+    ) -> acp::Result<acp::RequestPermissionResponse> {
+        let outcome = if let Some(opt) = args.options.first() {
+            acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                opt.option_id.clone(),
+            ))
+        } else {
+            acp::RequestPermissionOutcome::Cancelled
+        };
+        Ok(acp::RequestPermissionResponse::new(outcome))
+    }
+
+    async fn session_notification(
+        &self,
+        _args: acp::SessionNotification,
+    ) -> acp::Result<(), acp::Error> {
+        Ok(())
+    }
+
+    async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        Err(acp::Error::method_not_found())
+    }
+
+    async fn ext_notification(&self, _args: acp::ExtNotification) -> acp::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Shared TUI state (Arc<Mutex> so iocraft can read it)
+// Shared TUI state
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Default)]
@@ -117,9 +116,9 @@ struct TuiStateInner {
 
 struct AgentUiState {
     name: String,
-    state: String, // "starting", "ready", "error"
+    api_url: String,
+    state: String,
     output: Vec<String>,
-    perm_pending: Option<PermReq>,
 }
 
 impl TuiState {
@@ -140,39 +139,95 @@ impl TuiState {
                 a.output.push(text.to_string());
             }
             let excess = a.output.len().saturating_sub(200);
-            if excess > 0 {
-                a.output.drain(..excess);
-            }
+            if excess > 0 { a.output.drain(..excess); }
         }
     }
 
-    fn set_perm(&self, name: &str, perm: Option<PermReq>) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(a) = inner.agents.iter_mut().find(|a| a.name == name) {
-            a.perm_pending = perm;
-        }
-    }
-
-    fn snapshot(&self, agent_idx: usize) -> (Vec<(String, String)>, Vec<String>, Option<PermReq>) {
+    fn snapshot(&self, agent_idx: usize) -> (Vec<(String, String)>, Vec<String>) {
         let inner = self.inner.lock().unwrap();
-        let agents: Vec<(String, String)> = inner
-            .agents
-            .iter()
-            .map(|a| (a.name.clone(), a.state.clone()))
-            .collect();
-        let output = inner
-            .agents
-            .get(agent_idx)
+        let agents: Vec<(String, String)> = inner.agents.iter()
+            .map(|a| (a.name.clone(), a.state.clone())).collect();
+        let output = inner.agents.get(agent_idx)
             .map(|a| {
                 let start = a.output.len().saturating_sub(30);
                 a.output[start..].to_vec()
-            })
-            .unwrap_or_default();
-        let perm = inner
-            .agents
-            .get(agent_idx)
-            .and_then(|a| a.perm_pending.clone());
-        (agents, output, perm)
+            }).unwrap_or_default();
+        (agents, output)
+    }
+
+    fn api_url(&self, agent_idx: usize) -> Option<String> {
+        self.inner.lock().unwrap().agents.get(agent_idx).map(|a| a.api_url.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REST API helpers — prompt via HTTP
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionInfo {
+    logical_connection_id: String,
+    latest_session_id: Option<String>,
+    state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptResult {
+    prompt_turn_id: String,
+}
+
+async fn submit_prompt_http(http: &reqwest::Client, api_url: &str, text: &str) -> Result<String> {
+    let connections: Vec<ConnectionInfo> = http
+        .get(format!("{api_url}/api/v1/connections")).send().await?.json().await?;
+    let conn = connections.iter()
+        .find(|c| c.state == "attached")
+        .or(connections.first())
+        .ok_or_else(|| anyhow::anyhow!("no connections"))?;
+    let session_id = conn.latest_session_id.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let result: PromptResult = http
+        .post(format!("{api_url}/api/v1/connections/{}/prompt", conn.logical_connection_id))
+        .json(&serde_json::json!({ "sessionId": session_id, "text": text }))
+        .send().await?.json().await?;
+    Ok(result.prompt_turn_id)
+}
+
+async fn stream_response(http: &reqwest::Client, api_url: &str, turn_id: &str, tui: &TuiState, name: &str) {
+    let Ok(response) = http
+        .get(format!("{api_url}/api/v1/prompt-turns/{turn_id}/stream"))
+        .timeout(std::time::Duration::from_secs(120))
+        .send().await
+    else { return };
+
+    use futures::StreamExt;
+    let mut buf = String::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(end) = buf.find("\n\n") {
+            let event = buf[..end].to_string();
+            buf = buf[end + 2..].to_string();
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data:").map(str::trim) {
+                    if let Ok(ev) = serde_json::from_str::<ChunkRow>(data) {
+                        match ev.chunk_type {
+                            ChunkType::Text => tui.push_text(name, &ev.content),
+                            ChunkType::ToolCall => tui.push_text(name, &format!("\n[tool] {}\n", ev.content)),
+                            ChunkType::Thinking => tui.push_text(name, "."),
+                            ChunkType::Stop => return,
+                            ChunkType::Error => {
+                                tui.push_text(name, &format!("[error] {}\n", ev.content));
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -185,7 +240,6 @@ struct DashboardProps {
     tui: Option<TuiState>,
     agent_count: usize,
     prompt_fn: Option<Arc<dyn Fn(usize, String) + Send + Sync>>,
-    perm_fn: Option<Arc<dyn Fn(usize, Option<String>) + Send + Sync>>,
 }
 
 #[component]
@@ -196,7 +250,6 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
     let mut input = hooks.use_state(|| String::new());
     let mut done = hooks.use_state(|| false);
 
-    // Poll for state changes at 10Hz to trigger re-renders
     let mut tick = hooks.use_state(|| 0u64);
     hooks.use_future(async move {
         loop {
@@ -206,12 +259,10 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
     });
 
     let sidebar_w: u32 = 22;
-    let output_w = (term_w as u32).saturating_sub(sidebar_w + 3); // 3 for borders/margin
-    let output_h = (term_h as u32).saturating_sub(6); // header + input + borders
-
+    let output_w = (term_w as u32).saturating_sub(sidebar_w + 3);
+    let output_h = (term_h as u32).saturating_sub(6);
     let agent_count = props.agent_count;
     let prompt_fn = props.prompt_fn.clone();
-    let perm_fn = props.perm_fn.clone();
 
     hooks.use_terminal_events(move |event| match event {
         TerminalEvent::Key(KeyEvent { code, kind, .. }) if kind != KeyEventKind::Release => {
@@ -219,41 +270,14 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                 KeyCode::Enter => {
                     let text = input.to_string();
                     if !text.is_empty() {
-                        if let Some(ref f) = prompt_fn {
-                            f(selected.get(), text);
-                        }
+                        if let Some(ref f) = prompt_fn { f(selected.get(), text); }
                         input.set(String::new());
                     }
                 }
                 KeyCode::Tab => selected.set((selected.get() + 1) % agent_count.max(1)),
-                KeyCode::BackTab => {
-                    selected.set((selected.get() + agent_count.max(1) - 1) % agent_count.max(1))
-                }
-                KeyCode::Char(c) => {
-                    // Check if permission pending — number keys resolve it
-                    // Otherwise append to input
-                    if c >= '1' && c <= '9' {
-                        if let Some(ref f) = perm_fn {
-                            // Try to resolve permission (perm_fn checks if pending)
-                            f(selected.get(), Some(c.to_string()));
-                            return;
-                        }
-                    }
-                    if c == 'n' || c == 'N' {
-                        if let Some(ref f) = perm_fn {
-                            f(selected.get(), None);
-                            return;
-                        }
-                    }
-                    let mut s = input.to_string();
-                    s.push(c);
-                    input.set(s);
-                }
-                KeyCode::Backspace => {
-                    let mut s = input.to_string();
-                    s.pop();
-                    input.set(s);
-                }
+                KeyCode::BackTab => selected.set((selected.get() + agent_count.max(1) - 1) % agent_count.max(1)),
+                KeyCode::Char(c) => { let mut s = input.to_string(); s.push(c); input.set(s); }
+                KeyCode::Backspace => { let mut s = input.to_string(); s.pop(); input.set(s); }
                 KeyCode::Esc => done.set(true),
                 _ => {}
             }
@@ -261,33 +285,22 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
         _ => {}
     });
 
-    if done.get() {
-        system.exit();
-    }
+    if done.get() { system.exit(); }
 
-    // Read snapshot
-    let (agents, output, perm) = props
-        .tui
-        .as_ref()
-        .map(|t| t.snapshot(selected.get()))
-        .unwrap_or_default();
-
+    let (agents, output) = props.tui.as_ref().map(|t| t.snapshot(selected.get())).unwrap_or_default();
     let sel = selected.get();
     let sel_name = agents.get(sel).map(|a| a.0.as_str()).unwrap_or("");
 
-    // Colors
     let border = Color::AnsiValue(60);
-    let header = Color::AnsiValue(145);
     let dim = Color::AnsiValue(242);
     let active = Color::AnsiValue(110);
+    let header = Color::AnsiValue(145);
     let ready_c = Color::AnsiValue(114);
     let starting_c = Color::AnsiValue(179);
     let error_c = Color::AnsiValue(196);
-    let warn_c = Color::AnsiValue(214);
 
     element! {
         View(flex_direction: FlexDirection::Column, width: term_w, height: term_h) {
-            // Header
             View(padding_left: 1, height: 1) {
                 Text(content: "durable-acp", weight: Weight::Bold, color: active)
                 Text(content: format!("  {} agents", agents.len()), color: dim)
@@ -296,10 +309,7 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                 Text(content: "esc", color: active)
                 Text(content: "=quit", color: dim)
             }
-
-            // Main: sidebar + output
             View(flex_direction: FlexDirection::Row, height: output_h) {
-                // Sidebar
                 View(width: sidebar_w, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
                         Text(content: "Agents", weight: Weight::Bold, color: header)
@@ -320,8 +330,6 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                         }
                     }))
                 }
-
-                // Output with ScrollView for proper wrapping + scrolling
                 View(width: output_w, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border, margin_left: 1) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
                         Text(content: sel_name.to_string(), weight: Weight::Bold, color: header, wrap: TextWrap::NoWrap)
@@ -331,27 +339,10 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                             #(output.iter().map(|line| {
                                 element! { View { Text(content: line.clone(), color: Color::AnsiValue(252)) } }
                             }))
-
-                            // Permission prompt
-                            #(perm.as_ref().map(|p| {
-                                element! {
-                                    View(flex_direction: FlexDirection::Column, margin_top: 1, border_style: BorderStyle::Round, border_color: warn_c, padding: 1) {
-                                        Text(content: format!("Permission: {}", p.title), color: warn_c, weight: Weight::Bold)
-                                        #(p.options.iter().enumerate().map(|(i, (_id, name))| {
-                                            element! {
-                                                View { Text(content: format!("  [{}] {}", i + 1, name), color: header) }
-                                            }
-                                        }))
-                                        Text(content: "  [n] Deny", color: dim)
-                                    }
-                                }
-                            }))
                         }
                     }
                 }
             }
-
-            // Input
             View(width: term_w, height: 3, border_style: BorderStyle::Round, border_color: active) {
                 View(padding_left: 1) {
                     Text(content: format!("[{}] > {}_", sel_name, input.to_string()), color: active, wrap: TextWrap::NoWrap)
@@ -379,18 +370,13 @@ async fn main() -> Result<()> {
         }]
     } else {
         let p = &cli.config;
-        if !p.exists() {
-            bail!("Config '{}' not found.", p.display());
-        }
+        if !p.exists() { bail!("Config '{}' not found.", p.display()); }
         let config: Config = toml::from_str(&std::fs::read_to_string(p)?)?;
         config.agent
     };
 
-    if agents.is_empty() {
-        bail!("No agents configured.");
-    }
+    if agents.is_empty() { bail!("No agents configured."); }
 
-    // Resolve commands from ACP registry
     eprintln!("Fetching ACP agent registry...");
     let registry = durable_acp_rs::acp_registry::fetch_registry().await?;
 
@@ -399,9 +385,7 @@ async fn main() -> Result<()> {
         let command = if let Some(cmd) = &config.command {
             cmd.clone()
         } else if let Some(agent_id) = &config.agent {
-            let remote = registry
-                .agents
-                .iter()
+            let remote = registry.agents.iter()
                 .find(|a| a.id == *agent_id)
                 .with_context(|| format!("Agent '{}' not found", agent_id))?;
             remote.resolve_command()?
@@ -411,20 +395,12 @@ async fn main() -> Result<()> {
         resolved.push((config.clone(), command));
     }
 
-    // Shared durable streams server
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.port);
-    let durable_streams = EmbeddedDurableStreams::start(bind, "durable-acp-state").await?;
-
-    // Shared REST API
-    let api_app_state = Arc::new(
-        AppState::with_shared_streams(durable_streams.clone()).await?,
-    );
-    let api_router = durable_acp_rs::api::router(api_app_state);
-    let api_listener =
-        tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], cli.port + 1))).await?;
-    tokio::spawn(async move {
-        let _ = axum::serve(api_listener, api_router).await;
-    });
+    let conductor_bin = std::env::current_exe()?
+        .parent().unwrap()
+        .join("durable-acp-rs");
+    if !conductor_bin.exists() {
+        bail!("Conductor binary not found at {}. Run `cargo build` first.", conductor_bin.display());
+    }
 
     // TUI state
     let tui = TuiState::default();
@@ -433,362 +409,123 @@ async fn main() -> Result<()> {
         for (config, _) in &resolved {
             inner.agents.push(AgentUiState {
                 name: config.name.clone(),
+                api_url: format!("http://127.0.0.1:{}", config.port + 1),
                 state: "starting".to_string(),
                 output: vec![],
-                perm_pending: None,
             });
         }
     }
 
-    // Set up in-process agent router
-    let router = durable_acp_rs::agent_router::AgentRouter::new();
-    durable_acp_rs::agent_router::set_global_router(router.clone());
-
-    // Prompt type: text + optional response channel for peer routing
-    type PromptMsg = (String, Option<oneshot::Sender<Result<String, String>>>);
-
-    // Channels for each agent
-    let mut prompt_txs: Vec<mpsc::UnboundedSender<PromptMsg>> = Vec::new();
-    let mut perm_txs: Vec<mpsc::UnboundedSender<Option<String>>> = Vec::new();
-
+    // LocalSet needed for ClientSideConnection (!Send futures)
     let local = tokio::task::LocalSet::new();
     let tui_clone = tui.clone();
+    let agents_ref = agents.clone();
 
-    // Spawn agents and run TUI on the same LocalSet
     local
         .run_until(async move {
+            // Spawn each conductor subprocess and bootstrap via ACP client
             for (config, command) in &resolved {
-                let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptMsg>();
-                let (perm_response_tx, perm_response_rx) =
-                    mpsc::unbounded_channel::<Option<String>>();
+                let mut conductor_args = vec![
+                    "--name".to_string(), config.name.clone(),
+                    "--port".to_string(), config.port.to_string(),
+                    "--state-stream".to_string(), config.state_stream.clone(),
+                ];
+                conductor_args.extend(command.iter().cloned());
 
-                prompt_txs.push(prompt_tx.clone());
-                perm_txs.push(perm_response_tx);
+                let mut child = tokio::process::Command::new(&conductor_bin)
+                    .args(&conductor_args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .with_context(|| format!("spawn conductor for '{}'", config.name))?;
 
+                let outgoing = child.stdin.take().unwrap().compat_write();
+                let incoming = child.stdout.take().unwrap().compat();
                 let name = config.name.clone();
+                let api_url = format!("http://127.0.0.1:{}", config.port + 1);
                 let tui2 = tui_clone.clone();
-                let ds = durable_streams.clone();
 
-                // Register in-process peer router
-                let (peer_tx, mut peer_rx) =
-                    mpsc::unbounded_channel::<durable_acp_rs::agent_router::PeerPromptRequest>();
-                router.register(name.clone(), peer_tx);
-
-                // Bridge peer requests → prompt channel with response oneshot
-                let prompt_tx_for_peer = prompt_tx.clone();
-                tokio::task::spawn_local(async move {
-                    while let Some(req) = peer_rx.recv().await {
-                        let _ = prompt_tx_for_peer.send((req.text, Some(req.response_tx)));
-                    }
+                // Register in peer registry
+                let _ = durable_acp_rs::registry::register(durable_acp_rs::registry::AgentEntry {
+                    name: config.name.clone(),
+                    api_url: api_url.clone(),
+                    logical_connection_id: uuid::Uuid::new_v4().to_string(),
+                    registered_at: durable_acp_rs::app::now_ms(),
                 });
 
-                let agent = AcpAgent::from_args(command.clone())
-                    .with_context(|| format!("parse agent command for '{}'", name))
-                    .unwrap();
+                // Connect as ACP client — the minimal glue
+                let (conn, handle_io) = acp::ClientSideConnection::new(
+                    DashboardClient { name: name.clone() },
+                    outgoing,
+                    incoming,
+                    |fut| { tokio::task::spawn_local(fut); },
+                );
+                tokio::task::spawn_local(handle_io);
 
-                // Spawn conductor + client on this LocalSet
-                tokio::task::spawn_local(run_agent(name, agent, ds, tui2, prompt_rx, perm_response_rx));
+                // Initialize + create session, then mark ready
+                tokio::task::spawn_local(async move {
+                    match async {
+                        conn.initialize(
+                            acp::InitializeRequest::new(acp::ProtocolVersion::V1)
+                                .client_info(acp::Implementation::new("durable-acp-dashboard", "0.1.0")
+                                    .title("Dashboard")),
+                        ).await?;
+                        conn.new_session(
+                            acp::NewSessionRequest::new(std::env::current_dir()?),
+                        ).await?;
+                        Ok::<_, anyhow::Error>(())
+                    }.await {
+                        Ok(()) => {
+                            tui2.set_state(&name, "ready");
+                            tui2.push_text(&name, &format!("[{}] Ready ({})\n", name, api_url));
+                        }
+                        Err(e) => {
+                            tui2.set_state(&name, "error");
+                            tui2.push_text(&name, &format!("[error] {}\n", e));
+                        }
+                    }
+
+                    // Keep connection alive until dashboard exits
+                    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    let _ = rx.await;
+                    drop(child);
+                    Ok::<_, anyhow::Error>(())
+                });
             }
 
-            // Build prompt/perm callbacks for TUI
-            let prompt_txs = Arc::new(prompt_txs);
-            let perm_txs = Arc::new(perm_txs);
-            let tui_for_perm = tui_clone.clone();
-
-            let prompt_fn: Arc<dyn Fn(usize, String) + Send + Sync> = {
-                let txs = prompt_txs.clone();
-                Arc::new(move |idx, text| {
-                    if let Some(tx) = txs.get(idx) {
-                        let _ = tx.send((text, None)); // None = TUI prompt, no response needed
+            // Prompt callback — submits via REST API
+            let http = reqwest::Client::new();
+            let tui_prompt = tui_clone.clone();
+            let prompt_fn: Arc<dyn Fn(usize, String) + Send + Sync> = Arc::new(move |idx, text| {
+                let tui = tui_prompt.clone();
+                let http = http.clone();
+                let Some(api_url) = tui.api_url(idx) else { return };
+                let name = tui.inner.lock().unwrap().agents.get(idx)
+                    .map(|a| a.name.clone()).unwrap_or_default();
+                tui.push_text(&name, &format!("> {}\n", text));
+                tokio::task::spawn_local(async move {
+                    match submit_prompt_http(&http, &api_url, &text).await {
+                        Ok(turn_id) => stream_response(&http, &api_url, &turn_id, &tui, &name).await,
+                        Err(e) => tui.push_text(&name, &format!("[error] {}\n", e)),
                     }
-                })
-            };
+                    tui.push_text(&name, "\n");
+                });
+            });
 
-            let perm_fn: Arc<dyn Fn(usize, Option<String>) + Send + Sync> = {
-                let txs = perm_txs.clone();
-                let tui = tui_for_perm;
-                Arc::new(move |idx, response| {
-                    // Check if there's a pending permission for this agent
-                    let inner = tui.inner.lock().unwrap();
-                    let perm = inner.agents.get(idx).and_then(|a| a.perm_pending.clone());
-                    drop(inner);
-
-                    if let Some(perm) = perm {
-                        let option_id = response.and_then(|r| {
-                            r.parse::<usize>()
-                                .ok()
-                                .and_then(|n| perm.options.get(n - 1))
-                                .map(|(id, _)| id.clone())
-                        });
-                        if let Some(tx) = txs.get(idx) {
-                            let _ = tx.send(option_id);
-                        }
-                        tui.set_perm(
-                            &inner_name(&tui, idx),
-                            None,
-                        );
-                    }
-                })
-            };
-
-            // Run TUI — render_loop is a standard Future, awaiting it on
-            // the LocalSet lets spawn_local conductor tasks interleave
             let agent_count = resolved.len();
-            element!(Dashboard(
-                tui: tui_clone,
-                agent_count: agent_count,
-                prompt_fn: prompt_fn,
-                perm_fn: perm_fn,
-            ))
-            .fullscreen()
-            .await
-            .ok();
+            element!(Dashboard(tui: tui_clone, agent_count: agent_count, prompt_fn: prompt_fn))
+                .fullscreen().await.ok();
 
             // Cleanup
-            for config in agents.iter() {
+            for config in agents_ref.iter() {
                 let _ = durable_acp_rs::registry::unregister(&config.name);
             }
+
+            Ok::<_, anyhow::Error>(())
         })
-        .await;
+        .await?;
 
     Ok(())
-}
-
-fn inner_name(tui: &TuiState, idx: usize) -> String {
-    tui.inner
-        .lock()
-        .unwrap()
-        .agents
-        .get(idx)
-        .map(|a| a.name.clone())
-        .unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
-// Per-agent conductor task
-// ---------------------------------------------------------------------------
-
-async fn run_agent(
-    name: String,
-    agent: AcpAgent,
-    durable_streams: EmbeddedDurableStreams,
-    tui: TuiState,
-    mut prompt_rx: mpsc::UnboundedReceiver<(String, Option<oneshot::Sender<Result<String, String>>>)>,
-    mut perm_response_rx: mpsc::UnboundedReceiver<Option<String>>,
-) {
-    let app = match AppState::with_shared_streams(durable_streams).await {
-        Ok(app) => Arc::new(app),
-        Err(e) => {
-            tui.set_state(&name, "error");
-            tui.push_text(&name, &format!("[error] {}\n", e));
-            return;
-        }
-    };
-
-    // Register in peer registry
-    let _ = durable_acp_rs::registry::register(durable_acp_rs::registry::AgentEntry {
-        name: name.clone(),
-        api_url: "in-process".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
-        registered_at: durable_acp_rs::app::now_ms(),
-    });
-
-    // In-memory transport: client <-> conductor
-    let (client_out, conductor_in) = duplex(64 * 1024);
-    let (conductor_out, client_in) = duplex(64 * 1024);
-
-    let conductor_transport =
-        sacp::ByteStreams::new(conductor_out.compat_write(), conductor_in.compat());
-    let client_transport =
-        sacp::ByteStreams::new(client_out.compat_write(), client_in.compat());
-
-    let name2 = name.clone();
-    let tui2 = tui.clone();
-
-    // Permission channel for this agent
-    let (perm_output_tx, mut perm_output_rx) = mpsc::unbounded_channel::<PermReq>();
-
-    // Merge permission requests into the perm_response flow
-    let tui_for_perm = tui.clone();
-    let name_for_perm = name.clone();
-    tokio::task::spawn_local(async move {
-        while let Some(req) = perm_output_rx.recv().await {
-            tui_for_perm.set_perm(&name_for_perm, Some(req));
-        }
-    });
-
-    let result = Client
-        .builder()
-        .name(&format!("{}-client", name))
-        .on_receive_request(
-            {
-                let perm_tx = perm_output_tx;
-                let perm_rx = Arc::new(tokio::sync::Mutex::new(perm_response_rx));
-                let name = name.clone();
-                let tui = tui.clone();
-                async move |req: RequestPermissionRequest, responder, cx| {
-                    let title = req
-                        .tool_call
-                        .fields
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| "Permission".to_string());
-                    let options: Vec<(String, String)> = req
-                        .options
-                        .iter()
-                        .map(|o| (o.option_id.0.to_string(), o.name.clone()))
-                        .collect();
-
-                    let _ = perm_tx.send(PermReq {
-                        title: title.clone(),
-                        options: options.clone(),
-                    });
-
-                    let perm_rx = perm_rx.clone();
-                    let tui = tui.clone();
-                    let name = name.clone();
-
-                    cx.spawn(async move {
-                        let response = perm_rx.lock().await.recv().await.flatten();
-                        let outcome = if let Some(option_id) = response {
-                            RequestPermissionOutcome::Selected(
-                                SelectedPermissionOutcome::new(option_id),
-                            )
-                        } else {
-                            tui.push_text(&name, "[denied]\n");
-                            RequestPermissionOutcome::Cancelled
-                        };
-                        responder.respond(RequestPermissionResponse::new(outcome))
-                    })?;
-                    Ok(())
-                }
-            },
-            on_receive_request!(),
-        )
-        .with_spawned({
-            let app = app.clone();
-            move |_cx| async move {
-                ConductorImpl::new_agent(
-                    name2.clone(),
-                    ProxiesAndAgent::new(agent)
-                        .proxy(DurableStateProxy { app })
-                        .proxy(PeerMcpProxy),
-                    McpBridgeMode::default(),
-                )
-                .run(conductor_transport)
-                .await
-            }
-        })
-        .connect_with(client_transport, {
-            let name = name.clone();
-            let tui = tui2;
-            async move |connection| {
-                connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
-
-                connection
-                    .build_session_cwd()?
-                    .block_task()
-                    .run_until(async |mut session| {
-                        tui.set_state(&name, "ready");
-                        tui.push_text(&name, &format!("[{}] Ready\n", name));
-
-                        while let Some((text, mut response_tx)) = prompt_rx.recv().await {
-                            tui.push_text(&name, &format!("> {}\n", text));
-                            session.send_prompt(&text)?;
-                            let mut response_buf = String::new();
-
-                            loop {
-                                let msg = match session.read_update().await {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        let s = e.to_string();
-                                        if s.contains("Parse error")
-                                            || s.contains("unknown variant")
-                                            || s.contains("usage_update")
-                                            || s.contains("deserialization")
-                                        {
-                                            continue;
-                                        }
-                                        tui.push_text(&name, &format!("[error] {}\n", s));
-                                        break;
-                                    }
-                                };
-
-                                match msg {
-                                    SessionMessage::SessionMessage(dispatch) => {
-                                        if let Dispatch::Notification(ref m) = dispatch {
-                                            let params = serde_json::to_value(m.params())
-                                                .unwrap_or_default();
-                                            if let Ok(notif) =
-                                                serde_json::from_value::<SessionNotification>(params)
-                                            {
-                                                match notif.update {
-                                                    SessionUpdate::AgentMessageChunk(
-                                                        ContentChunk {
-                                                            content: ContentBlock::Text(t),
-                                                            ..
-                                                        },
-                                                    ) => {
-                                                        tui.push_text(&name, &t.text);
-                                                        response_buf.push_str(&t.text);
-                                                    }
-                                                    SessionUpdate::ToolCall(tc) => {
-                                                        tui.push_text(
-                                                            &name,
-                                                            &format!("\n[tool] {}\n", tc.title),
-                                                        );
-                                                    }
-                                                    SessionUpdate::ToolCallUpdate(tc) => {
-                                                        if let Some(title) = &tc.fields.title {
-                                                            tui.push_text(
-                                                                &name,
-                                                                &format!("[update] {}\n", title),
-                                                            );
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    }
-                                    SessionMessage::StopReason(_) => {
-                                        tui.push_text(&name, "\n");
-                                        // Send response to peer if this was a peer prompt
-                                        if let Some(tx) = response_tx.take() {
-                                            let _ = tx.send(Ok(response_buf.clone()));
-                                        }
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-
-                        Ok(())
-                    })
-                    .await
-            }
-        })
-        .await;
-
-    if let Err(e) = result {
-        let s = e.to_string();
-        // usage_update parse errors kill the connection but aren't fatal
-        // — the agent completed the turn, just couldn't parse the final notification
-        if s.contains("Parse error")
-            || s.contains("unknown variant")
-            || s.contains("usage_update")
-            || s.contains("deserialization")
-        {
-            tui.set_state(&name, "error");
-            // Don't dump the full error — just note the disconnect
-            tui.push_text(&name, "[session ended — schema mismatch]\n");
-        } else {
-            tui.set_state(&name, "error");
-            tui.push_text(&name, &format!("[error] {}\n", s));
-        }
-    }
 }

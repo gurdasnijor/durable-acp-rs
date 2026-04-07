@@ -30,7 +30,6 @@ pub struct RuntimeState {
     pub active_prompt_turn: Option<String>,
     pub queued: VecDeque<QueuedPrompt>,
     pub seq_by_prompt_turn: HashMap<String, i64>,
-    pub next_prompt_turn_id: Option<String>,
 }
 
 pub struct QueuedPrompt {
@@ -61,7 +60,6 @@ impl AppState {
                 active_prompt_turn: None,
                 queued: VecDeque::new(),
                 seq_by_prompt_turn: HashMap::new(),
-                next_prompt_turn_id: None,
             })),
             session_to_prompt_turn: Arc::new(RwLock::new(HashMap::new())),
             proxy_connection: Arc::new(Mutex::new(None)),
@@ -128,23 +126,13 @@ impl AppState {
         .await
     }
 
-    pub async fn set_next_prompt_turn_id(&self, id: String) {
-        self.runtime.lock().await.next_prompt_turn_id = Some(id);
-    }
-
     pub async fn enqueue_prompt(
         &self,
         prompt: PromptRequest,
         responder: Responder<PromptResponse>,
     ) -> Result<String> {
         let request_id = responder.id().to_string();
-        let prompt_turn_id = self
-            .runtime
-            .lock()
-            .await
-            .next_prompt_turn_id
-            .take()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let prompt_turn_id = Uuid::new_v4().to_string();
         let text = prompt_text(&prompt);
         let row = PromptTurnRow {
             prompt_turn_id: prompt_turn_id.clone(),
@@ -211,8 +199,12 @@ impl AppState {
             .await
     }
 
-    pub async fn set_proxy_connection(&self, cx: ConnectionTo<Conductor>) {
-        *self.proxy_connection.lock().await = Some(cx);
+    /// Capture the proxy connection on first use. Subsequent calls are no-ops.
+    pub async fn capture_proxy_connection(&self, cx: ConnectionTo<Conductor>) {
+        let mut guard = self.proxy_connection.lock().await;
+        if guard.is_none() {
+            *guard = Some(cx);
+        }
     }
 
     pub async fn take_next_prompt(&self) -> Option<QueuedPrompt> {

@@ -5,13 +5,15 @@ use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
 use sacp::ByteStreams;
+use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
 use sacp_tokio::AcpAgent;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use durable_acp_rs::api;
 use durable_acp_rs::app::AppState;
-use durable_acp_rs::conductor::build_conductor_with_peer_mcp;
+use durable_acp_rs::conductor::DurableStateProxy;
+use durable_acp_rs::peer_mcp::PeerMcpProxy;
 use durable_acp_rs::registry;
 
 #[derive(Debug, Parser)]
@@ -38,7 +40,6 @@ async fn main() -> Result<()> {
     let app = Arc::new(AppState::new(bind, cli.state_stream).await?);
     let api_port = cli.port + 1;
 
-    // Register in the agent registry
     let agent_name = cli.name.clone();
     registry::register(registry::AgentEntry {
         name: agent_name.clone(),
@@ -48,18 +49,21 @@ async fn main() -> Result<()> {
     })
     .context("register agent")?;
 
-    tracing::info!(
-        name = %agent_name,
-        api_port = api_port,
-        streams_port = cli.port,
-        "Conductor started"
-    );
+    tracing::info!(name = %agent_name, api_port, streams_port = cli.port, "Conductor started");
 
     let api_router = api::router(app.clone());
     spawn_api_server(api_port, api_router).await?;
 
     let agent = AcpAgent::from_args(cli.agent_command).context("parse agent command")?;
-    let conductor = build_conductor_with_peer_mcp(app, agent);
+
+    let conductor = ConductorImpl::new_agent(
+        "durable-acp".to_string(),
+        ProxiesAndAgent::new(agent)
+            .proxy(DurableStateProxy { app })
+            .proxy(PeerMcpProxy),
+        McpBridgeMode::default(),
+    );
+
     let result = conductor
         .run(ByteStreams::new(
             tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(tokio::io::stdout()),
@@ -68,9 +72,7 @@ async fn main() -> Result<()> {
         .await
         .context("run conductor");
 
-    // Unregister on exit
     let _ = registry::unregister(&agent_name);
-
     result
 }
 

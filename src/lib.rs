@@ -1,5 +1,4 @@
 pub mod acp_registry;
-pub mod agent_router;
 pub mod api;
 pub mod app;
 pub mod conductor;
