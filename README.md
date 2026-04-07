@@ -17,6 +17,31 @@ cargo run --bin chat -- npx @agentclientprotocol/claude-agent-acp
 cargo run --bin durable-acp-rs -- npx @agentclientprotocol/claude-agent-acp
 ```
 
+## ACP Agent Registry
+
+Any agent in the [ACP Registry](https://agentclientprotocol.com/registry) works. Browse the full list:
+
+```bash
+curl -s https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json | python3 -m json.tool
+```
+
+Popular agents (npx-based):
+
+| Agent | Command |
+|---|---|
+| Claude | `npx @agentclientprotocol/claude-agent-acp` |
+| Gemini | `npx @anthropic-ai/gemini-acp` |
+| Codex | `npx @anthropic-ai/codex-acp` |
+| Cline | `npx cline --acp` |
+| GitHub Copilot | `npx @anthropic-ai/github-copilot-cli-acp` |
+
+Use any of them with either binary:
+
+```bash
+cargo run --bin chat -- npx cline --acp
+cargo run --bin durable-acp-rs -- npx cline --acp
+```
+
 ## Binaries
 
 ### `chat` -- Interactive ACP Client
@@ -73,10 +98,22 @@ curl http://localhost:4438/api/v1/connections
 # View queued prompts
 curl http://localhost:4438/api/v1/connections/{id}/queue
 
-# Submit a prompt
+# Submit a prompt (returns promptTurnId for tracking)
 curl -X POST http://localhost:4438/api/v1/connections/{id}/prompt \
   -H 'Content-Type: application/json' \
   -d '{"sessionId": "...", "text": "hello"}'
+# => {"queued": true, "promptTurnId": "uuid"}
+
+# Stream response chunks via SSE
+curl http://localhost:4438/api/v1/prompt-turns/{promptTurnId}/stream
+# => data: {"chunkId":"...","promptTurnId":"...","type":"text","content":"Hello","seq":0,...}
+# => data: {"chunkId":"...","promptTurnId":"...","type":"stop","content":"{...}","seq":5,...}
+
+# Get all chunks for a prompt turn (non-streaming)
+curl http://localhost:4438/api/v1/prompt-turns/{promptTurnId}/chunks
+
+# Resume streaming from a specific sequence number
+curl http://localhost:4438/api/v1/prompt-turns/{promptTurnId}/stream?afterSeq=3
 
 # Cancel active prompt
 curl -X POST http://localhost:4438/api/v1/connections/{id}/cancel \
@@ -86,6 +123,24 @@ curl -X POST http://localhost:4438/api/v1/connections/{id}/cancel \
 # Pause / resume queue
 curl -X POST http://localhost:4438/api/v1/connections/{id}/queue/pause
 curl -X POST http://localhost:4438/api/v1/connections/{id}/queue/resume
+```
+
+### Submit-and-Stream Pattern
+
+For programmatic use (e.g. agent-to-agent messaging):
+
+```bash
+# 1. Find the active connection
+CONN=$(curl -s localhost:4438/api/v1/connections | jq -r '.[0].logicalConnectionId')
+SESSION=$(curl -s localhost:4438/api/v1/connections | jq -r '.[0].latestSessionId')
+
+# 2. Submit a prompt
+TURN=$(curl -s -X POST localhost:4438/api/v1/connections/$CONN/prompt \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessionId\": \"$SESSION\", \"text\": \"hello\"}" | jq -r '.promptTurnId')
+
+# 3. Stream the response
+curl -N localhost:4438/api/v1/prompt-turns/$TURN/stream
 ```
 
 ## Durable Streams

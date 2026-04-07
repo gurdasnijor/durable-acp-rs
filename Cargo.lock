@@ -602,6 +602,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum 0.8.8",
  "bytes",
