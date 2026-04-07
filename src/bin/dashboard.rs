@@ -190,13 +190,13 @@ struct DashboardProps {
 
 #[component]
 fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let (term_w, term_h) = hooks.use_terminal_size();
     let mut system = hooks.use_context_mut::<SystemContext>();
     let mut selected = hooks.use_state(|| 0usize);
     let mut input = hooks.use_state(|| String::new());
     let mut done = hooks.use_state(|| false);
 
     // Poll for state changes at 10Hz to trigger re-renders
-    // (conductor tasks update TuiState via Arc<Mutex>, iocraft needs a wake signal)
     let mut tick = hooks.use_state(|| 0u64);
     hooks.use_future(async move {
         loop {
@@ -204,6 +204,10 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
             tick.set(tick.get().wrapping_add(1));
         }
     });
+
+    let sidebar_w: u32 = 22;
+    let output_w = (term_w as u32).saturating_sub(sidebar_w + 3); // 3 for borders/margin
+    let output_h = (term_h as u32).saturating_sub(6); // header + input + borders
 
     let agent_count = props.agent_count;
     let prompt_fn = props.prompt_fn.clone();
@@ -282,9 +286,9 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
     let warn_c = Color::AnsiValue(214);
 
     element! {
-        View(flex_direction: FlexDirection::Column, width: 100pct, height: 100pct) {
+        View(flex_direction: FlexDirection::Column, width: term_w, height: term_h) {
             // Header
-            View(padding_left: 1) {
+            View(padding_left: 1, height: 1) {
                 Text(content: "durable-acp", weight: Weight::Bold, color: active)
                 Text(content: format!("  {} agents", agents.len()), color: dim)
                 Text(content: "  tab", color: active)
@@ -294,9 +298,9 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
             }
 
             // Main: sidebar + output
-            View(flex_grow: 1.0, flex_direction: FlexDirection::Row, margin_top: 1, overflow: Overflow::Hidden) {
+            View(flex_direction: FlexDirection::Row, height: output_h) {
                 // Sidebar
-                View(width: 22, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border) {
+                View(width: sidebar_w, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
                         Text(content: "Agents", weight: Weight::Bold, color: header)
                     }
@@ -304,49 +308,51 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                         let is_sel = i == sel;
                         let bg = if is_sel { Some(Color::AnsiValue(236)) } else { None };
                         let ind = if is_sel { ">" } else { " " };
-                        let (dot, dc) = match state.as_str() {
+                        let (dot, _dc) = match state.as_str() {
                             "ready" => ("●", ready_c),
                             "starting" => ("○", starting_c),
                             _ => ("✕", error_c),
                         };
                         element! {
                             View(background_color: bg, padding_left: 1) {
-                                Text(content: format!("{} {} {}", ind, dot, name), color: if is_sel { active } else { dim })
+                                Text(content: format!("{} {} {}", ind, dot, name), color: if is_sel { active } else { dim }, wrap: TextWrap::NoWrap)
                             }
                         }
                     }))
                 }
 
-                // Output — flex_basis:Length(0) forces the flex child to not size from content
-                View(flex_grow: 1.0, flex_shrink: 1.0, flex_basis: FlexBasis::Length(0), flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border, margin_left: 1, overflow: Overflow::Hidden) {
+                // Output with ScrollView for proper wrapping + scrolling
+                View(width: output_w, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border, margin_left: 1) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
-                        Text(content: format!("{}", sel_name), weight: Weight::Bold, color: header)
+                        Text(content: sel_name.to_string(), weight: Weight::Bold, color: header, wrap: TextWrap::NoWrap)
                     }
-                    View(flex_grow: 1.0, flex_direction: FlexDirection::Column, padding: 1, overflow: Overflow::Hidden) {
-                        #(output.iter().map(|line| {
-                            element! { View { Text(content: line.clone(), color: Color::AnsiValue(252), wrap: TextWrap::Wrap) } }
-                        }))
+                    ScrollView {
+                        View(flex_direction: FlexDirection::Column) {
+                            #(output.iter().map(|line| {
+                                element! { View { Text(content: line.clone(), color: Color::AnsiValue(252)) } }
+                            }))
 
-                        // Permission prompt (if pending)
-                        #(perm.as_ref().map(|p| {
-                            element! {
-                                View(flex_direction: FlexDirection::Column, margin_top: 1, border_style: BorderStyle::Round, border_color: warn_c, padding: 1) {
-                                    Text(content: format!("Permission: {}", p.title), color: warn_c, weight: Weight::Bold)
-                                    #(p.options.iter().enumerate().map(|(i, (_id, name))| {
-                                        element! {
-                                            View { Text(content: format!("  [{}] {}", i + 1, name), color: header) }
-                                        }
-                                    }))
-                                    Text(content: "  [n] Deny", color: dim)
+                            // Permission prompt
+                            #(perm.as_ref().map(|p| {
+                                element! {
+                                    View(flex_direction: FlexDirection::Column, margin_top: 1, border_style: BorderStyle::Round, border_color: warn_c, padding: 1) {
+                                        Text(content: format!("Permission: {}", p.title), color: warn_c, weight: Weight::Bold)
+                                        #(p.options.iter().enumerate().map(|(i, (_id, name))| {
+                                            element! {
+                                                View { Text(content: format!("  [{}] {}", i + 1, name), color: header) }
+                                            }
+                                        }))
+                                        Text(content: "  [n] Deny", color: dim)
+                                    }
                                 }
-                            }
-                        }))
+                            }))
+                        }
                     }
                 }
             }
 
             // Input
-            View(border_style: BorderStyle::Round, border_color: active, margin_top: 1, overflow: Overflow::Hidden) {
+            View(width: term_w, height: 3, border_style: BorderStyle::Round, border_color: active) {
                 View(padding_left: 1) {
                     Text(content: format!("[{}] > {}_", sel_name, input.to_string()), color: active, wrap: TextWrap::NoWrap)
                 }
@@ -534,7 +540,7 @@ async fn main() -> Result<()> {
                 prompt_fn: prompt_fn,
                 perm_fn: perm_fn,
             ))
-            .render_loop()
+            .fullscreen()
             .await
             .ok();
 
