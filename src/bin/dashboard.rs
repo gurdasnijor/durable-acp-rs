@@ -317,14 +317,14 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                     }))
                 }
 
-                // Output
-                View(flex_grow: 1.0, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border, margin_left: 1) {
+                // Output — min_width:0 + overflow:Hidden prevents flex child from expanding beyond parent
+                View(flex_grow: 1.0, min_width: 0, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border, margin_left: 1, overflow: Overflow::Hidden) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
                         Text(content: format!("{}", sel_name), weight: Weight::Bold, color: header)
                     }
-                    View(flex_grow: 1.0, flex_direction: FlexDirection::Column, padding: 1) {
+                    View(flex_grow: 1.0, flex_direction: FlexDirection::Column, padding: 1, overflow: Overflow::Hidden) {
                         #(output.iter().map(|line| {
-                            element! { View { Text(content: line.clone(), color: Color::AnsiValue(252)) } }
+                            element! { View { Text(content: line.clone(), color: Color::AnsiValue(252), wrap: TextWrap::Wrap) } }
                         }))
 
                         // Permission prompt (if pending)
@@ -346,9 +346,9 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
             }
 
             // Input
-            View(border_style: BorderStyle::Round, border_color: active, margin_top: 1) {
-                View(padding_left: 1, width: 100pct) {
-                    Text(content: format!("[{}] > {}_", sel_name, input.to_string()), color: active)
+            View(border_style: BorderStyle::Round, border_color: active, margin_top: 1, overflow: Overflow::Hidden) {
+                View(padding_left: 1) {
+                    Text(content: format!("[{}] > {}_", sel_name, input.to_string()), color: active, wrap: TextWrap::NoWrap)
                 }
             }
         }
