@@ -144,24 +144,28 @@ fn interactive_select(
         })
         .collect();
 
-    // Pre-select already installed agents
-    let defaults: Vec<bool> = registry
-        .agents
-        .iter()
-        .map(|a| installed.contains(&a.id))
-        .collect();
-
     let selections = MultiSelect::new()
         .with_prompt("Select agents to install (space to toggle, enter to confirm)")
         .items(&items)
-        .defaults(&defaults)
         .interact()?;
 
-    Ok(selections
+    let selected: Vec<String> = selections
         .into_iter()
         .map(|i| registry.agents[i].id.clone())
-        .filter(|id| !installed.contains(id)) // skip already installed
-        .collect())
+        .collect();
+
+    let (already, new): (Vec<_>, Vec<_>) =
+        selected.into_iter().partition(|id| installed.contains(id));
+
+    if !already.is_empty() {
+        eprintln!(
+            "\n{} Already installed: {}",
+            style("✓").green(),
+            already.join(", ")
+        );
+    }
+
+    Ok(new)
 }
 
 async fn install_agent(
