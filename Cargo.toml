@@ -37,10 +37,6 @@ name = "durable-acp-rs"
 path = "src/main.rs"
 
 [[bin]]
-name = "chat"
-path = "src/bin/chat.rs"
-
-[[bin]]
 name = "peer"
 path = "src/bin/peer.rs"
 
