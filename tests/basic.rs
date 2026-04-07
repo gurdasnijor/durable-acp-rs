@@ -14,6 +14,7 @@ async fn stream_db_applies_state_events() {
         logical_connection_id: "conn-1".to_string(),
         state: ConnectionState::Created,
         latest_session_id: None,
+        cwd: None,
         last_error: None,
         queue_paused: Some(false),
         created_at: 1,
@@ -42,8 +43,11 @@ async fn stream_db_applies_state_events() {
 
 #[tokio::test]
 async fn embedded_durable_streams_serves_stream_protocol() {
+    let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let streams = EmbeddedDurableStreams::start(bind, "state").await.unwrap();
+    let streams = EmbeddedDurableStreams::start_with_dir(bind, "state", tmp.path().to_path_buf())
+        .await
+        .unwrap();
 
     let client = reqwest::Client::new();
     let create = client
@@ -75,8 +79,13 @@ async fn embedded_durable_streams_serves_stream_protocol() {
 
 #[tokio::test]
 async fn app_state_persists_chunks_into_state_stream() {
+    let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let app = AppState::new(bind, "durable-acp-state").await.unwrap();
+    let durable_streams =
+        EmbeddedDurableStreams::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
+            .await
+            .unwrap();
+    let app = AppState::with_shared_streams(durable_streams).await.unwrap();
 
     let prompt_turn = PromptTurnRow {
         prompt_turn_id: "turn-1".to_string(),
@@ -101,4 +110,42 @@ async fn app_state_persists_chunks_into_state_stream() {
     assert_eq!(snapshot.prompt_turns.len(), 1);
     assert_eq!(snapshot.chunks.len(), 1);
     assert_eq!(snapshot.chunks.values().next().unwrap().content, "hi");
+}
+
+#[tokio::test]
+async fn file_storage_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    // First instance: write state
+    {
+        let ds = EmbeddedDurableStreams::start_with_dir(
+            bind,
+            "durable-acp-state",
+            tmp.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let app = AppState::with_shared_streams(ds).await.unwrap();
+        app.record_chunk("turn-1", ChunkType::Text, "persisted".to_string())
+            .await
+            .unwrap();
+    }
+
+    // Second instance: state should be replayed from disk
+    let bind2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let ds2 = EmbeddedDurableStreams::start_with_dir(
+        bind2,
+        "durable-acp-state",
+        tmp.path().to_path_buf(),
+    )
+    .await
+    .unwrap();
+
+    let snapshot = ds2.stream_db.snapshot().await;
+    assert_eq!(snapshot.chunks.len(), 1);
+    assert_eq!(
+        snapshot.chunks.values().next().unwrap().content,
+        "persisted"
+    );
 }

@@ -30,7 +30,6 @@ pub struct RuntimeState {
     pub active_prompt_turn: Option<String>,
     pub queued: VecDeque<QueuedPrompt>,
     pub seq_by_prompt_turn: HashMap<String, i64>,
-    pub next_prompt_turn_id: Option<String>,
 }
 
 pub struct QueuedPrompt {
@@ -61,7 +60,6 @@ impl AppState {
                 active_prompt_turn: None,
                 queued: VecDeque::new(),
                 seq_by_prompt_turn: HashMap::new(),
-                next_prompt_turn_id: None,
             })),
             session_to_prompt_turn: Arc::new(RwLock::new(HashMap::new())),
             proxy_connection: Arc::new(Mutex::new(None)),
@@ -71,6 +69,7 @@ impl AppState {
             logical_connection_id: logical_connection_id.clone(),
             state: ConnectionState::Created,
             latest_session_id: None,
+            cwd: None,
             last_error: None,
             queue_paused: Some(false),
             created_at: now_ms(),
@@ -128,23 +127,13 @@ impl AppState {
         .await
     }
 
-    pub async fn set_next_prompt_turn_id(&self, id: String) {
-        self.runtime.lock().await.next_prompt_turn_id = Some(id);
-    }
-
     pub async fn enqueue_prompt(
         &self,
         prompt: PromptRequest,
         responder: Responder<PromptResponse>,
     ) -> Result<String> {
         let request_id = responder.id().to_string();
-        let prompt_turn_id = self
-            .runtime
-            .lock()
-            .await
-            .next_prompt_turn_id
-            .take()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let prompt_turn_id = Uuid::new_v4().to_string();
         let text = prompt_text(&prompt);
         let row = PromptTurnRow {
             prompt_turn_id: prompt_turn_id.clone(),
@@ -211,8 +200,12 @@ impl AppState {
             .await
     }
 
-    pub async fn set_proxy_connection(&self, cx: ConnectionTo<Conductor>) {
-        *self.proxy_connection.lock().await = Some(cx);
+    /// Capture the proxy connection on first use. Subsequent calls are no-ops.
+    pub async fn capture_proxy_connection(&self, cx: ConnectionTo<Conductor>) {
+        let mut guard = self.proxy_connection.lock().await;
+        if guard.is_none() {
+            *guard = Some(cx);
+        }
     }
 
     pub async fn take_next_prompt(&self) -> Option<QueuedPrompt> {
@@ -249,6 +242,57 @@ impl AppState {
             .await?;
             let mut runtime = self.runtime.lock().await;
             runtime.active_prompt_turn = None;
+        }
+        Ok(())
+    }
+
+    /// Cancel a specific queued turn. Returns true if it was found and removed.
+    pub async fn cancel_queued_turn(&self, turn_id: &str) -> Result<bool> {
+        let mut runtime = self.runtime.lock().await;
+        let before = runtime.queued.len();
+        runtime.queued.retain(|q| q.prompt_turn.prompt_turn_id != turn_id);
+        let removed = runtime.queued.len() < before;
+        drop(runtime);
+        if removed {
+            self.finish_prompt_turn(turn_id, "cancelled".to_string(), PromptTurnState::Cancelled)
+                .await?;
+        }
+        Ok(removed)
+    }
+
+    /// Cancel all queued turns. Returns the number removed.
+    pub async fn cancel_all_queued(&self) -> Result<usize> {
+        let mut runtime = self.runtime.lock().await;
+        let turns: Vec<String> = runtime.queued.iter()
+            .map(|q| q.prompt_turn.prompt_turn_id.clone()).collect();
+        runtime.queued.clear();
+        drop(runtime);
+        for turn_id in &turns {
+            self.finish_prompt_turn(turn_id, "cancelled".to_string(), PromptTurnState::Cancelled)
+                .await?;
+        }
+        Ok(turns.len())
+    }
+
+    /// Reorder the queue by the given turn IDs. IDs not in the list are dropped.
+    pub async fn reorder_queue(&self, order: &[String]) -> Result<()> {
+        let mut runtime = self.runtime.lock().await;
+        let mut by_id: std::collections::HashMap<String, QueuedPrompt> = runtime.queued
+            .drain(..)
+            .map(|q| (q.prompt_turn.prompt_turn_id.clone(), q))
+            .collect();
+        for (pos, id) in order.iter().enumerate() {
+            if let Some(mut q) = by_id.remove(id) {
+                q.prompt_turn.position = Some(pos as i64);
+                runtime.queued.push_back(q);
+            }
+        }
+        // Remaining items not in order list get cancelled
+        let orphans: Vec<String> = by_id.into_keys().collect();
+        drop(runtime);
+        for id in &orphans {
+            self.finish_prompt_turn(id, "cancelled".to_string(), PromptTurnState::Cancelled)
+                .await?;
         }
         Ok(())
     }

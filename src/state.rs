@@ -78,6 +78,8 @@ pub struct ConnectionRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_paused: Option<bool>,
