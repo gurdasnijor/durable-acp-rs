@@ -147,22 +147,35 @@ client transport → conductor queue → proxy chain (correct path). See
 trait-based API that the v1 RFD explicitly replaces. Should use
 `sacp::Client.builder().connect_with()` like `dashboard.rs` already does.
 
-**1d. Simplify `agent_router.rs`**
+**1d. Evaluate `agent_router.rs` against conductor config pattern**
 
-The `AgentRouter` fills a gap the SDK intentionally doesn't address —
-cross-conductor peer routing. The SDK's `ActiveSession` manages one
-session on one chain. Our router serializes access across N chains.
+The [cookbook](https://github.com/agentclientprotocol/rust-sdk/blob/main/src/agent-client-protocol-cookbook/src/lib.rs#L783-L855)
+shows the paved road: proxies as standalone binaries, chained via
+`agent-client-protocol-conductor --config conductor.json`:
 
-The custom `PeerPromptRequest` + oneshot channel + bridge task pattern
-works but is verbose. Potential simplification: store `ActiveSession`
-references directly (wrapped in `Rc<RefCell>` since `!Send` on LocalSet)
-and call `session.send_prompt()` / `session.read_to_string()` without
-the channel indirection. The serialization concern (one prompt at a time)
-is handled by the `&mut self` borrow on `ActiveSession`.
+```json
+{
+  "proxies": [
+    { "command": ["durable-state-proxy", "--stream-url", "..."] },
+    { "command": ["peer-mcp-proxy"] }
+  ],
+  "agent": { "command": ["npx", "@agentclientprotocol/claude-agent-acp"] }
+}
+```
 
-This would eliminate `PeerPromptRequest`, the bridge task in `dashboard.rs`,
-and the oneshot response channel — replacing ~100 lines of custom wiring
-with direct SDK calls.
+In this model, `AgentRouter` is unnecessary — each proxy runs as a
+subprocess, peering goes through HTTP, and the conductor handles routing.
+
+Our in-process model (dashboard) uses `AgentRouter` as a performance
+optimization (~0ms vs ~0.1ms loopback HTTP). Two paths forward:
+
+- **Standard mode**: Package proxies as standalone binaries, use conductor
+  config. No `AgentRouter`. Peering via HTTP. Composable, ecosystem-native.
+- **Performance mode**: Keep programmatic `ConductorImpl` + `AgentRouter`
+  for the dashboard's in-process multi-agent case.
+
+Both should be supported. The `AgentRouter` stays for in-process, but the
+standalone proxy binaries unlock the standard conductor config workflow.
 
 **1e. Remove manual JSON deserialization workaround**
 
