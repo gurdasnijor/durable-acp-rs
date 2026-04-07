@@ -44,6 +44,23 @@ Client ──ACP (stdio)──► Conductor
                             └── Agent (claude-agent-acp, gemini, cline, etc.)
 ```
 
+### Conductor Usage
+
+We use `ConductorImpl::new_agent()` from `sacp-conductor` with
+`ProxiesAndAgent::new(agent).proxy(DurableStateProxy).proxy(PeerMcpProxy)`.
+The conductor handles:
+- Sequential component initialization (`proxy/initialize` → `initialize`)
+- `_proxy/successor/*` message routing between components
+- MCP bridge mode for MCP-over-ACP transport
+- Message ordering via central `ConductorMessage` queue
+- Process lifecycle (kill agent subprocess on conductor drop)
+
+**Not yet used:**
+- Dynamic chain construction (closure-based, examines `InitializeRequest`)
+- Proxy mode (`ConductorImpl<Proxy>` — conductor as proxy in larger chain)
+- `sacp-proxy` v3.0.0 framework (`JrHandlerChain`, `ProxyHandler`) — our
+  proxies use the lower-level `sacp::Proxy.builder()` API
+
 ### DurableStateProxy (`src/conductor.rs`)
 
 Implements `ConnectTo<Conductor>`. Intercepts:
