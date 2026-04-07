@@ -123,7 +123,7 @@ Independent: W6 (storage), W11 (filesystem), W12 (terminals)
 
 | W# | Task | Effort | Depends | SDD |
 |---|---|---|---|---|
-| W1 | Migrate to `sacp-proxy` v3.0.0 | 1-2d | — | [sdk-alignment.md](sdk-alignment.md) §1.1 |
+| W1 | Migrate to `sacp-proxy` v3.0.0 | 1-2d | — | [sdk-alignment.md](sdk-alignment.md) §1.1 — replaces `conductor.rs` + `peer_mcp.rs` (~630→200 lines) |
 | W2 | Standalone proxy binaries | 0.5d | W1 | [sdk-alignment.md](sdk-alignment.md) §1.2 |
 | W3 | Dashboard → subprocess model | 1d | W2 | [sdk-alignment.md](sdk-alignment.md) §1.3 |
 | W4 | API prompt routing fix | 0.5d | W1 | [known-limitations-sdd.md](known-limitations-sdd.md) §2 |
