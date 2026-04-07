@@ -72,8 +72,21 @@ struct ChunkEvent {
 // HTTP helper
 // ---------------------------------------------------------------------------
 
-/// Submit a prompt to a peer agent and return its complete text response.
-async fn call_peer(http: &reqwest::Client, api_url: &str, text: &str) -> Result<String> {
+/// Submit a prompt to a peer agent. Tries in-process routing first,
+/// falls back to HTTP if the agent isn't in the same process.
+async fn call_peer(http: &reqwest::Client, api_url: &str, name: &str, text: &str) -> Result<String> {
+    // Try in-process routing first
+    if let Some(router) = crate::agent_router::global_router() {
+        if let Some(result) = router.prompt(name, text).await {
+            return result.map_err(|e| anyhow::anyhow!(e));
+        }
+    }
+    // Fall back to HTTP
+    call_peer_http(http, api_url, text).await
+}
+
+/// Submit a prompt to a peer agent via HTTP REST API.
+async fn call_peer_http(http: &reqwest::Client, api_url: &str, text: &str) -> Result<String> {
     // 1. Find an attached connection with an active session.
     let connections: Vec<ConnectionInfo> = http
         .get(format!("{api_url}/api/v1/connections"))
@@ -213,7 +226,7 @@ impl ConnectTo<Conductor> for PeerMcpProxy {
                                 input.name
                             ))
                         })?;
-                    call_peer(&http, &entry.api_url, &input.text)
+                    call_peer(&http, &entry.api_url, &input.name, &input.text)
                         .await
                         .map_err(|e| sacp::util::internal_error(e.to_string()))
                 },

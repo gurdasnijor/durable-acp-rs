@@ -24,7 +24,7 @@ use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
 use sacp_tokio::AcpAgent;
 use serde::Deserialize;
 use tokio::io::duplex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use durable_acp_rs::app::AppState;
@@ -434,8 +434,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Set up in-process agent router
+    let router = durable_acp_rs::agent_router::AgentRouter::new();
+    durable_acp_rs::agent_router::set_global_router(router.clone());
+
+    // Prompt type: text + optional response channel for peer routing
+    type PromptMsg = (String, Option<oneshot::Sender<Result<String, String>>>);
+
     // Channels for each agent
-    let mut prompt_txs: Vec<mpsc::UnboundedSender<String>> = Vec::new();
+    let mut prompt_txs: Vec<mpsc::UnboundedSender<PromptMsg>> = Vec::new();
     let mut perm_txs: Vec<mpsc::UnboundedSender<Option<String>>> = Vec::new();
 
     let local = tokio::task::LocalSet::new();
@@ -445,16 +452,29 @@ async fn main() -> Result<()> {
     local
         .run_until(async move {
             for (config, command) in &resolved {
-                let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
+                let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptMsg>();
                 let (perm_response_tx, perm_response_rx) =
                     mpsc::unbounded_channel::<Option<String>>();
 
-                prompt_txs.push(prompt_tx);
+                prompt_txs.push(prompt_tx.clone());
                 perm_txs.push(perm_response_tx);
 
                 let name = config.name.clone();
                 let tui2 = tui_clone.clone();
                 let ds = durable_streams.clone();
+
+                // Register in-process peer router
+                let (peer_tx, mut peer_rx) =
+                    mpsc::unbounded_channel::<durable_acp_rs::agent_router::PeerPromptRequest>();
+                router.register(name.clone(), peer_tx);
+
+                // Bridge peer requests → prompt channel with response oneshot
+                let prompt_tx_for_peer = prompt_tx.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(req) = peer_rx.recv().await {
+                        let _ = prompt_tx_for_peer.send((req.text, Some(req.response_tx)));
+                    }
+                });
 
                 let agent = AcpAgent::from_args(command.clone())
                     .with_context(|| format!("parse agent command for '{}'", name))
@@ -473,7 +493,7 @@ async fn main() -> Result<()> {
                 let txs = prompt_txs.clone();
                 Arc::new(move |idx, text| {
                     if let Some(tx) = txs.get(idx) {
-                        let _ = tx.send(text);
+                        let _ = tx.send((text, None)); // None = TUI prompt, no response needed
                     }
                 })
             };
@@ -547,7 +567,7 @@ async fn run_agent(
     agent: AcpAgent,
     durable_streams: EmbeddedDurableStreams,
     tui: TuiState,
-    mut prompt_rx: mpsc::UnboundedReceiver<String>,
+    mut prompt_rx: mpsc::UnboundedReceiver<(String, Option<oneshot::Sender<Result<String, String>>>)>,
     mut perm_response_rx: mpsc::UnboundedReceiver<Option<String>>,
 ) {
     let app = match AppState::with_shared_streams(durable_streams).await {
@@ -669,9 +689,10 @@ async fn run_agent(
                         tui.set_state(&name, "ready");
                         tui.push_text(&name, &format!("[{}] Ready\n", name));
 
-                        while let Some(text) = prompt_rx.recv().await {
+                        while let Some((text, mut response_tx)) = prompt_rx.recv().await {
                             tui.push_text(&name, &format!("> {}\n", text));
                             session.send_prompt(&text)?;
+                            let mut response_buf = String::new();
 
                             loop {
                                 let msg = match session.read_update().await {
@@ -706,6 +727,7 @@ async fn run_agent(
                                                         },
                                                     ) => {
                                                         tui.push_text(&name, &t.text);
+                                                        response_buf.push_str(&t.text);
                                                     }
                                                     SessionUpdate::ToolCall(tc) => {
                                                         tui.push_text(
@@ -728,6 +750,10 @@ async fn run_agent(
                                     }
                                     SessionMessage::StopReason(_) => {
                                         tui.push_text(&name, "\n");
+                                        // Send response to peer if this was a peer prompt
+                                        if let Some(tx) = response_tx.take() {
+                                            let _ = tx.send(Ok(response_buf.clone()));
+                                        }
                                         break;
                                     }
                                     _ => {}
