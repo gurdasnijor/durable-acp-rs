@@ -254,6 +254,36 @@ The only difference is the transport.
 5. **Replay from offset** — durable stream supports `?since=N`, all three
    subscriber types can replay missed events
 
+## Alignment with ACP Proxy Chains RFD
+
+The [Proxy Chains RFD](https://agentclientprotocol.com/rfds/proxy-chains)
+defines proxies as composable message interceptors for context injection,
+tool coordination, response filtering, and session orchestration. It does
+NOT cover observability, event streaming, or webhooks — those are outside
+the proxy's responsibility.
+
+Our architecture respects this boundary:
+
+```
+ACP Proxy Chain (per spec)              Subscriber Layer (our addition)
+──────────────────────────              ────────────────────────────────
+DurableStateProxy                       WebSocket subscriber
+  intercepts → persists to stream ───►  Webhook subscriber
+PeerMcpProxy                            SSE subscriber
+  intercepts → injects MCP tools        (all consume the stream)
+```
+
+- **Proxies intercept** — they sit in the message chain, transform or
+  record, and forward. This is the spec's model.
+- **Subscribers consume** — they read from the durable stream and dispatch
+  to external systems. This is our addition on top.
+- **The durable stream bridges them** — the proxy writes, the subscriber
+  reads. Clean separation.
+
+This means our proxy chain is spec-compliant (context injection via MCP,
+response interception via durable state), and the event subscriber system
+is a complementary layer that doesn't require changes to the ACP spec.
+
 ## Files to Change
 
 | File | Change |
