@@ -123,13 +123,30 @@ Independent: W6 (storage), W11 (filesystem), W12 (terminals)
 
 | W# | Task | Effort | Depends | SDD |
 |---|---|---|---|---|
-| W1 | Migrate to `sacp-proxy` v3.0.0 | 1-2d | — | [sdk-alignment.md](sdk-alignment.md) §1.1 — replaces `conductor.rs` + `peer_mcp.rs` (~630→200 lines) |
+| W1 | Migrate to `sacp-proxy` v3.0.0 | 1-2d | — | [sdk-alignment.md](sdk-alignment.md) §1.1 |
 | W2 | Standalone proxy binaries | 0.5d | W1 | [sdk-alignment.md](sdk-alignment.md) §1.2 |
 | W3 | Dashboard → subprocess model | 1d | W2 | [sdk-alignment.md](sdk-alignment.md) §1.3 |
 | W4 | API prompt routing fix | 0.5d | W1 | [known-limitations-sdd.md](known-limitations-sdd.md) §2 |
 | W5 | Conductor config support | 0.5d | W2 | [sdk-alignment.md](sdk-alignment.md) §1.2 |
 
-**Delivers:** Clean architecture. `conductor.rs` ~150 lines, `dashboard.rs` ~200 lines. Delete `agent_router.rs`. Proxies work with standard `sacp-conductor` ecosystem.
+**What changes:**
+
+| File | Current | After | How |
+|---|---|---|---|
+| `conductor.rs` | 400 lines | 150 lines | `JrHandlerChain` + `ProxyHandler` replaces `Proxy.builder()` |
+| `peer_mcp.rs` | 230 lines | merged into proxy | `McpServiceRegistry` + `McpTool` impls replace manual MCP wiring |
+| `dashboard.rs` | 794 lines | 200 lines | Subprocess model — thin TUI over REST+SSE, no `LocalSet`/channels |
+| `api.rs` | 315 lines | 150 lines | Delete bypass hack, `submit_prompt` drops 63→10 lines |
+| `app.rs` | 284 lines | 240 lines | Delete `proxy_connection`, `set_next_prompt_turn_id` |
+| `agent_router.rs` | 80 lines | deleted | HTTP peering replaces in-process channels |
+| **Total** | **~2100 lines** | **~740 lines** | **-65%** |
+
+**Key migrations:**
+- `sacp::Proxy.builder()` → `sacp_proxy::JrHandlerChain` (auto init/forward/session/MCP)
+- `McpServer::builder()` + `ConnectTo<Conductor>` → `McpServiceRegistry` + `McpTool` trait
+- In-process `AgentRouter` channels → HTTP peering (already works)
+- `proxy_connection` bypass hack → prompts route through conductor subprocess
+- `ClientSideConnection` (v0) in `run.rs` → subprocess model or `Client.builder()` (v1)
 
 ### Track B: Infrastructure (parallelizable, ~4 days)
 
