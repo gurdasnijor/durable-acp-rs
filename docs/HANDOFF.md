@@ -124,6 +124,48 @@ The TUI and conductors share one `LocalSet`. The iocraft render loop yields betw
 
 11. **Conductor as editor plugin** — test `durable-acp-rs` as `agent_command` in Zed, VS Code, or other ACP-compatible editors.
 
+## Flamecast Integration Opportunity
+
+[Flamecast](~/smithery/flamecast) (`@flamecast/sdk`) is the TypeScript control plane for ACP agents — it manages session lifecycle, brokers permissions, persists session metadata, and has a React web UI. It shares the same architectural goals as durable-acp-rs but in a different language.
+
+**The key insight:** durable-acp-rs could plug into Flamecast transparently as the conductor layer, providing durable sessions without Flamecast needing to change.
+
+### How it could work
+
+Flamecast already uses ACP client connections to talk to agents. If you swap the agent command to point at `durable-acp-rs` (which wraps the real agent), Flamecast gets durable state for free:
+
+```
+Flamecast (TypeScript)
+  → AcpBridge (ACP client connection)
+    → durable-acp-rs (conductor, transparent proxy)
+      → DurableStateProxy (persists to durable stream)
+      → PeerMcpProxy (agent-to-agent tools)
+      → claude-agent-acp (the actual agent)
+```
+
+Flamecast doesn't know the conductor is there — it sees a standard ACP agent. But now:
+- Every session has durable state in a stream
+- Flamecast's React UI could subscribe to the durable stream for richer observability
+- Agent-to-agent messaging works across Flamecast-managed sessions
+- Session recovery on reconnect (replay from stream)
+
+### Integration paths
+
+1. **Transparent proxy** (easiest): Configure Flamecast's runtime provider to use `durable-acp-rs <agent-command>` instead of the raw agent command. Zero code changes to Flamecast. The conductor's REST API and durable streams are available as bonus endpoints.
+
+2. **Shared durable streams**: Point Flamecast's `FlamecastStorage` (currently Drizzle/PGLite/Postgres) at the durable streams server. The STATE-PROTOCOL events are the same schema as `@durable-acp/state` from the TypeScript implementation — they're designed to be cross-compatible.
+
+3. **Replace FlamecastStorage with durable streams**: Instead of Drizzle-backed storage, Flamecast could use the durable stream as its primary storage, with the `StreamDB` pattern for materialization. This would unify the storage layer across both implementations.
+
+4. **Flamecast as dashboard**: Flamecast's React UI is more polished than the TUI dashboard. Running durable-acp-rs as the conductor layer while using Flamecast's web UI for visualization would combine the best of both: Rust performance + TypeScript UI.
+
+### What to explore
+
+- Check if Flamecast's `AcpBridge` / `@acp/runtime-bridge` can accept a custom agent command (likely yes — the runtime providers already support this)
+- Verify the STATE-PROTOCOL event schema matches between the Rust and TypeScript implementations
+- Test: `flamecast dev` with agent command set to `durable-acp-rs npx @agentclientprotocol/claude-agent-acp`
+- Check if Flamecast's WebSocket protocol can subscribe to the durable stream's SSE endpoint
+
 ## Running It
 
 ```bash
