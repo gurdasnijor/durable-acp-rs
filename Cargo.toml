@@ -45,10 +45,6 @@ name = "peer"
 path = "src/bin/peer.rs"
 
 [[bin]]
-name = "run"
-path = "src/bin/run.rs"
-
-[[bin]]
 name = "agents"
 path = "src/bin/agents.rs"
 
