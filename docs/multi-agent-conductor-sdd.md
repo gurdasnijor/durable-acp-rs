@@ -1,9 +1,11 @@
 # SDD: Single-Process Multi-Agent Conductor
 
-## Problem
+> **Status: ✅ IMPLEMENTED** — See `src/bin/dashboard.rs`
 
-The current multi-agent setup spawns N conductor processes and communicates
-with them via REST API + SSE. This is fragile:
+## Problem (solved)
+
+The original multi-agent setup spawned N conductor processes and communicated
+with them via REST API + SSE. This was fragile:
 - Process lifecycle management is error-prone (kill signals, cleanup)
 - REST API round-trips add latency vs. in-process message passing
 - The TUI render loop and tokio runtime fight over the event loop
@@ -74,13 +76,12 @@ conductor based on the user's agent selection.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## Runtime Model
+## Runtime Model (implemented)
 
 ### The LocalSet + iocraft solution
 
-`LocalSet::run_until(fut)` doesn't "own the thread" exclusively — it pins
-`!Send` futures to the current thread. iocraft's `render_loop()` is a normal
-future. Nest them:
+`LocalSet::run_until(fut)` pins `!Send` futures to the current thread.
+iocraft's `.fullscreen()` is a standard `Future`. Nest them:
 
 ```rust
 #[tokio::main(flavor = "current_thread")]
@@ -89,17 +90,17 @@ async fn main() {
     local.run_until(async {
         // Spawn conductor tasks (!Send, need spawn_local)
         for agent in agents {
-            tokio::task::spawn_local(run_conductor(agent));
+            tokio::task::spawn_local(run_agent(agent));
         }
-        // TUI render loop runs on same LocalSet — conductors
-        // execute between frames/events
-        smol::block_on(element!(Dashboard(...)).render_loop()).unwrap();
+        // TUI render loop — conductors execute between frames
+        element!(Dashboard(...)).fullscreen().await.ok();
     }).await;
 }
 ```
 
-The `spawn_local` tasks run whenever the render loop yields (every frame/event).
-No separate threads, no channel bridging, no fighting.
+A 100ms `use_future` tick timer forces re-renders so `TuiState` changes
+(written by conductor tasks via `Arc<Mutex>`) appear in the UI.
+The `spawn_local` tasks run whenever the render loop yields.
 
 ## How It Works
 

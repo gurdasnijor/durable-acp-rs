@@ -68,59 +68,36 @@ The conductor's `McpBridgeMode` handles the `mcp/connect`, `mcp/message`,
 
 ## Multi-Agent Architecture
 
-Since one conductor = one agent, multi-agent setups require N conductor
-processes. The dashboard/runner manages this:
+**Implemented:** Single-process, N in-process conductors (see `multi-agent-conductor-sdd.md`).
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Dashboard / Runner                                             │
-│                                                                 │
-│  ClientSideConnection ──► Conductor-A ──► DurableState ──► Agent-A
-│  ClientSideConnection ──► Conductor-B ──► DurableState ──► Agent-B
-│  ClientSideConnection ──► Conductor-C ──► DurableState ──► Agent-C
-│                               │                                 │
-│                          REST API per conductor                 │
-│                          (submit prompt, stream chunks)         │
-│                                                                 │
-│  Local Registry (~/.config/durable-acp/registry.json)           │
-│  Each conductor registers on startup, unregisters on exit       │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Dashboard Process (cargo run --bin dashboard)                │
+│                                                              │
+│  TUI (iocraft) ←── in-process channels ──→ Agent Manager     │
+│                                                              │
+│  Conductor A: Client → DurableStateProxy → PeerMcpProxy → Agent
+│  Conductor B: Client → DurableStateProxy → PeerMcpProxy → Agent
+│  Conductor C: Client → DurableStateProxy → PeerMcpProxy → Agent
+│                                                              │
+│  Shared: EmbeddedDurableStreams + REST API (one port pair)    │
+│  Shared: AgentRouter (in-process peer messaging)             │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Why N processes, not one?
-
-The ACP spec defines a conductor as managing one proxy chain with one agent.
-`ConductorImpl::new_agent()` takes a single `ProxiesAndAgent`. This is
-intentional — the conductor handles initialization, capability negotiation,
-and message routing for one chain.
-
-Multi-agent coordination happens at a higher layer:
-- **Registry** — file-based discovery of peer conductors
-- **MCP tools** — agents call `prompt_agent` to message peers via HTTP
-- **Dashboard** — TUI/REST interface multiplexing across conductors
-- **Durable streams** — each conductor's state is independently observable
+One conductor per agent, all in-process on a single `LocalSet`. Connected
+via `tokio::io::duplex` (in-memory pipes). iocraft render loop and conductor
+tasks interleave on the same thread.
 
 ### Agent-to-Agent Communication
 
 ```
-Agent A's Claude session                              Agent B's Conductor
-        │                                                     │
-        │  list_agents() ──► local registry                   │
-        │  ◄── [{name: "agent-b", api: ":4440"}]             │
-        │                                                     │
-        │  prompt_agent(name="agent-b", text="...")           │
-        │      POST :4440/api/v1/connections/{id}/prompt ────►│
-        │      GET  :4440/api/v1/prompt-turns/{id}/stream ───►│
-        │      ◄── SSE chunks (text, tool_call, stop)         │
-        │  ◄── complete text response as tool result          │
+Agent A calls prompt_agent(name="agent-b", text="...")
+  → PeerMcpProxy checks AgentRouter (in-process)
+  → Routes through agent-b's session channel
+  → Collects streamed response → returns as tool result
+  → Falls back to HTTP if agent is in a different process
 ```
-
-The `prompt_agent` MCP tool:
-1. Reads the local registry for the peer's API URL
-2. Finds an attached connection + session via REST
-3. Submits a prompt (`POST /prompt`)
-4. Streams the response via SSE (`GET /stream`)
-5. Returns accumulated text as the tool result (120s timeout)
 
 ## State Model
 
@@ -156,7 +133,7 @@ In-memory materialization of state from stream events:
 
 ## REST API
 
-Each conductor exposes an HTTP API at `port + 1`:
+Shared API for all agents at `port + 1` (default 4438):
 
 | Endpoint | Method | Purpose |
 |---|---|---|
@@ -182,13 +159,12 @@ Each conductor exposes an HTTP API at `port + 1`:
 
 | Binary | Purpose | Transport |
 |---|---|---|
-| `durable-acp-rs` | Conductor — spawned by editors | ACP over stdio |
-| `dashboard` | Multi-agent TUI | REST API + SSE |
-| `run` | Headless multi-agent runner | REST API |
+| `dashboard` | Fullscreen multi-agent TUI (primary interface) | In-process channels |
+| `agents` | Config manager for agents.toml + ACP registry picker | — |
 | `chat` | Interactive single-agent chat | ACP over stdio |
-| `agents` | Config manager for agents.toml | — |
-| `install` | Agent installer from ACP registry | — |
+| `run` | Headless multi-agent runner | In-process channels |
 | `peer` | Agent-to-agent CLI | REST API + SSE |
+| `durable-acp-rs` | Conductor — spawned by editors as `agent_command` | ACP over stdio |
 
 ## Key Dependencies
 
@@ -210,8 +186,15 @@ so types like `PromptRequest`, `SessionNotification`, `StopReason` are identical
 - **No authentication** between agents — registry is local trust
 - **`submit_prompt` API bypasses proxy inbound path** — records state explicitly
   in the API handler rather than routing through `on_receive_request_from(Client)`
-- **`usage_update` session notification** — not in schema v0.11.4, skipped gracefully
 - **Single-instance drain loop** — multi-instance deferred to Durable Streams CAS
+- **No scrollback navigation** — output pane auto-scrolls but no keyboard scroll
+- **Peer prompts block the session** — no timeout on in-process routing path
+
+## Future SDDs
+
+- `multi-agent-conductor-sdd.md` — ✅ Implemented. Single-process multi-agent dashboard.
+- `flamecast-integration-sdd.md` — 🔜 Ready for execution. Flamecast API compatibility + pluggable transports.
+- `event-subscribers-sdd.md` — 🔜 Ready for execution. Unified WebSocket/webhook/SSE subscribers.
 
 ## References
 

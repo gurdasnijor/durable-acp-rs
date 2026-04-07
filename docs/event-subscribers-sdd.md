@@ -1,5 +1,14 @@
 # SDD: Unified Event Subscribers — WebSocket + Webhooks
 
+> **Status: 🔜 READY FOR EXECUTION**
+> - Implements [multi-session WebSocket RFC](https://flamecast.mintlify.app/rfcs/multi-session-websocket)
+> - Implements [webhooks RFC](https://flamecast.mintlify.app/rfcs/webhooks)
+> - Estimated: ~2-3 days total
+>   - `EventSubscriber` trait + `SubscriberManager`: ~0.5 day
+>   - `WsSubscriber` (Flamecast channel protocol): ~1-1.5 days
+>   - `WebhookSubscriber` (HTTP POST + HMAC): ~0.5 day
+>   - Generalized SSE endpoints: ~0.5 day
+
 ## Insight
 
 The [multi-session WebSocket RFC](https://flamecast.mintlify.app/rfcs/multi-session-websocket)

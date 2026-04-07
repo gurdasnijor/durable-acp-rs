@@ -90,39 +90,40 @@ The TUI and conductors share one `LocalSet`. The iocraft render loop yields betw
 
 ## Design Docs
 
-- `docs/architecture.md` — full system architecture, state model, REST API
-- `docs/multi-agent-conductor-sdd.md` — single-process multi-agent design (the "why" behind the dashboard architecture)
-- `SDD-multi-agent-messaging.md` — original messaging SDD (partially implemented)
+| Doc | Status | Description |
+|---|---|---|
+| `docs/architecture.md` | Current | System architecture, state model, REST API, proxy chain |
+| `docs/multi-agent-conductor-sdd.md` | ✅ Implemented | Single-process multi-agent dashboard design |
+| `docs/flamecast-integration-sdd.md` | 🔜 Ready | Flamecast API compatibility, pluggable transports, what to cut |
+| `docs/event-subscribers-sdd.md` | 🔜 Ready | Unified WebSocket/webhook/SSE subscriber model |
+| `docs/HANDOFF.md` | Current | This file — start here |
+| `SDD-multi-agent-messaging.md` | ⚠️ Superseded | Original messaging SDD — replaced by `agent_router.rs` + `peer_mcp.rs` |
 
 ## What to Work On Next
 
-### High Impact
+### SDDs Ready for Execution
 
-1. **Scrollable output** — wire up arrow keys / mouse wheel to the iocraft `ScrollView`. Currently output scrolls down but you can't scroll back up.
+1. **Flamecast Integration** (`docs/flamecast-integration-sdd.md`) — Session CRUD API, pluggable transports, Flamecast API compatibility. This is the path to replacing Flamecast's backend with durable-acp-rs while keeping the React UI.
 
-2. **Peer prompt timeout** — add a timeout on the in-process `AgentRouter` path. Currently only the HTTP fallback has a 120s timeout.
+2. **Event Subscribers** (`docs/event-subscribers-sdd.md`) — Unified WebSocket + webhook + SSE model. Delivers both Flamecast RFCs (multi-session WebSocket, webhooks) with a single `EventSubscriber` trait.
 
-3. **Multi-model workflows** — test with heterogeneous agents (Claude + Gemini + Codex). The infrastructure works, but real multi-model collaboration hasn't been exercised.
+### Dashboard Polish
 
-4. **Permission UX** — verify the interactive permission flow end-to-end in the dashboard. The channel wiring exists but needs testing.
+3. **Scrollable output** — wire up arrow keys / mouse wheel to iocraft's `ScrollView`.
 
-### Medium Impact
+4. **Peer prompt timeout** — add timeout on in-process `AgentRouter` path.
 
-5. **Clean up dead code** — remove `Output` enum, `AgentHandle` struct, unused imports/warnings in `dashboard.rs`.
+5. **Permission UX** — verify interactive permission flow end-to-end.
 
-6. **Error display** — agent startup errors (missing binaries, API key issues) should show in the TUI sidebar, not just as `✕`.
+6. **Clean up dead code** — remove `Output` enum, `AgentHandle` struct, warnings.
 
-7. **Persistent storage** — the durable streams server is in-memory. Adding SQLite or file-backed storage would survive conductor restarts.
+### Infrastructure
 
-8. **Remote agents** — the `AgentRouter` currently only routes in-process. The HTTP fallback works for cross-process, but there's no discovery for remote agents (different machines).
+7. **Persistent storage** — SQLite or file-backed durable streams server.
 
-### Lower Priority
+8. **Pluggable transports** — TCP/WebSocket `ByteStreams` for remote agents (spec'd in `flamecast-integration-sdd.md`).
 
-9. **Agent status heartbeat** — detect when an agent subprocess dies and update the sidebar status.
-
-10. **Queue visualization** — the REST API exposes queue state but the TUI doesn't show it.
-
-11. **Conductor as editor plugin** — test `durable-acp-rs` as `agent_command` in Zed, VS Code, or other ACP-compatible editors.
+9. **Editor integration** — test `durable-acp-rs` as `agent_command` in Zed, VS Code.
 
 ## Flamecast Integration Opportunity
 

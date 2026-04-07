@@ -1,5 +1,12 @@
 # SDD: Flamecast Integration — What to Cut, What to Share
 
+> **Status: 🔜 READY FOR EXECUTION**
+> - Phase 1 (Session CRUD): ~1-2 days — add 6 endpoints to `api.rs`
+> - Phase 2 (Permissions + Queue): ~1 day — wire permission channels to API
+> - Phase 3 (WebSocket): ~2-3 days — see `event-subscribers-sdd.md`
+> - Phase 4 (Agent Templates): ~0.5 day — thin wrapper over `agents.toml` + registry
+> - Pluggable Transports: ~1 day — `Transport` enum + TCP/WS `ByteStreams`
+
 ## The Opportunity
 
 Flamecast and durable-acp-rs solve the same problem from different angles:
