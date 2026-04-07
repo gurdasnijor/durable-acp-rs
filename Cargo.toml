@@ -16,6 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 agent-client-protocol = "0.10.4"
 async-trait = "0.1"
 sacp = "11.0.0"
+schemars = { version = "1.0", features = ["derive"] }
 sacp-conductor = "11.0.0"
 sacp-tokio = "11.0.0"
 serde = { version = "1", features = ["derive"] }

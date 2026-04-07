@@ -402,3 +402,18 @@ pub fn build_conductor(app: Arc<AppState>, agent: AcpAgent) -> ConductorImpl<sac
         McpBridgeMode::default(),
     )
 }
+
+/// Like `build_conductor` but also injects the `list_agents` / `prompt_agent`
+/// MCP tools so the wrapped agent can discover and message peer conductors.
+pub fn build_conductor_with_peer_mcp(
+    app: Arc<AppState>,
+    agent: AcpAgent,
+) -> ConductorImpl<sacp::Agent> {
+    ConductorImpl::new_agent(
+        "durable-acp".to_string(),
+        ProxiesAndAgent::new(agent)
+            .proxy(DurableStateProxy { app })
+            .proxy(crate::peer_mcp::PeerMcpProxy),
+        McpBridgeMode::default(),
+    )
+}

@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use durable_acp_rs::api;
 use durable_acp_rs::app::AppState;
-use durable_acp_rs::conductor::build_conductor;
+use durable_acp_rs::conductor::build_conductor_with_peer_mcp;
 use durable_acp_rs::registry;
 
 #[derive(Debug, Parser)]
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     spawn_api_server(api_port, api_router).await?;
 
     let agent = AcpAgent::from_args(cli.agent_command).context("parse agent command")?;
-    let conductor = build_conductor(app, agent);
+    let conductor = build_conductor_with_peer_mcp(app, agent);
     let result = conductor
         .run(ByteStreams::new(
             tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(tokio::io::stdout()),
