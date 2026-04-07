@@ -7,145 +7,188 @@ Any [ACP client](https://agentclientprotocol.com/protocol/overview#client) (edit
 ## Quick Start
 
 ```bash
-# Interactive chat with Claude (default agent)
+# Install agents from the ACP registry (interactive picker)
+cargo run --bin install
+
+# Start all agents from agents.toml
+cargo run --bin run
+
+# Or chat interactively with a single agent
 cargo run --bin chat
-
-# Chat with a specific agent
-cargo run --bin chat -- npx @agentclientprotocol/claude-agent-acp
-
-# Run the conductor directly (for editor integration)
-cargo run --bin durable-acp-rs -- npx @agentclientprotocol/claude-agent-acp
 ```
 
-## ACP Agent Registry
+## Install Agents
 
-Any agent in the [ACP Registry](https://agentclientprotocol.com/registry) works. Browse the full list:
+Browse and install agents from the [ACP Registry](https://agentclientprotocol.com/registry) (27+ agents):
 
 ```bash
-curl -s https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json | python3 -m json.tool
+# Interactive multi-select with checkbox UI
+cargo run --bin install
+
+# Install specific agents by ID
+cargo run --bin install -- claude-acp gemini cline
+
+# List what's installed
+cargo run --bin install -- --list
+
+# Browse the registry without installing
+cargo run --bin run -- --list
 ```
 
-Popular agents (npx-based):
+Agents are installed to `.agent-bin/` and automatically added to `agents.toml`.
 
-| Agent | Command |
-|---|---|
-| Claude | `npx @agentclientprotocol/claude-agent-acp` |
-| Gemini | `npx @anthropic-ai/gemini-acp` |
-| Codex | `npx @anthropic-ai/codex-acp` |
-| Cline | `npx cline --acp` |
-| GitHub Copilot | `npx @anthropic-ai/github-copilot-cli-acp` |
+## Multi-Agent Setup
 
-Use any of them with either binary:
+### agents.toml
+
+Define agents to run. Agent IDs are resolved from the [ACP registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json), or specify a raw command:
+
+```toml
+[[agent]]
+name = "agent-a"
+port = 4437
+agent = "claude-acp"   # ACP registry ID
+
+[[agent]]
+name = "agent-b"
+port = 4439
+agent = "claude-acp"
+
+# Raw command (no registry lookup)
+# [[agent]]
+# name = "custom"
+# port = 4441
+# command = ["node", "my-agent.js", "--acp"]
+```
+
+CLI args mirror the TOML structure:
 
 ```bash
-cargo run --bin chat -- npx cline --acp
-cargo run --bin durable-acp-rs -- npx cline --acp
+cargo run --bin run -- --agent claude-acp --name my-agent --port 4437
+```
+
+### Start All Agents
+
+```bash
+cargo run --bin run
+```
+
+This fetches the ACP registry, resolves agent IDs to commands, spawns all conductors, initializes ACP sessions, and keeps everything alive. Ctrl-C stops all.
+
+## Agent-to-Agent Messaging (MCP Peering)
+
+Each conductor injects two [MCP tools](https://agentclientprotocol.com/rfds/mcp-over-acp) into the agent's session via the proxy chain:
+
+- **`list_agents`** -- discover peer agents from the local registry
+- **`prompt_agent`** -- send a prompt to a named peer and get the complete response
+
+These appear as native tools alongside the agent's built-in tools (Bash, Read, Write, etc.). No special prompting needed -- agents discover peers automatically.
+
+### How It Works
+
+```
+Agent A                    Registry                    Agent B
+   |                          |                           |
+   |  list_agents() --------->|                           |
+   |  <-- [{name: "agent-b",  |                           |
+   |        api_url: ":4440"}]|                           |
+   |                          |                           |
+   |  prompt_agent(                                       |
+   |    name="agent-b",       POST /api/v1/.../prompt --->|
+   |    text="write a haiku") GET  /api/v1/.../stream --->|
+   |                          |  <-- SSE chunks           |
+   |  <-- "Ownership and     |                           |
+   |       borrowing dance..." |                           |
+```
+
+The `prompt_agent` tool:
+1. Looks up the peer in the local registry (`~/.config/durable-acp/registry.json`)
+2. Finds the peer's active connection and session via REST API
+3. Submits a prompt via `POST /api/v1/connections/{id}/prompt`
+4. Streams the response via SSE (`GET /api/v1/prompt-turns/{id}/stream`)
+5. Returns the accumulated text as the tool result
+
+### Example
+
+With two agents running:
+
+```bash
+# In agent-a's session, the agent can:
+# 1. Call list_agents → discovers agent-b
+# 2. Call prompt_agent(name="agent-b", text="write a haiku about rust")
+# 3. Receive agent-b's complete response as a tool result
+```
+
+Via the REST API:
+
+```bash
+# Ask agent-a to talk to agent-b
+curl -X POST localhost:4438/api/v1/connections/{id}/prompt \
+  -H 'Content-Type: application/json' \
+  -d '{"sessionId": "...", "text": "use list_agents to find peers, then prompt_agent to ask agent-b to write a haiku"}'
+```
+
+### Peer CLI
+
+For agent-to-agent messaging from the command line (without going through a conductor):
+
+```bash
+# List registered agents
+cargo run --bin peer -- list
+
+# Send a prompt to a peer
+cargo run --bin peer -- prompt --agent agent-b "write a haiku about rust"
 ```
 
 ## Binaries
 
-### `chat` -- Interactive ACP Client
-
-A terminal chat client that connects directly to an ACP agent. Useful for testing and development.
-
-```bash
-cargo run --bin chat [-- AGENT_COMMAND...]
-```
-
-- Default agent: `npx @agentclientprotocol/claude-agent-acp`
-- Streams text responses, shows tool calls with titles, displays thinking
-- Auto-approves permission requests (logs them to stderr)
-- `Ctrl-D` to quit
-
-### `durable-acp-rs` -- Durable ACP Conductor
-
-The main conductor binary. Designed to be spawned by an ACP client (editor) as `agent_command`. Communicates over stdin/stdout via ACP JSON-RPC.
-
-```bash
-cargo run --bin durable-acp-rs -- [OPTIONS] AGENT_COMMAND...
-```
-
-**Options:**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--port PORT` | `4437` | Durable streams server port |
-| `--state-stream NAME` | `durable-acp-state` | State stream name |
-
-**Ports used:**
-
-- `PORT` (default 4437) -- Durable streams HTTP server (append/subscribe/SSE)
-- `PORT+1` (default 4438) -- REST API for external clients
-
-**Editor integration:**
-
-Configure your editor to use the conductor as its agent command:
-
-```
-agent_command: durable-acp-rs npx @agentclientprotocol/claude-agent-acp
-```
-
-The editor sends standard ACP over stdio. It doesn't know about durable streams.
+| Binary | Purpose |
+|---|---|
+| `install` | Interactive agent installer -- browse ACP registry, install to `.agent-bin/`, update `agents.toml` |
+| `run` | Multi-agent runner -- start all agents from `agents.toml`, maintain ACP sessions |
+| `chat` | Interactive terminal chat -- connect directly to an agent, stream responses |
+| `peer` | Agent-to-agent CLI -- list peers, send prompts via REST API |
+| `durable-acp-rs` | Conductor binary -- spawned by clients/editors as `agent_command` |
 
 ## REST API
 
-While the conductor is running, query state at `http://localhost:4438`:
+While conductors are running, query state at `http://localhost:{port+1}`:
 
 ```bash
 # List connections
-curl http://localhost:4438/api/v1/connections
-
-# View queued prompts
-curl http://localhost:4438/api/v1/connections/{id}/queue
+curl localhost:4438/api/v1/connections
 
 # Submit a prompt (returns promptTurnId for tracking)
-curl -X POST http://localhost:4438/api/v1/connections/{id}/prompt \
+curl -X POST localhost:4438/api/v1/connections/{id}/prompt \
   -H 'Content-Type: application/json' \
   -d '{"sessionId": "...", "text": "hello"}'
 # => {"queued": true, "promptTurnId": "uuid"}
 
 # Stream response chunks via SSE
-curl http://localhost:4438/api/v1/prompt-turns/{promptTurnId}/stream
-# => data: {"chunkId":"...","promptTurnId":"...","type":"text","content":"Hello","seq":0,...}
-# => data: {"chunkId":"...","promptTurnId":"...","type":"stop","content":"{...}","seq":5,...}
+curl -N localhost:4438/api/v1/prompt-turns/{promptTurnId}/stream
 
-# Get all chunks for a prompt turn (non-streaming)
-curl http://localhost:4438/api/v1/prompt-turns/{promptTurnId}/chunks
+# Get all chunks (non-streaming)
+curl localhost:4438/api/v1/prompt-turns/{promptTurnId}/chunks
 
-# Resume streaming from a specific sequence number
-curl http://localhost:4438/api/v1/prompt-turns/{promptTurnId}/stream?afterSeq=3
+# Resume streaming from a sequence number
+curl localhost:4438/api/v1/prompt-turns/{id}/stream?afterSeq=3
 
-# Cancel active prompt
-curl -X POST http://localhost:4438/api/v1/connections/{id}/cancel \
-  -H 'Content-Type: application/json' \
-  -d '{"sessionId": "..."}'
+# View queued prompts
+curl localhost:4438/api/v1/connections/{id}/queue
 
-# Pause / resume queue
-curl -X POST http://localhost:4438/api/v1/connections/{id}/queue/pause
-curl -X POST http://localhost:4438/api/v1/connections/{id}/queue/resume
-```
+# Cancel / pause / resume
+curl -X POST localhost:4438/api/v1/connections/{id}/cancel \
+  -H 'Content-Type: application/json' -d '{"sessionId": "..."}'
+curl -X POST localhost:4438/api/v1/connections/{id}/queue/pause
+curl -X POST localhost:4438/api/v1/connections/{id}/queue/resume
 
-### Submit-and-Stream Pattern
-
-For programmatic use (e.g. agent-to-agent messaging):
-
-```bash
-# 1. Find the active connection
-CONN=$(curl -s localhost:4438/api/v1/connections | jq -r '.[0].logicalConnectionId')
-SESSION=$(curl -s localhost:4438/api/v1/connections | jq -r '.[0].latestSessionId')
-
-# 2. Submit a prompt
-TURN=$(curl -s -X POST localhost:4438/api/v1/connections/$CONN/prompt \
-  -H 'Content-Type: application/json' \
-  -d "{\"sessionId\": \"$SESSION\", \"text\": \"hello\"}" | jq -r '.promptTurnId')
-
-# 3. Stream the response
-curl -N localhost:4438/api/v1/prompt-turns/$TURN/stream
+# View peer registry
+curl localhost:4438/api/v1/registry
 ```
 
 ## Durable Streams
 
-The conductor embeds a [Durable Streams](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) HTTP server. All state (connections, prompt turns, chunks, permissions, terminals) is persisted as [STATE-PROTOCOL](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md) events to a single append-only stream.
+The conductor embeds a [Durable Streams](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) HTTP server. All state is persisted as [STATE-PROTOCOL](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md) events.
 
 ```bash
 # Read the raw state stream
@@ -155,111 +198,90 @@ curl http://localhost:4437/streams/durable-acp-state
 curl http://localhost:4437/streams/durable-acp-state?live=sse
 ```
 
-External clients (like the TypeScript `@durable-acp/client`) can subscribe to this stream for reactive UX: queue visibility, history replay, multi-session dashboards.
-
 ## Architecture
 
 ```
-Editor (ACP client)          durable-acp-rs (conductor)           Agent
-        |                           |                               |
-        |  stdin/stdout (ACP)       |  stdin/stdout (ACP)           |
-        |                           |                               |
-        |  session/prompt --------->|                               |
-        |                           |  -> persist promptTurn        |
-        |                           |  -> drain queue               |
-        |                           |  session/prompt ------------->|
-        |                           |                               |
-        |                           |  <-- session/update (text)    |
-        |                           |  -> persist chunk             |
-        |  <-- session/update       |                               |
-        |                           |                               |
-        |                           |    State Stream (durable)     |
-        |                           |    - connections              |
-        |                           |    - promptTurns              |
-        |                           |    - chunks                   |
-        |                           |    - permissions              |
-        |                           |    - terminals                |
+                        ┌─────────────────────────────────────────────┐
+Client ──ACP──► Conductor                                             │
+                │  DurableStateProxy  (intercept + persist)           │
+                │  PeerMcpProxy       (list_agents, prompt_agent)     │
+                │  Agent (claude-agent-acp, gemini, cline, etc.)      │
+                │                                                     │
+                │  Embedded Durable Streams Server (:4437)            │
+                │  REST API (:4438)                                   │
+                │  StreamDB (in-memory materialized state)            │
+                └─────────────────────────────────────────────────────┘
+                         ▲                              ▲
+                    stdio (ACP)                    HTTP/SSE
+                         │                              │
+                    Editor/CLI                   @durable-acp/client
+                                                 or peer agents
 ```
 
-The conductor occupies both ACP roles:
-- **Implements Agent** -- editors see it as a standard ACP agent
-- **Implements Client** (via proxy) -- the real agent sees it as a standard ACP client
+Proxy chain: `Client → DurableStateProxy → PeerMcpProxy → Agent`
+
+- **DurableStateProxy** -- intercepts all ACP messages, persists to state stream
+- **PeerMcpProxy** -- injects `list_agents` and `prompt_agent` MCP tools via [MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp)
+- **Agent** -- any ACP-compatible agent from the [registry](https://agentclientprotocol.com/registry)
 
 ## Project Structure
 
 ```
 src/
-  main.rs              CLI entry point for the conductor
+  main.rs              Conductor CLI entry point
   lib.rs               Module exports
-  conductor.rs         DurableStateProxy -- intercepts ACP messages, persists state
-  app.rs               AppState -- runtime state, queue management, chunk recording
-  state.rs             StreamDB + schema types (connections, turns, chunks, etc.)
+  conductor.rs         DurableStateProxy + PeerMcpProxy wiring
+  peer_mcp.rs          MCP server with list_agents + prompt_agent tools
+  acp_registry.rs      ACP registry client (cdn.agentclientprotocol.com)
+  registry.rs          Local agent registry (~/.config/durable-acp/)
+  app.rs               AppState -- runtime state, queue, chunk recording
+  state.rs             StreamDB + schema types
   durable_streams.rs   Embedded durable streams HTTP server
   api.rs               REST API endpoints (axum)
   bin/
-    chat.rs            Interactive ACP chat client
+    install.rs         Interactive agent installer
+    run.rs             Multi-agent runner
+    chat.rs            Interactive terminal chat client
+    peer.rs            Agent-to-agent CLI
+agents.toml            Multi-agent configuration
 tests/
-  basic.rs             Unit tests for StreamDB, durable streams, AppState
+  basic.rs             Unit tests
 ```
-
-## Dependencies
-
-| Crate | Purpose |
-|---|---|
-| `sacp` | ACP conductor framework (proxy chain, message routing) |
-| `sacp-conductor` | Conductor orchestrator (`ConductorImpl`, `ProxiesAndAgent`) |
-| `sacp-tokio` | Agent process spawning (`AcpAgent`) |
-| `agent-client-protocol` | Typed ACP schema (requests, responses, notifications) |
-| `durable-streams-server` | Embedded durable streams HTTP server |
-| `axum` | REST API server |
-| `tokio` | Async runtime |
-
-`sacp` and `agent-client-protocol` share the same underlying schema crate (`agent-client-protocol-schema`), so their types are identical and interchangeable.
 
 ## Development
 
 ```bash
-# Build
-cargo build
+cargo build            # build all binaries
+cargo test             # run tests
+cargo build --release  # optimized build
 
-# Run tests
-cargo test
-
-# Build release
-cargo build --release
-
-# Run with debug logging
+# Debug logging
 RUST_LOG=debug cargo run --bin chat
-
-# Run with sacp trace logging
-RUST_LOG=sacp=trace cargo run --bin chat
+RUST_LOG=sacp=trace cargo run --bin run
 ```
 
 ### Prerequisites
 
 - Rust 2024 edition (1.85+)
-- Node.js / npm (for `npx @agentclientprotocol/claude-agent-acp`)
-- `ANTHROPIC_API_KEY` environment variable (for Claude-based agents)
+- Node.js / npm (for npx-based agents)
+- `ANTHROPIC_API_KEY` (for Claude), `GEMINI_API_KEY` (for Gemini), etc.
 
 ### Known Issues
 
-- `agent-client-protocol-schema v0.11.4` does not include the `usage_update` session notification variant sent by `claude-agent-acp v0.25.3`. The chat client handles this gracefully by skipping unknown variants.
+- `agent-client-protocol-schema v0.11.4` doesn't include `usage_update` sent by `claude-agent-acp v0.25.3`. Handled gracefully by skipping unknown variants.
+- The `submit_prompt` API sends directly to the agent (bypasses the proxy's inbound handler). State recording is done explicitly in the API handler.
 
 ## References
 
 **ACP:**
 - [Protocol Overview](https://agentclientprotocol.com/protocol/overview)
 - [Proxy Chains RFD](https://agentclientprotocol.com/rfds/proxy-chains)
+- [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp)
 - [Conductor Spec](https://agentclientprotocol.github.io/symposium-acp/conductor.html)
+- [Agent Registry](https://agentclientprotocol.com/registry)
 - [Rust SDK](https://github.com/agentclientprotocol/rust-sdk)
 - [Cookbook](https://github.com/agentclientprotocol/rust-sdk/tree/main/src/agent-client-protocol-cookbook)
-- [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp)
 
 **Durable Streams:**
 - [Protocol Spec](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md)
 - [STATE-PROTOCOL Spec](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md)
-- [StreamDB Design](https://github.com/durable-streams/durable-streams/blob/main/docs/stream-db.md)
-
-**Design Docs:**
-- [Architecture](../distributed-acp/docs/v1-finish/README.md)
-- [Rust Conductor SDD](../distributed-acp/docs/v1-finish/rust-conductor-sdd.md)
