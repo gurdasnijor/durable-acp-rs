@@ -37,6 +37,17 @@ cargo run --bin run -- --list
 
 Agents are installed to `.agent-bin/` and automatically added to `agents.toml`.
 
+## Manage Agents
+
+```bash
+cargo run --bin agents                          # list configured agents
+cargo run --bin agents -- add claude-acp        # add from ACP registry (auto-assigns port)
+cargo run --bin agents -- add gemini --port 4441  # add with explicit port
+cargo run --bin agents -- add cline --name my-cline  # add with custom name
+cargo run --bin agents -- remove agent-b        # remove by name
+cargo run --bin agents -- clear                 # remove all
+```
+
 ## Multi-Agent Setup
 
 ### agents.toml
@@ -144,10 +155,11 @@ cargo run --bin peer -- prompt --agent agent-b "write a haiku about rust"
 
 | Binary | Purpose |
 |---|---|
-| `install` | Interactive agent installer -- browse ACP registry, install to `.agent-bin/`, update `agents.toml` |
+| `agents` | Manage `agents.toml` -- add, remove, list configured agents |
+| `install` | Interactive agent installer -- browse ACP registry, install to `.agent-bin/` |
 | `run` | Multi-agent runner -- start all agents from `agents.toml`, maintain ACP sessions |
 | `chat` | Interactive terminal chat -- connect directly to an agent, stream responses |
-| `peer` | Agent-to-agent CLI -- list peers, send prompts via REST API |
+| `peer` | Agent-to-agent CLI -- list running peers, send prompts via REST API |
 | `durable-acp-rs` | Conductor binary -- spawned by clients/editors as `agent_command` |
 
 ## REST API
@@ -239,6 +251,7 @@ src/
   durable_streams.rs   Embedded durable streams HTTP server
   api.rs               REST API endpoints (axum)
   bin/
+    agents.rs          Agent config manager (add/remove/list)
     install.rs         Interactive agent installer
     run.rs             Multi-agent runner
     chat.rs            Interactive terminal chat client
