@@ -161,6 +161,25 @@ via `serde_json::from_value` to skip unknown variants. With
 `unstable_session_usage` enabled, test whether `MatchDispatch::if_notification`
 works directly. If yes, remove the workaround (~30 lines per file).
 
+### Impact on other files
+
+**`src/app.rs` (~284 lines → ~240)**
+- Delete `proxy_connection: Arc<Mutex<Option<ConnectionTo<Conductor>>>>` — no API bypass
+- Delete `set_proxy_connection()` — no longer called
+- Delete `set_next_prompt_turn_id()` — no pre-generation needed
+- Core stays: `enqueue_prompt`, `record_chunk`, `finish_prompt_turn`, `write_state_event`, queue management
+
+**`src/api.rs` (~315 lines → ~150)**
+- `submit_prompt` drops from 63 to ~10 lines — forward to conductor subprocess, no bypass hack
+- `cancel_turn` simplifies — no `proxy_connection`
+- `stream_prompt_turn` replaced by `SseSubscriber` when W7 lands
+- Delete all `proxy_connection` usage
+- Simple read endpoints (`list_connections`, `get_queue`, `get_chunks`, `get_registry`) stay unchanged
+
+**`src/peer_mcp.rs` (~230 lines → merged into proxy config)**
+- `McpServiceRegistry` + `McpTool` impls replace manual `ConnectTo<Conductor>` + `McpServer::builder()`
+- `call_peer` HTTP helper stays (used for cross-process peering)
+
 ## Verification
 
 After Phase 1:
