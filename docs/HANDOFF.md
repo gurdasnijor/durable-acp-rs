@@ -107,29 +107,75 @@ The TUI and conductors share one `LocalSet`. The iocraft render loop yields betw
 
 ## What to Work On Next
 
-### SDDs Ready for Execution
+### Priority 1: Align with ACP SDK Paved Roads
 
-1. **Flamecast Integration** (`docs/flamecast-integration-sdd.md`) — Session CRUD API, pluggable transports, Flamecast API compatibility. This is the path to replacing Flamecast's backend with durable-acp-rs while keeping the React UI.
+The [Rust SDK v1 RFD](https://agentclientprotocol.com/rfds/rust-sdk-v1)
+defines the canonical patterns. We're already using the v1 API (via `sacp`),
+but at a low level. Aligning with higher-level abstractions reduces code
+and prevents drift from the ecosystem.
 
-2. **Event Subscribers** (`docs/event-subscribers-sdd.md`) — Unified WebSocket + webhook + SSE model. Delivers both Flamecast RFCs (multi-session WebSocket, webhooks) with a single `EventSubscriber` trait.
+**1a. Migrate to `sacp-proxy` v3.0.0** (~1-2 days)
 
-### Dashboard Polish
+Replace `sacp::Proxy.builder()` with `JrHandlerChain` + `ProxyHandler`.
+This cuts `conductor.rs` from ~400 lines to ~150 and gives us:
+- Automatic init/forwarding/session tracking/MCP wiring
+- `McpServiceRegistry` replaces manual `McpServer::builder()`
+- Transport-agnostic `.proxy().serve(ByteStreams)`
+- Composable proxy crates
 
-3. **Scrollable output** — wire up arrow keys / mouse wheel to iocraft's `ScrollView`.
+```rust
+// Before: manual Proxy.builder() with 6 handler registrations
+// After:
+JrHandlerChain::new()
+    .name("durable-state")
+    .on_request_from_client::<PromptRequest>(|req, cx| async { ... })
+    .on_notification_from_agent::<SessionNotification>(|notif, cx| async { ... })
+    .proxy()
+    .serve(transport)
+```
 
-4. **Peer prompt timeout** — add timeout on in-process `AgentRouter` path.
+**1b. Fix API prompt routing** (~0.5 day)
 
-5. **Permission UX** — verify interactive permission flow end-to-end.
+Route REST API prompts through `AgentRouter` → `session.send_prompt()`
+instead of `cx.send_request_to(Agent, ...)`. This sends through the
+client transport → conductor queue → proxy chain (correct path). See
+`known-limitations-sdd.md` §2.
 
-6. **Clean up dead code** — remove `Output` enum, `AgentHandle` struct, warnings.
+**1c. Use SDK v1 naming conventions**
 
-### Infrastructure
+The v1 RFD uses directional link types (`ClientToAgent`, `AgentToClient`,
+`ProxyToConductor`). Our code uses `sacp::Client`, `sacp::Agent`,
+`sacp::Conductor` which map to these. No code change needed, but comments
+and docs should reference the v1 terminology.
 
-7. **Persistent storage** — SQLite or file-backed durable streams server.
+### Priority 2: Close Remaining Gaps (see `known-limitations-sdd.md`)
 
-8. **Pluggable transports** — TCP/WebSocket `ByteStreams` for remote agents (spec'd in `flamecast-integration-sdd.md`).
+| Gap | Effort | Described In |
+|---|---|---|
+| File system access | ~0.5 day | `known-limitations-sdd.md` §4 |
+| Terminal management API | ~1 day | `known-limitations-sdd.md` §5 |
+| File-backed storage | ~0.5 day | `known-limitations-sdd.md` §1 |
+| WebSocket multiplexing | ~1.5 days | `event-subscribers-sdd.md` |
+| Webhooks | ~0.5 day | `event-subscribers-sdd.md` |
+| Runtime providers | ~2-3 days/provider | `known-limitations-sdd.md` §6 |
 
-9. **Editor integration** — test `durable-acp-rs` as `agent_command` in Zed, VS Code.
+### Priority 3: Flamecast Integration (see `flamecast-integration-sdd.md`)
+
+| Phase | What | Effort |
+|---|---|---|
+| Phase 1 | Session CRUD API (`/agents` endpoints) | ~1-2 days |
+| Phase 2 | Permission resolution + queue API | ~1 day |
+| Phase 3 | WebSocket (from event-subscribers-sdd) | ~2-3 days |
+| Phase 4 | Agent templates API | ~0.5 day |
+| Transports | TCP/WS `ByteStreams` for remote agents | ~1 day |
+
+### Priority 4: Dashboard Polish
+
+- Scrollable output (arrow keys / mouse wheel on `ScrollView`)
+- Peer prompt timeout on in-process path
+- Permission UX verification
+- Dead code cleanup (`Output` enum, `AgentHandle` struct)
+- Editor integration testing (Zed, VS Code)
 
 ## Flamecast Integration Opportunity
 
