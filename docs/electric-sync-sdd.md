@@ -56,39 +56,22 @@ No changes. The embedded `durable-streams-server` already:
 - Streams SSE (`?live=sse&offset=N`)
 - Handles producer idempotency
 
-### 2. Sync Service (~100 lines)
+### 2. Sync Service (reference impl exists)
 
-A small process that bridges DS stream → Postgres:
+The [durable-streams-server repo](https://thesampaton.github.io/durable-streams-rust-server/architecture/sync.html)
+provides a reference sync service (`e2e/sync/sync.mjs`) that does exactly
+this: subscribes to a DS stream via SSE, parses events, INSERTs into
+Postgres. We deploy it, not write it.
 
-```javascript
-// sync-service.mjs
-import { createClient } from "@electric-sql/client";
+Configuration only — point it at our DS stream URL and Postgres:
 
-const DS_STREAM_URL = process.env.DS_STREAM_URL;
-const PG_CONNECTION = process.env.DATABASE_URL;
-
-// Subscribe to DS stream via SSE
-const res = await fetch(`${DS_STREAM_URL}?live=sse&offset=-1`);
-const reader = res.body.getReader();
-
-// Parse SSE events, INSERT into Postgres
-while (true) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  
-  for (const event of parseSSE(value)) {
-    const { headers, key, value } = JSON.parse(event.data);
-    await db.query(
-      `INSERT INTO session_events (stream_name, event_type, event_key, operation, payload, ds_offset)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      ["durable-acp-state", headers.type, key, headers.operation, value, event.id]
-    );
-  }
-}
+```bash
+DS_STREAM_URL=http://localhost:4437/streams/durable-acp-state
+DATABASE_URL=postgresql://localhost/durable_acp
 ```
 
-This is the [reference pattern](https://thesampaton.github.io/durable-streams-rust-server/architecture/sync.html)
-from the durable-streams docs. Could also be written in Rust (~80 lines).
+The sync service handles SSE parsing, offset tracking, reconnection,
+and Postgres insertion. Zero custom code needed.
 
 ### 3. Postgres Schema
 
@@ -335,16 +318,17 @@ services:
 
 ## Effort
 
-| Component | Lines | Effort |
+| Component | New Code | Effort |
 |---|---|---|
 | Postgres schema (SQL) | ~40 lines | 0.5 day |
-| Sync service (JS or Rust) | ~100 lines | 0.5 day |
+| Sync service | 0 lines (deploy reference impl) | config only |
 | Webhook worker (JS) | ~50 lines | 0.5 day |
 | Docker compose | ~30 lines | included |
 | DurableACPClient (TS) with Electric | ~100 lines | 1 day |
-| **Total** | **~320 lines** | **~2.5 days** |
+| **Total** | **~220 lines** | **~2 days** |
 
 Compared to W6+W7 custom Rust: ~550 lines, ~4 days.
 
-Saves ~2 days AND gives us SQL queries, Grafana, full-text search,
-analytics, backup/restore — none of which the custom approach provides.
+Saves ~2 days, eliminates ~550 lines of custom Rust, AND gives us
+SQL queries, Grafana, full-text search, analytics, backup/restore —
+none of which the custom approach provides.
