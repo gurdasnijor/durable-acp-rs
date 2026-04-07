@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, Sse};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use agent_client_protocol::{CancelNotification, ContentBlock, PromptRequest};
 use futures::stream::Stream;
@@ -18,7 +18,8 @@ use crate::state::{ChunkRow, ChunkType, CollectionChange, ConnectionRow, PromptT
 pub fn router(app: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/connections", get(list_connections))
-        .route("/api/v1/connections/{id}/queue", get(get_queue))
+        .route("/api/v1/connections/{id}/queue", get(get_queue).delete(clear_queue).put(reorder_queue))
+        .route("/api/v1/connections/{id}/queue/{turn_id}", delete(cancel_queued_turn))
         .route("/api/v1/connections/{id}/queue/pause", post(pause_queue))
         .route("/api/v1/connections/{id}/queue/resume", post(resume_queue))
         .route("/api/v1/connections/{id}/prompt", post(submit_prompt))
@@ -239,6 +240,45 @@ async fn get_registry(
 
 fn is_terminal_chunk(chunk: &ChunkRow) -> bool {
     matches!(chunk.chunk_type, ChunkType::Stop | ChunkType::Error)
+}
+
+// --- Queue management ---
+
+async fn cancel_queued_turn(
+    Path((_id, turn_id)): Path<(String, String)>,
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    let removed = app.cancel_queued_turn(&turn_id).await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    if removed {
+        Ok(Json(serde_json::json!({ "cancelled": turn_id })))
+    } else {
+        Err(axum::http::StatusCode::NOT_FOUND)
+    }
+}
+
+async fn clear_queue(
+    Path(_id): Path<String>,
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    let count = app.cancel_all_queued().await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "cancelled": count })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReorderBody {
+    order: Vec<String>,
+}
+
+async fn reorder_queue(
+    Path(_id): Path<String>,
+    State(app): State<Arc<AppState>>,
+    Json(body): Json<ReorderBody>,
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    app.reorder_queue(&body.order).await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "reordered": true })))
 }
 
 // --- File system access ---

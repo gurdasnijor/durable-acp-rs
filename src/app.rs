@@ -246,6 +246,57 @@ impl AppState {
         Ok(())
     }
 
+    /// Cancel a specific queued turn. Returns true if it was found and removed.
+    pub async fn cancel_queued_turn(&self, turn_id: &str) -> Result<bool> {
+        let mut runtime = self.runtime.lock().await;
+        let before = runtime.queued.len();
+        runtime.queued.retain(|q| q.prompt_turn.prompt_turn_id != turn_id);
+        let removed = runtime.queued.len() < before;
+        drop(runtime);
+        if removed {
+            self.finish_prompt_turn(turn_id, "cancelled".to_string(), PromptTurnState::Cancelled)
+                .await?;
+        }
+        Ok(removed)
+    }
+
+    /// Cancel all queued turns. Returns the number removed.
+    pub async fn cancel_all_queued(&self) -> Result<usize> {
+        let mut runtime = self.runtime.lock().await;
+        let turns: Vec<String> = runtime.queued.iter()
+            .map(|q| q.prompt_turn.prompt_turn_id.clone()).collect();
+        runtime.queued.clear();
+        drop(runtime);
+        for turn_id in &turns {
+            self.finish_prompt_turn(turn_id, "cancelled".to_string(), PromptTurnState::Cancelled)
+                .await?;
+        }
+        Ok(turns.len())
+    }
+
+    /// Reorder the queue by the given turn IDs. IDs not in the list are dropped.
+    pub async fn reorder_queue(&self, order: &[String]) -> Result<()> {
+        let mut runtime = self.runtime.lock().await;
+        let mut by_id: std::collections::HashMap<String, QueuedPrompt> = runtime.queued
+            .drain(..)
+            .map(|q| (q.prompt_turn.prompt_turn_id.clone(), q))
+            .collect();
+        for (pos, id) in order.iter().enumerate() {
+            if let Some(mut q) = by_id.remove(id) {
+                q.prompt_turn.position = Some(pos as i64);
+                runtime.queued.push_back(q);
+            }
+        }
+        // Remaining items not in order list get cancelled
+        let orphans: Vec<String> = by_id.into_keys().collect();
+        drop(runtime);
+        for id in &orphans {
+            self.finish_prompt_turn(id, "cancelled".to_string(), PromptTurnState::Cancelled)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn set_paused(&self, paused: bool) -> Result<()> {
         {
             let mut runtime = self.runtime.lock().await;
