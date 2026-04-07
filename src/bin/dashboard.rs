@@ -743,7 +743,20 @@ async fn run_agent(
         .await;
 
     if let Err(e) = result {
-        tui.set_state(&name, "error");
-        tui.push_text(&name, &format!("[error] {}\n", e));
+        let s = e.to_string();
+        // usage_update parse errors kill the connection but aren't fatal
+        // — the agent completed the turn, just couldn't parse the final notification
+        if s.contains("Parse error")
+            || s.contains("unknown variant")
+            || s.contains("usage_update")
+            || s.contains("deserialization")
+        {
+            tui.set_state(&name, "error");
+            // Don't dump the full error — just note the disconnect
+            tui.push_text(&name, "[session ended — schema mismatch]\n");
+        } else {
+            tui.set_state(&name, "error");
+            tui.push_text(&name, &format!("[error] {}\n", s));
+        }
     }
 }
