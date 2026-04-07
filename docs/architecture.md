@@ -60,11 +60,11 @@ Implements `ConnectTo<Conductor>`. Injects two MCP tools via
 [MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp):
 
 - `list_agents` — reads local registry, returns peer names + URLs
-- `prompt_agent` — HTTP POST to peer's REST API, SSE streams the response
+- `prompt_agent` — routes through `AgentRouter` (in-process channels) or
+  falls back to HTTP REST API for cross-process/remote peers
 
-The conductor's `McpBridgeMode` handles the `mcp/connect`, `mcp/message`,
-`mcp/disconnect` protocol automatically. Agents that support MCP-over-ACP
-(like `claude-agent-acp`) see these as native tools.
+The conductor's `McpBridgeMode` handles `mcp/connect`, `mcp/message`,
+`mcp/disconnect` automatically. Agents see these as native tools.
 
 ## Multi-Agent Architecture
 
@@ -190,11 +190,162 @@ so types like `PromptRequest`, `SessionNotification`, `StopReason` are identical
 - **No scrollback navigation** — output pane auto-scrolls but no keyboard scroll
 - **Peer prompts block the session** — no timeout on in-process routing path
 
-## Future SDDs
+## Target Architecture
 
-- `multi-agent-conductor-sdd.md` — ✅ Implemented. Single-process multi-agent dashboard.
-- `flamecast-integration-sdd.md` — 🔜 Ready for execution. Flamecast API compatibility + pluggable transports.
-- `event-subscribers-sdd.md` — 🔜 Ready for execution. Unified WebSocket/webhook/SSE subscribers.
+The current system works end-to-end: multi-agent dashboard, in-process
+peering, durable state. The target architecture extends it across three axes:
+
+### 1. Unified Event Subscribers (see `event-subscribers-sdd.md`)
+
+```
+StreamDb::subscribe_changes()
+         │
+    SubscriberManager
+    ┌────┼──────────────┐
+    ▼    ▼              ▼
+   WS    Webhook        SSE
+```
+
+All three are the same `EventSubscriber` trait — subscribe to changes,
+filter by session/event, dispatch via different transport. Delivers both
+[Flamecast RFCs](https://flamecast.mintlify.app/rfcs/) (multi-session
+WebSocket, webhooks). The durable stream gives replay (`?since=N`) for
+all three.
+
+**Separation from ACP spec:**
+- Proxies intercept (per [Proxy Chains RFD](https://agentclientprotocol.com/rfds/proxy-chains))
+- Subscribers consume (our addition)
+- The durable stream bridges them
+
+### 2. Pluggable Transports (see `flamecast-integration-sdd.md`)
+
+```
+ConductorImpl::run(transport: ByteStreams<W, R>)
+                         ▲
+            ┌────────────┼────────────┐
+            │            │            │
+      stdio (local)   TCP/TLS    WebSocket
+      AcpAgent        TcpStream  tokio-tungstenite
+      (today)         (trivial)  (trivial)
+```
+
+All three are `AsyncRead + AsyncWrite`. The conductor, proxies, and
+StreamDB don't know which transport they're on. Enables:
+- Remote agents on GPU servers / cloud VMs / E2B sandboxes
+- Remote conductors connected from dashboard via TCP
+- Cross-machine peering via HTTP fallback (already works)
+
+```toml
+# agents.toml
+[[agent]]
+name = "local-claude"
+agent = "claude-acp"
+
+[[agent]]
+name = "remote-gemini"
+transport = "tcp"
+host = "gpu-server.internal"
+port = 9000
+```
+
+### 3. Flamecast-Compatible Control Plane (see `flamecast-integration-sdd.md`)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  durable-acp-rs                                         │
+│                                                         │
+│  Phase 1: Session CRUD API                              │
+│    POST/GET/DELETE /agents — create, list, terminate    │
+│    POST /agents/:id/prompts — send prompt               │
+│    GET /agents/:id/stream — SSE events                  │
+│                                                         │
+│  Phase 2: Permissions + Queue                           │
+│    POST /agents/:id/permissions/:id — resolve           │
+│    GET/PUT/DELETE /agents/:id/queue                     │
+│                                                         │
+│  Phase 3: WebSocket (unified subscriber)                │
+│    WS /ws — channel-based multiplex                     │
+│    subscribe/prompt/permission/queue/terminal            │
+│                                                         │
+│  Phase 4: Agent Templates                               │
+│    GET/POST/PUT /agent-templates                        │
+└─────────────────────────────────────────────────────────┘
+         ▲                              ▲
+    Flamecast React UI              Any HTTP client
+    (drop AcpBridge,                (curl, scripts,
+     FlamecastStorage,               other services)
+     event bus)
+```
+
+Flamecast's React UI points at durable-acp-rs endpoints. Flamecast cuts:
+- `AcpBridge` / `runtime-bridge` → `ConductorImpl`
+- `FlamecastStorage` (PGLite/Postgres) → durable streams + StreamDB
+- Event bus → `StreamDb::subscribe_changes()`
+- Session lifecycle → `SessionBuilder` + `ActiveSession`
+
+Flamecast gains:
+- MCP peering across all sessions (automatic)
+- In-process multi-agent (N agents, one process)
+- Durable sessions (replay from stream)
+- Pluggable transports (Docker/E2B agents via TCP)
+
+### 4. Persistent Storage + API Fix (see `known-limitations-sdd.md`)
+
+```
+EmbeddedDurableStreams
+    ├── InMemoryStorage (today)
+    └── FileStorage (target)
+            base_dir: ~/.local/share/durable-acp/streams/
+            format: append-only .jsonl per stream
+            startup: read + replay into StreamDB
+
+API prompt routing (target):
+    API handler → AgentRouter.prompt() → prompt_tx channel
+      → session.send_prompt() → client transport
+      → ConductorMessage queue → proxy chain → agent
+    (same path as TUI and peer prompts)
+```
+
+### Target Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  durable-acp-rs process                                          │
+│                                                                  │
+│  ┌─ Frontends ────────────────────────────────────────────────┐  │
+│  │  TUI (iocraft)    REST API (axum)    WebSocket    Webhooks │  │
+│  └────────┬──────────────┬──────────────────┬────────────┬───┘  │
+│           │              │                  │            │       │
+│  ┌────────▼──────────────▼──────────────────▼────────────▼───┐  │
+│  │  SubscriberManager + AgentRouter                           │  │
+│  │  (in-process channels, event dispatch)                     │  │
+│  └────────┬───────────────────────────────────────────────────┘  │
+│           │                                                      │
+│  ┌────────▼───────────────────────────────────────────────────┐  │
+│  │  N × ConductorImpl (one per agent)                         │  │
+│  │                                                            │  │
+│  │  Conductor A: Client → DurableStateProxy → PeerMcpProxy   │  │
+│  │                → Agent (stdio / TCP / WebSocket)           │  │
+│  │  Conductor B: Client → DurableStateProxy → PeerMcpProxy   │  │
+│  │                → Agent (stdio / TCP / WebSocket)           │  │
+│  └────────┬───────────────────────────────────────────────────┘  │
+│           │                                                      │
+│  ┌────────▼───────────────────────────────────────────────────┐  │
+│  │  Durable Streams Server (one instance)                     │  │
+│  │  State Stream → StreamDB (materialized collections)        │  │
+│  │  Storage: InMemory → FileStorage (target)                  │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+## SDDs
+
+| Doc | Status | Description |
+|---|---|---|
+| `multi-agent-conductor-sdd.md` | ✅ Implemented | Single-process multi-agent dashboard |
+| `flamecast-integration-sdd.md` | 🔜 Ready | Flamecast API + pluggable transports (~5 days) |
+| `event-subscribers-sdd.md` | 🔜 Ready | WebSocket + webhooks + SSE (~3 days) |
+| `known-limitations-sdd.md` | 🔜 Ready | Storage, API fix, drain loop (~1.5 days for first two) |
 
 ## References
 

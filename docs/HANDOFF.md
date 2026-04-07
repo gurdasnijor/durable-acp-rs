@@ -21,17 +21,23 @@ A Rust multi-agent orchestrator built on the [ACP](https://agentclientprotocol.c
 
 ## What Doesn't Work / Known Issues
 
-1. **Permission handling in dashboard** — the `cx.spawn` approach for interactive permissions is wired but untested. The permission prompt renders in the TUI but the response channel flow hasn't been verified end-to-end.
+See `docs/known-limitations-sdd.md` for full details and fixes.
 
-2. **`submit_prompt` API bypasses proxy inbound** — the REST API's POST `/prompt` sends `cx.send_request_to(Agent, ...)` which goes directly to the agent, not through `on_receive_request_from(Client, ...)`. State recording is done explicitly in the API handler. This works but duplicates logic from the conductor's proxy handler.
+1. **In-memory storage** — state lost on restart. Fix: file-backed `Storage` impl (~0.5 day).
 
-3. **Dead code warnings** — `Output` enum and `AgentHandle` struct in `dashboard.rs` are unused (replaced by direct `TuiState` writes). Should be cleaned up.
+2. **API bypasses proxy chain** — `POST /prompt` sends directly to agent. Fix: route through `AgentRouter` channel → `session.send_prompt()` (~0.5 day).
 
-4. **Some agents fail to start** — agents with binary distributions (cursor, goose, kimi, opencode) need their binaries installed separately. The dashboard shows them as `✕`. Only `npx`/`uvx`-based agents work out of the box.
+3. **Single-instance drain loop** — fine in single-process, needs CAS for multi-instance. Deferred.
 
-5. **Peer prompts block the session** — when agent-a calls `prompt_agent(agent-b, ...)`, agent-a's session blocks until agent-b responds. If agent-b is slow or stuck, agent-a hangs. No timeout on the in-process channel path (the HTTP path has 120s timeout).
+4. **Permission handling untested** — `cx.spawn` wiring exists but the TUI response flow isn't verified end-to-end.
 
-6. **No scrollback navigation** — the ScrollView renders output but there's no keyboard scrolling (arrow keys don't scroll the output pane). Would need iocraft's `ScrollView` keyboard integration.
+5. **Dead code** — `Output` enum, `AgentHandle` struct in `dashboard.rs`. Cleanup needed.
+
+6. **Some agents fail to start** — binary-distribution agents need manual install. Only `npx`/`uvx` work out of the box.
+
+7. **No scrollback** — output auto-scrolls but can't scroll back up.
+
+8. **Peer prompts block** — no timeout on in-process `AgentRouter` path.
 
 ## Architecture (Key Files)
 
