@@ -159,12 +159,30 @@ Flamecast doesn't know the conductor is there — it sees a standard ACP agent. 
 
 4. **Flamecast as dashboard**: Flamecast's React UI is more polished than the TUI dashboard. Running durable-acp-rs as the conductor layer while using Flamecast's web UI for visualization would combine the best of both: Rust performance + TypeScript UI.
 
+### durable-acp-rs as the control plane
+
+The Rust SDK already has `SessionBuilder` ([source](https://github.com/agentclientprotocol/rust-sdk/blob/main/src/agent-client-protocol-core/src/session.rs)) which handles session creation, MCP server injection, and provides `ActiveSession` with `send_prompt` / `read_update`. Combined with `ConductorImpl` + our durable state layer, this IS a control plane. What's needed:
+
+| Flamecast API | Implementation Path |
+|---|---|
+| `POST /sessions` (create) | Spawn `ConductorImpl` + `AcpAgent`, initialize, create session via `SessionBuilder` |
+| `DELETE /sessions/:id` (stop) | Drop the conductor task (kills agent subprocess) |
+| `GET /sessions` (list) | Read `connections` collection from `StreamDB` |
+| `GET /sessions/:id/events` (stream) | SSE from durable stream filtered by `logical_connection_id` |
+| `POST /sessions/:id/prompt` | Already exists in `api.rs` |
+| `POST /sessions/:id/permissions/:id/resolve` | Route to permission handler's response channel |
+| `GET /agents` (templates) | `acp_registry::fetch_registry()` + `agents.toml` |
+| `WS /ws` (bidirectional) | Wrap `StreamDb::subscribe_changes()` + prompt submission |
+
+The `StreamDB` collections (`connections`, `prompt_turns`, `chunks`, `permissions`, `terminals`) map directly to Flamecast's session state. The STATE-PROTOCOL event schema was designed to be compatible with `@durable-acp/state`.
+
 ### What to explore
 
 - Check if Flamecast's `AcpBridge` / `@acp/runtime-bridge` can accept a custom agent command (likely yes — the runtime providers already support this)
 - Verify the STATE-PROTOCOL event schema matches between the Rust and TypeScript implementations
 - Test: `flamecast dev` with agent command set to `durable-acp-rs npx @agentclientprotocol/claude-agent-acp`
 - Check if Flamecast's WebSocket protocol can subscribe to the durable stream's SSE endpoint
+- Build the session CRUD API endpoints to match Flamecast's API shape — the data layer already exists
 
 ## Running It
 
