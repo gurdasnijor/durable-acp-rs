@@ -327,10 +327,9 @@ async fn add_interactive(config_path: &PathBuf) -> Result<()> {
         .collect();
 
     let result_arc: SharedResult = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
-    smol::block_on(
-        element!(RegistryPicker(agents: items.clone(), result: result_arc.clone()))
-            .render_loop(),
-    )?;
+    element!(RegistryPicker(agents: items.clone(), result: result_arc.clone()))
+        .render_loop()
+        .await?;
     let result = result_arc.lock().unwrap().clone();
 
     if result.is_empty() {

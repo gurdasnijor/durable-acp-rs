@@ -195,6 +195,16 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
     let mut input = hooks.use_state(|| String::new());
     let mut done = hooks.use_state(|| false);
 
+    // Poll for state changes at 10Hz to trigger re-renders
+    // (conductor tasks update TuiState via Arc<Mutex>, iocraft needs a wake signal)
+    let mut tick = hooks.use_state(|| 0u64);
+    hooks.use_future(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tick.set(tick.get().wrapping_add(1));
+        }
+    });
+
     let agent_count = props.agent_count;
     let prompt_fn = props.prompt_fn.clone();
     let perm_fn = props.perm_fn.clone();
@@ -495,17 +505,17 @@ async fn main() -> Result<()> {
                 })
             };
 
-            // Run TUI
+            // Run TUI — render_loop is a standard Future, awaiting it on
+            // the LocalSet lets spawn_local conductor tasks interleave
             let agent_count = resolved.len();
-            smol::block_on(
-                element!(Dashboard(
-                    tui: tui_clone,
-                    agent_count: agent_count,
-                    prompt_fn: prompt_fn,
-                    perm_fn: perm_fn,
-                ))
-                .render_loop(),
-            )
+            element!(Dashboard(
+                tui: tui_clone,
+                agent_count: agent_count,
+                prompt_fn: prompt_fn,
+                perm_fn: perm_fn,
+            ))
+            .render_loop()
+            .await
             .ok();
 
             // Cleanup
@@ -670,6 +680,8 @@ async fn run_agent(
                                         let s = e.to_string();
                                         if s.contains("Parse error")
                                             || s.contains("unknown variant")
+                                            || s.contains("usage_update")
+                                            || s.contains("deserialization")
                                         {
                                             continue;
                                         }
