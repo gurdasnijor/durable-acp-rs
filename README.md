@@ -81,26 +81,58 @@ agent = "gemini"
 # command = ["node", "my-agent.js", "--acp"]
 ```
 
-## Agent-to-Agent Messaging
+## Agent-to-Agent Messaging (MCP Peering)
 
-Each agent automatically gets `list_agents` and `prompt_agent` [MCP tools](https://agentclientprotocol.com/rfds/mcp-over-acp) injected via the proxy chain. Agents discover and message peers without any configuration.
+Each agent automatically gets `list_agents` and `prompt_agent` tools injected as native MCP tools via the [MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp) transport. No configuration, no prompting — the tools appear alongside the agent's built-in tools (Bash, Read, Write, etc.).
+
+### How MCP-over-ACP works
+
+The `PeerMcpProxy` sits in the conductor's proxy chain. When the conductor initializes a session, it:
+
+1. Sends `proxy/initialize` to the proxy (per the [conductor spec](https://agentclientprotocol.github.io/symposium-acp/conductor.html))
+2. The proxy declares an MCP server with `list_agents` + `prompt_agent` tools
+3. The conductor adds the MCP server URL (`acp:<uuid>`) to the `NewSessionRequest`'s `mcpServers` list
+4. The agent connects to the MCP server via `mcp/connect`, `mcp/message` — all over the existing ACP connection
+5. The agent calls `tools/list` and discovers the peer tools
+
+The agent doesn't know the tools come from a proxy — they look like any other MCP tool. The conductor handles all the `mcp/connect`/`mcp/message`/`mcp/disconnect` routing via its `McpBridgeMode`.
+
+### In-process routing (dashboard)
+
+When agents run in the same process (the dashboard), peer prompts route through the `AgentRouter` — a shared registry of in-process channels:
 
 ```
-Agent A                     AgentRouter                   Agent B
-   |                            |                            |
-   |  list_agents() ----------->|                            |
-   |  <-- [agent-a, agent-b,   |                            |
-   |       codex-acp, ...]     |                            |
-   |                            |                            |
-   |  prompt_agent(             |                            |
-   |    name="agent-b",         |  in-process channel ------>|
-   |    text="write a haiku")   |  <-- streamed response     |
-   |  <-- complete text         |                            |
+Agent A calls prompt_agent(name="agent-b", text="...")
+  → PeerMcpProxy checks AgentRouter (global, in-process)
+  → AgentRouter finds agent-b's prompt channel
+  → Sends prompt through agent-b's session (same LocalSet)
+  → agent-b's read_update loop streams text into response buffer
+  → Complete response returned via oneshot channel
+  → Zero HTTP, zero serialization, zero latency
 ```
 
-In the dashboard, peer communication routes through **in-process channels** — zero HTTP overhead. The `prompt_agent` tool sends a prompt through the peer's session channel, collects streamed text from `read_update`, and returns the complete response.
+### Cross-process routing (separate conductors)
 
-When agents run in separate processes, `prompt_agent` falls back to the REST API (HTTP POST + SSE streaming).
+When agents run as separate processes, `prompt_agent` falls back to HTTP:
+
+```
+Agent A calls prompt_agent(name="agent-b", text="...")
+  → PeerMcpProxy checks AgentRouter (not found — different process)
+  → Falls back to HTTP via local registry (~/.config/durable-acp/registry.json)
+  → POST agent-b:4440/api/v1/connections/{id}/prompt
+  → GET  agent-b:4440/api/v1/prompt-turns/{id}/stream (SSE)
+  → Accumulates text chunks until stop
+  → Returns complete response as tool result
+```
+
+### What agents can do with peering
+
+- **Delegate tasks**: "ask agent-b to review this code"
+- **Multi-model workflows**: Claude writes code, Gemini reviews it, Codex tests it
+- **Collaborative debugging**: agents share findings via prompts
+- **Fan-out**: one agent prompts multiple peers in sequence
+
+The agents don't need special instructions. Claude naturally uses `list_agents` to discover peers and `prompt_agent` to message them when asked to collaborate.
 
 ## All Binaries
 
@@ -143,9 +175,34 @@ Each conductor manages one proxy chain per the [ACP Conductor Spec](https://agen
 - **PeerMcpProxy** — injects `list_agents` + `prompt_agent` MCP tools via [MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp)
 - **Agent** — any ACP-compatible agent from the [registry](https://agentclientprotocol.com/registry)
 
-### Durable State
+### Durable State — The Integration Layer
 
-All state persists to a single [durable stream](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) as [STATE-PROTOCOL](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md) events. Collections: connections, prompt turns, chunks, permissions, terminals.
+The durable state stream is the central innovation. Every ACP message that passes through the conductor is persisted to an append-only [durable stream](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) as [STATE-PROTOCOL](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md) events. This gives you three things for free:
+
+**1. Decoupling across network boundaries.** The state stream is an HTTP resource. Any client — a web dashboard, a CLI, a mobile app, another agent — can subscribe via SSE and see every prompt, every response chunk, every tool call, every permission request as it happens. The client doesn't need to speak ACP or be connected to the conductor's stdio. It just reads HTTP.
+
+```bash
+# Any client, anywhere, can watch the full agent session
+curl http://conductor-host:4437/streams/durable-acp-state?live=sse
+```
+
+**2. Free durability via proxy.** Because the conductor sits in the proxy chain, durability is transparent. The agent and client don't know state is being recorded — they speak standard ACP. Swap in the conductor as `agent_command` and every session is automatically durable. Remove it and everything works the same, just without persistence. Zero code changes on either side.
+
+**3. Durable sessions — reconnect and resume.** The state stream is the complete history. If a client disconnects and reconnects, it replays from the stream and has the full session: every prompt, every response, every tool call. The `StreamDB` materializes the stream into in-memory collections (`connections`, `prompt_turns`, `chunks`, `permissions`, `terminals`) keyed by `logical_connection_id`. External clients subscribe to collection changes for reactive UX.
+
+```
+State Stream (append-only log):
+  insert connection {id: "abc", state: "created"}
+  update connection {id: "abc", state: "attached", sessionId: "xyz"}
+  insert prompt_turn {id: "t1", state: "queued", text: "hello"}
+  update prompt_turn {id: "t1", state: "active"}
+  insert chunk {turnId: "t1", type: "text", content: "Hi!", seq: 0}
+  insert chunk {turnId: "t1", type: "text", content: " How can I help?", seq: 1}
+  insert chunk {turnId: "t1", type: "stop", seq: 2}
+  update prompt_turn {id: "t1", state: "completed"}
+```
+
+The `StreamDB` watches this stream and maintains live, queryable collections. Multiple conductors write to the same stream — the `logical_connection_id` partitions each agent's state.
 
 ## REST API
 
