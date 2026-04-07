@@ -44,6 +44,7 @@ conductor based on the user's agent selection.
 │  │  TUI (iocraft)                                          │ │
 │  │  - Agent sidebar with status                            │ │
 │  │  - Output pane with streamed responses                  │ │
+│  │  - Permission prompts inline                            │ │
 │  │  - Input bar for prompts                                │ │
 │  │  - Tab to switch agents                                 │ │
 │  └────────┬────────────────────────────────────────────────┘ │
@@ -51,57 +52,85 @@ conductor based on the user's agent selection.
 │  ┌────────▼────────────────────────────────────────────────┐ │
 │  │  Agent Manager                                          │ │
 │  │                                                         │ │
+│  │  Shared: EmbeddedDurableStreams (one server, one stream) │ │
+│  │  Shared: REST API (one port, all agents' state)         │ │
+│  │                                                         │ │
 │  │  agent-a:                                               │ │
 │  │    Client.builder()                                     │ │
-│  │      .connect_with(conductor_a, |conn| { ... })         │ │
-│  │    conductor_a = ConductorImpl::new_agent(              │ │
-│  │      ProxiesAndAgent::new(AcpAgent("claude-acp"))       │ │
-│  │        .proxy(DurableStateProxy { app_a })              │ │
-│  │        .proxy(PeerMcpProxy)                             │ │
-│  │    )                                                    │ │
-│  │    session_a: ActiveSession                             │ │
+│  │      .on_receive_request(permission_handler)            │ │
+│  │      .with_spawned(conductor_a)                         │ │
+│  │      .connect_with(transport, session_loop)             │ │
+│  │    AppState(shared_streams, "agent-a")                   │ │
+│  │    prompt_tx / output_rx channels                       │ │
 │  │                                                         │ │
 │  │  agent-b:                                               │ │
 │  │    Client.builder()                                     │ │
-│  │      .connect_with(conductor_b, |conn| { ... })         │ │
-│  │    conductor_b = ConductorImpl::new_agent(              │ │
-│  │      ProxiesAndAgent::new(AcpAgent("gemini"))           │ │
-│  │        .proxy(DurableStateProxy { app_b })              │ │
-│  │        .proxy(PeerMcpProxy)                             │ │
-│  │    )                                                    │ │
-│  │    session_b: ActiveSession                             │ │
-│  │                                                         │ │
+│  │      .on_receive_request(permission_handler)            │ │
+│  │      .with_spawned(conductor_b)                         │ │
+│  │      .connect_with(transport, session_loop)             │ │
+│  │    AppState(shared_streams, "agent-b")                   │ │
+│  │    prompt_tx / output_rx channels                       │ │
 │  └─────────────────────────────────────────────────────────┘ │
-│                                                              │
-│  Each conductor spawns its agent as a subprocess (stdio).    │
-│  The TUI and all conductors share one tokio runtime.         │
-│  No REST API needed for prompt submission — use in-process   │
-│  ActiveSession::send_prompt() directly.                      │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+## Runtime Model
+
+### The LocalSet + iocraft solution
+
+`LocalSet::run_until(fut)` doesn't "own the thread" exclusively — it pins
+`!Send` futures to the current thread. iocraft's `render_loop()` is a normal
+future. Nest them:
+
+```rust
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        // Spawn conductor tasks (!Send, need spawn_local)
+        for agent in agents {
+            tokio::task::spawn_local(run_conductor(agent));
+        }
+        // TUI render loop runs on same LocalSet — conductors
+        // execute between frames/events
+        smol::block_on(element!(Dashboard(...)).render_loop()).unwrap();
+    }).await;
+}
+```
+
+The `spawn_local` tasks run whenever the render loop yields (every frame/event).
+No separate threads, no channel bridging, no fighting.
 
 ## How It Works
 
 ### 1. Process startup
 
 ```rust
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let agents = load_agents_toml();
-    let registry = fetch_acp_registry();
+    let registry = fetch_acp_registry().await;
 
-    // Single tokio runtime + LocalSet (required by sacp)
-    let local_set = tokio::task::LocalSet::new();
-    local_set.run_until(async {
+    // One shared durable streams server
+    let durable_streams = EmbeddedDurableStreams::start(bind, "durable-acp-state").await;
+
+    // One shared REST API
+    spawn_api_server(api_port, durable_streams.clone()).await;
+
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
         let mut manager = AgentManager::new();
 
         for config in agents {
             let command = resolve_command(&config, &registry);
-            manager.spawn_agent(config, command).await;
+            manager.spawn_agent(config, command, durable_streams.clone()).await;
         }
 
-        // Run TUI — manager provides channels for prompt/response
-        run_tui(manager).await;
-    });
+        // Run TUI — conductors interleave on same thread
+        smol::block_on(
+            element!(Dashboard(manager: manager.handle())).render_loop()
+        ).unwrap();
+    }).await;
 }
 ```
 
@@ -112,26 +141,27 @@ Each agent gets its own `ConductorImpl` wired into a `Client.builder()` via
 
 ```rust
 impl AgentManager {
-    async fn spawn_agent(&mut self, config: AgentConfig, command: Vec<String>) {
+    async fn spawn_agent(
+        &mut self,
+        config: AgentConfig,
+        command: Vec<String>,
+        durable_streams: EmbeddedDurableStreams,
+    ) {
         let agent = AcpAgent::from_args(command);
-        let app = AppState::new(bind, config.state_stream).await;
+        let app = AppState::with_shared_streams(durable_streams, &config.name);
 
-        // Client connects to conductor, conductor connects to agent
-        let (prompt_tx, prompt_rx) = channel();
-        let (output_tx, output_rx) = channel();
+        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let (perm_tx, perm_rx) = mpsc::unbounded_channel();
 
         tokio::task::spawn_local(async move {
             Client.builder()
                 .name(&config.name)
                 .on_receive_request(
-                    // Handle permissions
-                    async |req: RequestPermissionRequest, responder, _cx| {
-                        // auto-approve or route to TUI
-                    },
+                    permission_handler(perm_tx, perm_rx),
                     on_receive_request!(),
                 )
                 .with_spawned(|_cx| async move {
-                    // The conductor runs inside with_spawned
                     ConductorImpl::new_agent(
                         config.name.clone(),
                         ProxiesAndAgent::new(agent)
@@ -141,25 +171,21 @@ impl AgentManager {
                     )
                 })
                 .connect_with(transport, async |connection| {
-                    // Initialize
                     connection.send_request(InitializeRequest::new(ProtocolVersion::V1))
                         .block_task().await?;
 
-                    // Create session
                     connection.build_session_cwd()?
                         .block_task()
                         .run_until(async |mut session| {
-                            // Signal ready
                             output_tx.send(Output::Ready);
 
-                            // Process prompts from TUI
                             while let Some(text) = prompt_rx.recv().await {
                                 session.send_prompt(&text)?;
                                 loop {
                                     match session.read_update().await? {
                                         SessionMessage::SessionMessage(dispatch) => {
-                                            // Parse and send to TUI
-                                            output_tx.send(Output::Chunk(text));
+                                            // Parse notification, send to TUI
+                                            output_tx.send(Output::Chunk(parse(dispatch)));
                                         }
                                         SessionMessage::StopReason(reason) => {
                                             output_tx.send(Output::Done(reason));
@@ -179,6 +205,7 @@ impl AgentManager {
             name: config.name,
             prompt_tx,
             output_rx,
+            perm_rx,
         });
     }
 }
@@ -191,23 +218,117 @@ No REST API, no HTTP, no SSE — pure in-process message passing.
 
 ```rust
 // User types prompt, hits enter
-let text = input_buf.to_string();
-let agent = &agents[selected_agent];
 agent.prompt_tx.send(text);
 
-// TUI polls output channels for streaming responses
-for agent in &agents {
-    while let Ok(output) = agent.output_rx.try_recv() {
-        match output {
-            Output::Ready => set_agent_state(&agent.name, "ready"),
-            Output::Chunk(text) => append_output(&agent.name, &text),
-            Output::Done(reason) => append_output(&agent.name, "\n"),
-        }
+// TUI polls output channels (in use_future or render loop)
+while let Ok(output) = agent.output_rx.try_recv() {
+    match output {
+        Output::Ready => set_agent_state("ready"),
+        Output::Chunk(chunk) => append_output(chunk),
+        Output::Done(reason) => append_output("\n"),
+        Output::Permission(req) => show_permission_prompt(req),
     }
 }
 ```
 
-### 4. Shared state infrastructure
+### 4. Permission handling (interactive)
+
+When an agent requests permission, the handler sends the request to the TUI
+via channel and awaits the user's response:
+
+```rust
+enum Output {
+    Ready,
+    Chunk(ChunkData),
+    Done(StopReason),
+    Permission(PermissionRequest),
+}
+
+enum PermissionResponse {
+    Approve(PermissionOptionId),
+    Deny,
+}
+```
+
+**Flow:**
+
+```
+Agent requests permission
+  → Client.on_receive_request handler fires
+  → Handler sends Output::Permission(req) to TUI via output_tx
+  → Handler awaits response on perm_response_rx channel
+  → TUI displays permission prompt inline in the output pane:
+
+     ┌─ Output — agent-a ──────────────────────────────┐
+     │ I need to read the file src/main.rs             │
+     │                                                  │
+     │ ⚠ Permission: Read file src/main.rs             │
+     │   [1] Always Allow  [2] Allow  [3] Deny         │
+     │   Choose (1-3): _                                │
+     └──────────────────────────────────────────────────┘
+
+  → User presses 1/2/3
+  → TUI sends PermissionResponse via perm_response_tx
+  → Handler receives response, calls responder.respond()
+  → Agent continues
+```
+
+**Implementation:**
+
+```rust
+fn permission_handler(
+    output_tx: Sender<Output>,
+    response_rx: Receiver<PermissionResponse>,
+) -> impl AsyncFnMut(RequestPermissionRequest, Responder, ConnectionTo) -> Result<()> {
+    async move |req, responder, cx| {
+        // Send to TUI
+        output_tx.send(Output::Permission(PermissionRequest {
+            agent_name: agent_name.clone(),
+            title: req.tool_call.fields.title.clone(),
+            options: req.options.clone(),
+            response_tx: oneshot::channel(),
+        }));
+
+        // Wait for user response (this runs on the event loop,
+        // but cx.spawn moves it off so the connection keeps processing)
+        cx.spawn(async move {
+            let response = response_rx.recv().await;
+            let outcome = match response {
+                Some(PermissionResponse::Approve(id)) =>
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
+                _ => RequestPermissionOutcome::Cancelled,
+            };
+            responder.respond(RequestPermissionResponse::new(outcome))
+        })?;
+        Ok(())
+    }
+}
+```
+
+**Key detail:** The permission handler uses `cx.spawn()` to move the blocking
+wait off the event loop. This is critical — the cookbook warns: "Message
+handlers run on the event loop. Blocking in a handler prevents the connection
+from processing new messages." The `cx.spawn` creates a task that awaits the
+user's response without blocking.
+
+**TUI key handling during permission prompt:**
+
+When a permission is pending, the TUI switches input mode. Instead of typing
+into the prompt bar, number keys (1/2/3) resolve the permission:
+
+```rust
+// In use_terminal_events
+if permission_pending.get() {
+    match code {
+        KeyCode::Char('1') => perm_response_tx.send(Approve(options[0].id)),
+        KeyCode::Char('2') => perm_response_tx.send(Approve(options[1].id)),
+        KeyCode::Char('3') | KeyCode::Char('n') => perm_response_tx.send(Deny),
+        _ => {}
+    }
+}
+```
+
+### 5. Shared state infrastructure
 
 Per the reference architecture, there is **one** durable streams server and
 **one** state stream for all agents. Multiple conductors write to the same
@@ -229,7 +350,7 @@ This means:
 - External clients see all agents' state in one subscription
 - The `StreamDB` already keys everything by `logical_connection_id`
 
-### 5. Agent-to-agent (peer) communication
+### 6. Agent-to-agent (peer) communication
 
 The `PeerMcpProxy` provides `list_agents` and `prompt_agent` tools. Since
 all agents share one process, peer communication can go through in-process
@@ -247,11 +368,11 @@ The REST API remains for:
    No changes to `ConductorImpl` needed.
 
 2. **`Client.builder().with_spawned().connect_with()`** — the pattern from
-   the conductor tests. The client and conductor run in the same process,
-   connected via in-memory transport.
+   the conductor tests. Client and conductor in same process, connected via
+   in-memory transport.
 
 3. **In-process channels for TUI ↔ agent** — `mpsc` channels carry prompts
-   down and streamed chunks up. No HTTP round-trips.
+   down and streamed chunks + permission requests up. No HTTP round-trips.
 
 4. **Shared durable streams** — one embedded server, one state stream, one
    REST API. All conductors write to the same stream, keyed by
@@ -260,50 +381,48 @@ The REST API remains for:
 5. **In-process peering** — `prompt_agent` routes through channels, not HTTP,
    when the target agent is in the same process.
 
-5. **Single `LocalSet`** — all conductors share one LocalSet on one thread.
+6. **Single `LocalSet`** — all conductors share one LocalSet on one thread.
    sacp futures are `!Send`, so everything runs on the same thread. This is
    fine — the actual work (LLM inference) happens in the agent subprocess,
    not in the conductor.
 
-6. **iocraft TUI runs on the same thread** — `smol::block_on()` drives the
-   render loop. It needs to yield to the LocalSet for conductor tasks. This
-   may require using `iocraft`'s async render hooks (`use_future`) to poll
-   channels, or running the TUI on a separate thread with the channels
-   bridging the gap.
+7. **iocraft render loop inside `LocalSet::run_until`** — the TUI future
+   runs on the same LocalSet as the conductor tasks. Conductor tasks
+   execute between render frames when the TUI yields.
 
-## Open Questions
+8. **Interactive permissions** — permission requests route to the TUI via
+   `Output::Permission`. The handler uses `cx.spawn()` to await the user's
+   response without blocking the event loop. The TUI switches to permission
+   input mode (number keys) while a request is pending.
 
-- **TUI + LocalSet coexistence**: iocraft's `render_loop()` and tokio's
-  `LocalSet::run_until()` both want to own the thread. Options:
-  - Run TUI on a separate OS thread, bridge via `Arc<Mutex>` + channels
-  - Use iocraft's `use_future` hook to poll inside the render loop
-  - Use a custom executor that interleaves both
+## Error Handling
 
-- **Permission routing**: When an agent requests permission, should the TUI
-  show an interactive prompt? Or auto-approve? If interactive, the permission
-  handler needs to send to the TUI channel and await a response.
-
-- **Error handling**: If one conductor crashes, the others should continue.
-  Each conductor runs in its own `spawn_local` — a panic in one shouldn't
-  bring down the process.
+- If one conductor crashes, the others continue. Each runs in its own
+  `spawn_local` task.
+- Crashed agents show error status in the TUI sidebar (● → ✕).
+- The TUI remains responsive — it's not blocked on any single agent.
+- Parse errors from unknown message types (e.g. `usage_update`) are
+  skipped, not fatal.
 
 ## Files to Change
 
 | File | Change |
 |---|---|
-| `src/bin/dashboard.rs` | Rewrite: remove subprocess spawning, use `Client.builder().with_spawned()` pattern, shared durable streams |
-| `src/app.rs` | Add `AppState::with_shared_streams()` constructor for shared durable streams |
-| `src/conductor.rs` | No changes — `build_conductor_with_peer_mcp` already returns `ConductorImpl` |
+| `src/bin/dashboard.rs` | Rewrite: in-process conductors, LocalSet+iocraft, permission routing |
+| `src/app.rs` | Add `AppState::with_shared_streams()` constructor |
+| `src/conductor.rs` | No changes |
 | `src/peer_mcp.rs` | Add in-process peer routing option alongside HTTP |
-| `src/api.rs` | Serve all agents' state from shared StreamDB (filter by connection ID or show all) |
+| `src/api.rs` | Serve all agents' state from shared StreamDB |
 | `Cargo.toml` | No new deps needed |
 
 ## What This Replaces
 
 The current `dashboard.rs` spawns N conductor subprocesses and talks to them
 via REST API. The new version:
-- Eliminates subprocess management
+- Eliminates subprocess management (conductors are in-process)
 - Eliminates REST API latency for prompt submission
 - Gets streaming responses via in-process channels instead of SSE
 - Has a single process to start/stop
-- Still runs the REST API per-agent for external/peer access
+- Interactive permission handling (not auto-approve)
+- Shared state stream for all agents
+- Still runs REST API for external access
