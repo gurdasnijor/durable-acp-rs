@@ -1,6 +1,6 @@
 # SDD: Known Limitations — Implementation Paths
 
-> Four technical debts that should be resolved before production use.
+> Three technical debts that should be resolved before production use.
 
 ## 1. In-Memory Storage — Durable Streams Reset on Restart
 
@@ -58,69 +58,7 @@ struct FileStorage {
 
 ---
 
-## 2. No Authentication Between Agents
-
-**Problem:** The peer registry (`~/.config/durable-acp/registry.json`) is
-trusted by default. Any agent can register and any agent can prompt any
-other agent. The HTTP fallback path in `prompt_agent` has no auth.
-
-**Impact:** Fine for local development. Unacceptable for remote agents or
-multi-tenant deployments.
-
-**Fix — two layers:**
-
-### Layer 1: Shared secret per agent (quick)
-
-Each agent gets a `secret` in `agents.toml`. The `prompt_agent` MCP tool
-and REST API require it as a `Bearer` token:
-
-```toml
-[[agent]]
-name = "agent-a"
-agent = "claude-acp"
-secret = "random-256-bit-hex"
-```
-
-```rust
-// REST API: verify Bearer token
-fn verify_auth(req: &Request, expected: &str) -> bool {
-    req.headers().get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.strip_prefix("Bearer "))
-        .flatten()
-        == Some(expected)
-}
-
-// AgentRouter: attach secret to registration
-router.register(name, tx, secret);
-```
-
-### Layer 2: mTLS for remote agents (proper)
-
-When pluggable transports land (see `flamecast-integration-sdd.md`), TCP
-connections should support mTLS. Each agent has a client certificate. The
-conductor verifies the certificate before accepting the connection.
-
-```toml
-[[agent]]
-name = "remote-agent"
-transport = "tcp"
-host = "gpu-server"
-port = 9000
-tls_cert = "certs/agent.pem"
-tls_key = "certs/agent-key.pem"
-tls_ca = "certs/ca.pem"
-```
-
-**Files to change:**
-- `src/registry.rs` — add `secret` field to `AgentEntry`
-- `src/peer_mcp.rs` — pass `Authorization` header in HTTP fallback
-- `src/api.rs` — verify `Bearer` token on mutation endpoints
-- `agents.toml` — add `secret` field
-
----
-
-## 3. `submit_prompt` API Bypasses Proxy Inbound Path
+## 2. `submit_prompt` API Bypasses Proxy Inbound Path
 
 **Problem:** `POST /api/v1/connections/{id}/prompt` calls
 `cx.send_request_to(Agent, request)` which sends directly to the agent,
@@ -132,32 +70,52 @@ handler. The API handler explicitly records the `PromptTurnRow` and
 enqueue/record logic changes, the API handler must be updated in sync.
 The API path doesn't go through the queue — it sends directly to the agent.
 
-**Root cause:** `send_request_to(Agent, ...)` sends downstream from the
-proxy's position. The proxy only intercepts requests coming FROM Client,
-but the API isn't the Client role.
+**Root cause:** The connection API (`ConnectionTo<Conductor>`) only supports
+sending **outgoing** messages to peers. It cannot re-inject a message into
+the **incoming** handler chain:
+
+```
+                            ┌── DurableStateProxy ──────────────────────┐
+                            │                                           │
+Client (stdin) ──────► on_receive_from(Client, req)                     │
+                            │    enqueue → drive_queue                  │
+                            │         ↓                                 │
+                            │    send_to(Agent) ───────────────► Agent  │
+                            │                                           │
+API ──────────────────── send_to(Agent) ────────────────────────► Agent │
+                            │   ↑ BYPASSES the handler chain            │
+                            └───────────────────────────────────────────┘
+```
+
+`send_request_to(Agent, ...)` sends downstream from the proxy's position.
+The proxy only fires `on_receive_request_from(Client, ...)` for messages
+arriving from the Client transport. There is no `inject_from(Client, req)`
+API on `ConnectionTo<Conductor>`.
 
 **Fix options:**
 
-### Option A: Inject request from Client side (ideal)
+### Option A: Write to the client-side transport (ideal)
 
-Find a way to inject the request into the conductor's handler chain as if
-it came from the Client transport. This would route through the proxy
-naturally. The challenge: `ConnectionTo<Conductor>` doesn't have a
-"send as if from Client" API.
-
-Possible approach: use the conductor's `with_spawned` callback to expose
-a channel that accepts external requests and feeds them into the client
-side of the transport:
+The dashboard creates `duplex` pipes for each conductor. The client side
+of the transport is `client_out` / `client_in`. An external prompt could
+be written directly to `client_out` as a raw ACP JSON-RPC message, which
+would enter the conductor from the Client side and trigger the proxy
+handler naturally:
 
 ```rust
-// During conductor setup
-let (external_prompt_tx, external_prompt_rx) = mpsc::unbounded_channel();
+// During setup, keep a handle to the client-side writer
+let (client_out, conductor_in) = duplex(64 * 1024);
+let client_writer = client_out.clone(); // for external injection
 
-// In the client transport handler, merge external prompts
-// with TUI prompts and send through the ACP connection
+// To inject a prompt from the API:
+let jsonrpc = format_jsonrpc_request("session/prompt", &prompt);
+client_writer.write_all(jsonrpc.as_bytes()).await?;
 ```
 
-### Option B: Share the enqueue logic (pragmatic)
+This is architecturally clean but requires raw JSON-RPC formatting and
+managing request IDs / response routing manually.
+
+### Option B: Share the enqueue logic (pragmatic, recommended)
 
 Extract the enqueue + state recording logic into a shared function that
 both the proxy handler and the API handler call. This doesn't fix the
@@ -181,7 +139,8 @@ The API endpoint is only needed for external clients. If external clients
 use the WebSocket protocol instead (from `event-subscribers-sdd.md`),
 the REST prompt endpoint becomes unnecessary.
 
-**Recommended:** Option B for now, Option A when the WebSocket layer lands.
+**Recommended:** Option B now, Option A later if raw transport injection
+proves necessary.
 
 **Files to change:**
 - `src/app.rs` — extract shared enqueue logic
@@ -190,7 +149,7 @@ the REST prompt endpoint becomes unnecessary.
 
 ---
 
-## 4. Single-Instance Drain Loop
+## 3. Single-Instance Drain Loop
 
 **Problem:** The drain loop (queued → active → send to agent → complete)
 runs inside each conductor. If two processes write to the same durable
