@@ -19,3 +19,41 @@ name = "pi-acp"
 port = 4443
 agent = "pi-acp"
 command = ["/Users/gnijor/gurdasnijor/durable-acp-rs/.agent-bin/pi-acp/run.sh"]
+
+[[agent]]
+name = "cursor"
+port = 4445
+agent = "cursor"
+
+[[agent]]
+name = "deepagents"
+port = 4447
+agent = "deepagents"
+command = ["/Users/gnijor/gurdasnijor/durable-acp-rs/.agent-bin/deepagents/run.sh"]
+
+[[agent]]
+name = "gemini"
+port = 4449
+agent = "gemini"
+command = ["/Users/gnijor/gurdasnijor/durable-acp-rs/.agent-bin/gemini/run.sh"]
+
+[[agent]]
+name = "goose"
+port = 4451
+agent = "goose"
+
+[[agent]]
+name = "kilo"
+port = 4453
+agent = "kilo"
+command = ["/Users/gnijor/gurdasnijor/durable-acp-rs/.agent-bin/kilo/run.sh"]
+
+[[agent]]
+name = "kimi"
+port = 4455
+agent = "kimi"
+
+[[agent]]
+name = "opencode"
+port = 4457
+agent = "opencode"

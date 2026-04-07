@@ -128,7 +128,11 @@ fn RegistryPicker(props: &RegistryPickerProps, mut hooks: Hooks) -> impl Into<An
                     selected.set(selected.get() ^ (1 << cursor.get()));
                 }
                 KeyCode::Enter => {
-                    let bits = selected.get();
+                    let mut bits = selected.get();
+                    // If nothing toggled, select the cursor item
+                    if bits == 0 {
+                        bits |= 1 << cursor.get();
+                    }
                     let indices: Vec<usize> = (0..agent_count)
                         .filter(|i| bits & (1 << i) != 0)
                         .collect();
