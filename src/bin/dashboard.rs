@@ -1,25 +1,39 @@
-//! Multi-agent TUI dashboard.
+//! Multi-agent TUI dashboard — single process, N conductors.
 //!
-//! Starts agents from agents.toml, shows status, lets you prompt any agent
-//! and streams responses in real-time.
+//! Runs all agents from agents.toml in one process with in-process
+//! conductors. The TUI acts as Terminal Client for all agents.
 //!
 //! Usage:
 //!   cargo run --bin dashboard
 //!   cargo run --bin dashboard -- --agent claude-acp
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::{self as acp, Agent as _};
+use agent_client_protocol::{
+    InitializeRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionNotification, SessionUpdate, ContentBlock, ContentChunk,
+};
 use anyhow::{Context, Result, bail};
 use clap::Parser as ClapParser;
 use iocraft::prelude::*;
+use sacp::{Client, Dispatch, SessionMessage, on_receive_request};
+use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
+use sacp_tokio::AcpAgent;
 use serde::Deserialize;
+use tokio::io::duplex;
+use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use durable_acp_rs::app::AppState;
+use durable_acp_rs::conductor::DurableStateProxy;
+use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
+use durable_acp_rs::peer_mcp::PeerMcpProxy;
+
 // ---------------------------------------------------------------------------
-// CLI
+// CLI + Config
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, ClapParser)]
@@ -38,10 +52,11 @@ struct Cli {
 #[derive(Debug, Clone, Deserialize)]
 struct AgentConfig {
     name: String,
+    #[allow(dead_code)]
     port: u16,
     agent: Option<String>,
     command: Option<Vec<String>>,
-    #[serde(default = "default_state_stream")]
+    #[serde(default = "default_ss")]
     state_stream: String,
 }
 
@@ -50,115 +65,114 @@ struct Config {
     agent: Vec<AgentConfig>,
 }
 
-fn default_state_stream() -> String {
+fn default_ss() -> String {
     "durable-acp-state".to_string()
 }
 
 // ---------------------------------------------------------------------------
-// Shared state between TUI and async tasks
+// Channel types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
-struct AgentStatus {
+#[derive(Debug, Clone)]
+enum Output {
+    Ready,
+    Text(String),
+    ToolCall(String),
+    Thinking,
+    Stop,
+    Error(String),
+    Permission(PermReq),
+}
+
+#[derive(Debug, Clone)]
+struct PermReq {
+    title: String,
+    options: Vec<(String, String)>, // (option_id, name)
+}
+
+// ---------------------------------------------------------------------------
+// Agent handle
+// ---------------------------------------------------------------------------
+
+struct AgentHandle {
     name: String,
-    port: u16,
+    prompt_tx: mpsc::UnboundedSender<String>,
+    output_rx: mpsc::UnboundedReceiver<Output>,
+    perm_tx: mpsc::UnboundedSender<Option<String>>, // None = deny, Some(id) = approve
+}
+
+// ---------------------------------------------------------------------------
+// Shared TUI state (Arc<Mutex> so iocraft can read it)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct TuiState {
+    inner: Arc<Mutex<TuiStateInner>>,
+}
+
+#[derive(Default)]
+struct TuiStateInner {
+    agents: Vec<AgentUiState>,
+}
+
+struct AgentUiState {
+    name: String,
     state: String, // "starting", "ready", "error"
+    output: Vec<String>,
+    perm_pending: Option<PermReq>,
 }
 
-#[derive(Clone, Debug)]
-struct OutputLine {
-    agent: String,
-    text: String,
-}
-
-#[derive(Clone)]
-struct DashState {
-    agents: Arc<Mutex<Vec<AgentStatus>>>,
-    output: Arc<Mutex<Vec<OutputLine>>>,
-    input_tx: tokio::sync::mpsc::UnboundedSender<(String, String)>, // (agent_name, text)
-}
-
-impl DashState {
-    fn new(input_tx: tokio::sync::mpsc::UnboundedSender<(String, String)>) -> Self {
-        Self {
-            agents: Arc::new(Mutex::new(Vec::new())),
-            output: Arc::new(Mutex::new(Vec::new())),
-            input_tx,
-        }
-    }
-
-    fn set_agent_state(&self, name: &str, state: &str) {
-        let mut agents = self.agents.lock().unwrap();
-        if let Some(a) = agents.iter_mut().find(|a| a.name == name) {
+impl TuiState {
+    fn set_state(&self, name: &str, state: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(a) = inner.agents.iter_mut().find(|a| a.name == name) {
             a.state = state.to_string();
         }
     }
 
-    fn push_output(&self, agent: &str, text: &str) {
-        let mut output = self.output.lock().unwrap();
-        // Append to last line if same agent and not newline-terminated
-        let should_append = output
-            .last()
-            .map(|l| l.agent == agent && !l.text.ends_with('\n'))
-            .unwrap_or(false);
-        if should_append {
-            output.last_mut().unwrap().text.push_str(text);
-        } else {
-            output.push(OutputLine {
-                agent: agent.to_string(),
-                text: text.to_string(),
-            });
-            let excess = output.len().saturating_sub(200);
+    fn push_text(&self, name: &str, text: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(a) = inner.agents.iter_mut().find(|a| a.name == name) {
+            let should_append = a.output.last().map(|l| !l.ends_with('\n')).unwrap_or(false);
+            if should_append {
+                a.output.last_mut().unwrap().push_str(text);
+            } else {
+                a.output.push(text.to_string());
+            }
+            let excess = a.output.len().saturating_sub(200);
             if excess > 0 {
-                output.drain(..excess);
+                a.output.drain(..excess);
             }
         }
     }
 
-    fn push_system(&self, text: &str) {
-        let mut output = self.output.lock().unwrap();
-        output.push(OutputLine {
-            agent: "system".to_string(),
-            text: text.to_string(),
-        });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Headless ACP client (for conductor connections)
-// ---------------------------------------------------------------------------
-
-struct HeadlessClient;
-
-#[async_trait::async_trait(?Send)]
-impl acp::Client for HeadlessClient {
-    async fn request_permission(
-        &self,
-        args: acp::RequestPermissionRequest,
-    ) -> acp::Result<acp::RequestPermissionResponse> {
-        let outcome = if let Some(opt) = args.options.first() {
-            acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
-                opt.option_id.clone(),
-            ))
-        } else {
-            acp::RequestPermissionOutcome::Cancelled
-        };
-        Ok(acp::RequestPermissionResponse::new(outcome))
+    fn set_perm(&self, name: &str, perm: Option<PermReq>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(a) = inner.agents.iter_mut().find(|a| a.name == name) {
+            a.perm_pending = perm;
+        }
     }
 
-    async fn session_notification(
-        &self,
-        _args: acp::SessionNotification,
-    ) -> acp::Result<(), acp::Error> {
-        Ok(())
-    }
-
-    async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn ext_notification(&self, _args: acp::ExtNotification) -> acp::Result<()> {
-        Ok(())
+    fn snapshot(&self, agent_idx: usize) -> (Vec<(String, String)>, Vec<String>, Option<PermReq>) {
+        let inner = self.inner.lock().unwrap();
+        let agents: Vec<(String, String)> = inner
+            .agents
+            .iter()
+            .map(|a| (a.name.clone(), a.state.clone()))
+            .collect();
+        let output = inner
+            .agents
+            .get(agent_idx)
+            .map(|a| {
+                let start = a.output.len().saturating_sub(30);
+                a.output[start..].to_vec()
+            })
+            .unwrap_or_default();
+        let perm = inner
+            .agents
+            .get(agent_idx)
+            .and_then(|a| a.perm_pending.clone());
+        (agents, output, perm)
     }
 }
 
@@ -168,144 +182,152 @@ impl acp::Client for HeadlessClient {
 
 #[derive(Default, Props)]
 struct DashboardProps {
-    dash: Option<DashState>,
-    agent_names: Vec<String>,
+    tui: Option<TuiState>,
+    agent_count: usize,
+    prompt_fn: Option<Arc<dyn Fn(usize, String) + Send + Sync>>,
+    perm_fn: Option<Arc<dyn Fn(usize, Option<String>) + Send + Sync>>,
 }
 
 #[component]
 fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut system = hooks.use_context_mut::<SystemContext>();
-    let mut selected_agent = hooks.use_state(|| 0usize);
-    let mut input_buf = hooks.use_state(|| String::new());
-    let mut should_exit = hooks.use_state(|| false);
+    let mut selected = hooks.use_state(|| 0usize);
+    let mut input = hooks.use_state(|| String::new());
+    let mut done = hooks.use_state(|| false);
 
-    let agent_count = props.agent_names.len();
-    let dash = props.dash.clone();
+    let agent_count = props.agent_count;
+    let prompt_fn = props.prompt_fn.clone();
+    let perm_fn = props.perm_fn.clone();
 
     hooks.use_terminal_events(move |event| match event {
         TerminalEvent::Key(KeyEvent { code, kind, .. }) if kind != KeyEventKind::Release => {
             match code {
-                    KeyCode::Enter => {
-                        let text = input_buf.to_string();
-                        if !text.is_empty() {
-                            if let Some(ref d) = dash {
-                                let agents = d.agents.lock().unwrap();
-                                let sel = selected_agent.get();
-                                if sel < agents.len() {
-                                    let name = agents[sel].name.clone();
-                                    drop(agents);
-                                    let _ = d.input_tx.send((name, text.clone()));
-                                }
-                            }
-                            input_buf.set(String::new());
+                KeyCode::Enter => {
+                    let text = input.to_string();
+                    if !text.is_empty() {
+                        if let Some(ref f) = prompt_fn {
+                            f(selected.get(), text);
+                        }
+                        input.set(String::new());
+                    }
+                }
+                KeyCode::Tab => selected.set((selected.get() + 1) % agent_count.max(1)),
+                KeyCode::BackTab => {
+                    selected.set((selected.get() + agent_count.max(1) - 1) % agent_count.max(1))
+                }
+                KeyCode::Char(c) => {
+                    // Check if permission pending — number keys resolve it
+                    // Otherwise append to input
+                    if c >= '1' && c <= '9' {
+                        if let Some(ref f) = perm_fn {
+                            // Try to resolve permission (perm_fn checks if pending)
+                            f(selected.get(), Some(c.to_string()));
+                            return;
                         }
                     }
-                    KeyCode::Char(c) => {
-                        let mut s = input_buf.to_string();
-                        s.push(c);
-                        input_buf.set(s);
+                    if c == 'n' || c == 'N' {
+                        if let Some(ref f) = perm_fn {
+                            f(selected.get(), None);
+                            return;
+                        }
                     }
-                    KeyCode::Backspace => {
-                        let mut s = input_buf.to_string();
-                        s.pop();
-                        input_buf.set(s);
-                    }
-                    KeyCode::Tab => {
-                        selected_agent.set((selected_agent.get() + 1) % agent_count.max(1));
-                    }
-                    KeyCode::BackTab => {
-                        selected_agent.set(
-                            (selected_agent.get() + agent_count.max(1) - 1) % agent_count.max(1),
-                        );
-                    }
-                    KeyCode::Esc => should_exit.set(true),
-                    _ => {}
+                    let mut s = input.to_string();
+                    s.push(c);
+                    input.set(s);
                 }
+                KeyCode::Backspace => {
+                    let mut s = input.to_string();
+                    s.pop();
+                    input.set(s);
+                }
+                KeyCode::Esc => done.set(true),
+                _ => {}
+            }
         }
         _ => {}
     });
 
-    if should_exit.get() {
+    if done.get() {
         system.exit();
     }
 
-    // Read current state
-    let agents: Vec<AgentStatus> = props
-        .dash
+    // Read snapshot
+    let (agents, output, perm) = props
+        .tui
         .as_ref()
-        .map(|d| d.agents.lock().unwrap().clone())
+        .map(|t| t.snapshot(selected.get()))
         .unwrap_or_default();
 
-    let output: Vec<OutputLine> = props
-        .dash
-        .as_ref()
-        .map(|d| {
-            let o = d.output.lock().unwrap();
-            let start = o.len().saturating_sub(30);
-            o[start..].to_vec()
-        })
-        .unwrap_or_default();
-
-    let sel = selected_agent.get();
-    let selected_name = agents.get(sel).map(|a| a.name.as_str()).unwrap_or("");
+    let sel = selected.get();
+    let sel_name = agents.get(sel).map(|a| a.0.as_str()).unwrap_or("");
 
     // Colors
     let border = Color::AnsiValue(60);
     let header = Color::AnsiValue(145);
     let dim = Color::AnsiValue(242);
     let active = Color::AnsiValue(110);
-    let ready_color = Color::AnsiValue(114);
-    let starting_color = Color::AnsiValue(179);
+    let ready_c = Color::AnsiValue(114);
+    let starting_c = Color::AnsiValue(179);
+    let error_c = Color::AnsiValue(196);
+    let warn_c = Color::AnsiValue(214);
 
     element! {
         View(flex_direction: FlexDirection::Column, width: 100pct, height: 100pct) {
             // Header
-            View(padding_left: 1, margin_bottom: 1) {
+            View(padding_left: 1) {
                 Text(content: "durable-acp", weight: Weight::Bold, color: active)
                 Text(content: format!("  {} agents", agents.len()), color: dim)
-                Text(content: "  tab=switch agent  esc=quit", color: dim)
+                Text(content: "  tab", color: active)
+                Text(content: "=switch  ", color: dim)
+                Text(content: "esc", color: active)
+                Text(content: "=quit", color: dim)
             }
 
-            // Main area: agents sidebar + output
-            View(flex_grow: 1.0, flex_direction: FlexDirection::Row) {
-                // Agent list (sidebar)
-                View(width: 20, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border) {
+            // Main: sidebar + output
+            View(flex_grow: 1.0, flex_direction: FlexDirection::Row, margin_top: 1) {
+                // Sidebar
+                View(width: 22, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
                         Text(content: "Agents", weight: Weight::Bold, color: header)
                     }
-                    #(agents.iter().enumerate().map(|(i, a)| {
+                    #(agents.iter().enumerate().map(|(i, (name, state))| {
                         let is_sel = i == sel;
                         let bg = if is_sel { Some(Color::AnsiValue(236)) } else { None };
-                        let indicator = if is_sel { ">" } else { " " };
-                        let state_color = match a.state.as_str() {
-                            "ready" => ready_color,
-                            "starting" => starting_color,
-                            _ => Color::AnsiValue(196),
-                        };
-                        let dot = match a.state.as_str() {
-                            "ready" => "●",
-                            "starting" => "○",
-                            _ => "✕",
+                        let ind = if is_sel { ">" } else { " " };
+                        let (dot, dc) = match state.as_str() {
+                            "ready" => ("●", ready_c),
+                            "starting" => ("○", starting_c),
+                            _ => ("✕", error_c),
                         };
                         element! {
                             View(background_color: bg, padding_left: 1) {
-                                Text(content: format!("{} {} {}", indicator, dot, a.name), color: if is_sel { active } else { dim })
+                                Text(content: format!("{} {} {}", ind, dot, name), color: if is_sel { active } else { dim })
                             }
                         }
                     }))
                 }
 
-                // Output area
+                // Output
                 View(flex_grow: 1.0, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border, margin_left: 1) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
-                        Text(content: format!("Output — {}", selected_name), weight: Weight::Bold, color: header)
+                        Text(content: format!("{}", sel_name), weight: Weight::Bold, color: header)
                     }
                     View(flex_grow: 1.0, flex_direction: FlexDirection::Column, padding: 1) {
-                        #(output.iter().filter(|l| l.agent == selected_name || l.agent == "system").map(|line| {
-                            let color = if line.agent == "system" { dim } else { Color::AnsiValue(252) };
+                        #(output.iter().map(|line| {
+                            element! { View { Text(content: line.clone(), color: Color::AnsiValue(252)) } }
+                        }))
+
+                        // Permission prompt (if pending)
+                        #(perm.as_ref().map(|p| {
                             element! {
-                                View {
-                                    Text(content: line.text.clone(), color: color)
+                                View(flex_direction: FlexDirection::Column, margin_top: 1, border_style: BorderStyle::Round, border_color: warn_c, padding: 1) {
+                                    Text(content: format!("Permission: {}", p.title), color: warn_c, weight: Weight::Bold)
+                                    #(p.options.iter().enumerate().map(|(i, (_id, name))| {
+                                        element! {
+                                            View { Text(content: format!("  [{}] {}", i + 1, name), color: header) }
+                                        }
+                                    }))
+                                    Text(content: "  [n] Deny", color: dim)
                                 }
                             }
                         }))
@@ -313,141 +335,14 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                 }
             }
 
-            // Input bar
+            // Input
             View(border_style: BorderStyle::Round, border_color: active, margin_top: 1) {
                 View(padding_left: 1, width: 100pct) {
-                    Text(content: format!("[{}] > {}_", selected_name, input_buf.to_string()), color: active)
+                    Text(content: format!("[{}] > {}_", sel_name, input.to_string()), color: active)
                 }
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Prompt submission via REST API
-// ---------------------------------------------------------------------------
-
-async fn submit_and_stream(
-    dash: DashState,
-    agent_name: String,
-    api_port: u16,
-    text: String,
-) {
-    let client = reqwest::Client::new();
-    let api_url = format!("http://127.0.0.1:{}", api_port);
-
-    let connections: Vec<serde_json::Value> = match client
-        .get(format!("{api_url}/api/v1/connections"))
-        .send()
-        .await
-    {
-        Ok(resp) => resp.json().await.unwrap_or_default(),
-        Err(e) => {
-            dash.push_output(&agent_name, &format!("[error: {}]\n", e));
-            return;
-        }
-    };
-
-    let conn = match connections.first() {
-        Some(c) => c,
-        None => {
-            dash.push_output(&agent_name, "[error: no connections]\n");
-            return;
-        }
-    };
-
-    let conn_id = conn["logicalConnectionId"].as_str().unwrap_or("");
-    let session_id = conn["latestSessionId"].as_str().unwrap_or("");
-
-    if session_id.is_empty() {
-        dash.push_output(&agent_name, "[error: no session]\n");
-        return;
-    }
-
-    // Submit prompt
-    dash.push_output(&agent_name, &format!("> {}\n", text));
-
-    let result: serde_json::Value = match client
-        .post(format!("{api_url}/api/v1/connections/{conn_id}/prompt"))
-        .json(&serde_json::json!({ "sessionId": session_id, "text": text }))
-        .send()
-        .await
-    {
-        Ok(resp) => resp.json().await.unwrap_or_default(),
-        Err(e) => {
-            dash.push_output(&agent_name, &format!("[error: {}]\n", e));
-            return;
-        }
-    };
-
-    let turn_id = result["promptTurnId"].as_str().unwrap_or("");
-    if turn_id.is_empty() {
-        dash.push_output(&agent_name, "[error: no promptTurnId]\n");
-        return;
-    }
-
-    // Stream response via SSE
-    let resp = match client
-        .get(format!("{api_url}/api/v1/prompt-turns/{turn_id}/stream"))
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            dash.push_output(&agent_name, &format!("[error: {}]\n", e));
-            return;
-        }
-    };
-
-    use futures::StreamExt;
-    let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
-
-    while let Some(chunk) = stream.next().await {
-        let bytes = match chunk {
-            Ok(b) => b,
-            Err(_) => break,
-        };
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-
-        while let Some(end) = buf.find("\n\n") {
-            let event = buf[..end].to_string();
-            buf = buf[end + 2..].to_string();
-
-            for line in event.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
-                        let chunk_type = chunk["type"].as_str().unwrap_or("");
-                        let content = chunk["content"].as_str().unwrap_or("");
-                        match chunk_type {
-                            "text" => dash.push_output(&agent_name, content),
-                            "tool_call" => {
-                                dash.push_output(&agent_name, &format!("\n[tool] {}\n", content))
-                            }
-                            "stop" => {
-                                dash.push_output(&agent_name, "\n");
-                                return;
-                            }
-                            "error" => {
-                                dash.push_output(
-                                    &agent_name,
-                                    &format!("\n[error] {}\n", content),
-                                );
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-    dash.push_output(&agent_name, "\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -464,14 +359,14 @@ async fn main() -> Result<()> {
             port: cli.port,
             agent: Some(agent_id.clone()),
             command: None,
-            state_stream: default_state_stream(),
+            state_stream: default_ss(),
         }]
     } else {
-        let config_path = &cli.config;
-        if !config_path.exists() {
-            bail!("Config '{}' not found. Use --agent <id>.", config_path.display());
+        let p = &cli.config;
+        if !p.exists() {
+            bail!("Config '{}' not found.", p.display());
         }
-        let config: Config = toml::from_str(&std::fs::read_to_string(config_path)?)?;
+        let config: Config = toml::from_str(&std::fs::read_to_string(p)?)?;
         config.agent
     };
 
@@ -479,15 +374,10 @@ async fn main() -> Result<()> {
         bail!("No agents configured.");
     }
 
+    // Resolve commands from ACP registry
     eprintln!("Fetching ACP agent registry...");
     let registry = durable_acp_rs::acp_registry::fetch_registry().await?;
 
-    let conductor_bin = std::env::current_exe()?
-        .parent()
-        .unwrap()
-        .join("durable-acp-rs");
-
-    // Resolve commands
     let mut resolved: Vec<(AgentConfig, Vec<String>)> = Vec::new();
     for config in &agents {
         let command = if let Some(cmd) = &config.command {
@@ -505,141 +395,343 @@ async fn main() -> Result<()> {
         resolved.push((config.clone(), command));
     }
 
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
-    let dash = DashState::new(input_tx);
+    // Shared durable streams server
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.port);
+    let durable_streams = EmbeddedDurableStreams::start(bind, "durable-acp-state").await?;
 
-    // Initialize agent status
+    // Shared REST API
+    let api_app_state = Arc::new(
+        AppState::with_shared_streams(durable_streams.clone()).await?,
+    );
+    let api_router = durable_acp_rs::api::router(api_app_state);
+    let api_listener =
+        tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], cli.port + 1))).await?;
+    tokio::spawn(async move {
+        let _ = axum::serve(api_listener, api_router).await;
+    });
+
+    // TUI state
+    let tui = TuiState::default();
     {
-        let mut statuses = dash.agents.lock().unwrap();
+        let mut inner = tui.inner.lock().unwrap();
         for (config, _) in &resolved {
-            statuses.push(AgentStatus {
+            inner.agents.push(AgentUiState {
                 name: config.name.clone(),
-                port: config.port,
                 state: "starting".to_string(),
+                output: vec![],
+                perm_pending: None,
             });
         }
     }
 
-    let agent_names: Vec<String> = resolved.iter().map(|(c, _)| c.name.clone()).collect();
+    // Channels for each agent
+    let mut prompt_txs: Vec<mpsc::UnboundedSender<String>> = Vec::new();
+    let mut perm_txs: Vec<mpsc::UnboundedSender<Option<String>>> = Vec::new();
 
-    // Spawn conductors
-    let local_set = tokio::task::LocalSet::new();
-    let dash_clone = dash.clone();
+    let local = tokio::task::LocalSet::new();
+    let tui_clone = tui.clone();
 
-    local_set.spawn_local(async move {
-        for (config, command) in &resolved {
-            let mut conductor_args = vec![
-                "--name".to_string(),
-                config.name.clone(),
-                "--port".to_string(),
-                config.port.to_string(),
-                "--state-stream".to_string(),
-                config.state_stream.clone(),
-            ];
-            conductor_args.extend(command.iter().cloned());
+    // Spawn agents and run TUI on the same LocalSet
+    local
+        .run_until(async move {
+            for (config, command) in &resolved {
+                let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<String>();
+                let (perm_response_tx, perm_response_rx) =
+                    mpsc::unbounded_channel::<Option<String>>();
 
-            let child_result = tokio::process::Command::new(&conductor_bin)
-                .args(&conductor_args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn();
+                prompt_txs.push(prompt_tx);
+                perm_txs.push(perm_response_tx);
 
-            let mut child = match child_result {
-                Ok(c) => c,
-                Err(e) => {
-                    dash_clone.set_agent_state(&config.name, "error");
-                    dash_clone.push_system(&format!("[{}] Failed to start: {}", config.name, e));
-                    continue;
-                }
+                let name = config.name.clone();
+                let tui2 = tui_clone.clone();
+                let ds = durable_streams.clone();
+
+                let agent = AcpAgent::from_args(command.clone())
+                    .with_context(|| format!("parse agent command for '{}'", name))
+                    .unwrap();
+
+                // Spawn conductor + client on this LocalSet
+                tokio::task::spawn_local(run_agent(name, agent, ds, tui2, prompt_rx, perm_response_rx));
+            }
+
+            // Build prompt/perm callbacks for TUI
+            let prompt_txs = Arc::new(prompt_txs);
+            let perm_txs = Arc::new(perm_txs);
+            let tui_for_perm = tui_clone.clone();
+
+            let prompt_fn: Arc<dyn Fn(usize, String) + Send + Sync> = {
+                let txs = prompt_txs.clone();
+                Arc::new(move |idx, text| {
+                    if let Some(tx) = txs.get(idx) {
+                        let _ = tx.send(text);
+                    }
+                })
             };
 
-            let outgoing = child.stdin.take().unwrap().compat_write();
-            let incoming = child.stdout.take().unwrap().compat();
-            let name = config.name.clone();
-            let dash2 = dash_clone.clone();
+            let perm_fn: Arc<dyn Fn(usize, Option<String>) + Send + Sync> = {
+                let txs = perm_txs.clone();
+                let tui = tui_for_perm;
+                Arc::new(move |idx, response| {
+                    // Check if there's a pending permission for this agent
+                    let inner = tui.inner.lock().unwrap();
+                    let perm = inner.agents.get(idx).and_then(|a| a.perm_pending.clone());
+                    drop(inner);
 
-            let (conn, handle_io) = acp::ClientSideConnection::new(
-                HeadlessClient,
-                outgoing,
-                incoming,
-                |fut| {
-                    tokio::task::spawn_local(fut);
-                },
-            );
-
-            tokio::task::spawn_local(handle_io);
-
-            tokio::task::spawn_local(async move {
-                match conn
-                    .initialize(
-                        acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
-                            acp::Implementation::new("durable-acp-dashboard", "0.1.0")
-                                .title("Dashboard"),
-                        ),
-                    )
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        dash2.set_agent_state(&name, "error");
-                        dash2.push_system(&format!("[{}] Init failed: {}", name, e));
-                        return;
+                    if let Some(perm) = perm {
+                        let option_id = response.and_then(|r| {
+                            r.parse::<usize>()
+                                .ok()
+                                .and_then(|n| perm.options.get(n - 1))
+                                .map(|(id, _)| id.clone())
+                        });
+                        if let Some(tx) = txs.get(idx) {
+                            let _ = tx.send(option_id);
+                        }
+                        tui.set_perm(
+                            &inner_name(&tui, idx),
+                            None,
+                        );
                     }
-                }
+                })
+            };
 
-                match conn
-                    .new_session(acp::NewSessionRequest::new(
-                        std::env::current_dir().unwrap_or_default(),
-                    ))
-                    .await
-                {
-                    Ok(_) => {
-                        dash2.set_agent_state(&name, "ready");
-                        dash2.push_system(&format!("[{}] Ready", name));
-                    }
-                    Err(e) => {
-                        dash2.set_agent_state(&name, "error");
-                        dash2.push_system(&format!("[{}] Session failed: {}", name, e));
-                    }
-                }
-
-                // Keep alive
-                let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
-                let _ = rx.await;
-                drop(child);
-            });
-        }
-    });
-
-    // Prompt submission task
-    let dash_for_input = dash.clone();
-    let agents_for_input = agents.clone();
-    tokio::spawn(async move {
-        while let Some((agent_name, text)) = input_rx.recv().await {
-            let port = agents_for_input
-                .iter()
-                .find(|a| a.name == agent_name)
-                .map(|a| a.port + 1)
-                .unwrap_or(4438);
-            let d = dash_for_input.clone();
-            tokio::spawn(submit_and_stream(d, agent_name, port, text));
-        }
-    });
-
-    // Run TUI on the local set
-    local_set
-        .run_until(async {
+            // Run TUI
+            let agent_count = resolved.len();
             smol::block_on(
-                element!(Dashboard(dash: dash.clone(), agent_names: agent_names)).render_loop(),
-            )?;
+                element!(Dashboard(
+                    tui: tui_clone,
+                    agent_count: agent_count,
+                    prompt_fn: prompt_fn,
+                    perm_fn: perm_fn,
+                ))
+                .render_loop(),
+            )
+            .ok();
 
             // Cleanup
-            for config in &agents {
+            for config in agents.iter() {
                 let _ = durable_acp_rs::registry::unregister(&config.name);
             }
-            Ok::<_, anyhow::Error>(())
         })
-        .await
+        .await;
+
+    Ok(())
+}
+
+fn inner_name(tui: &TuiState, idx: usize) -> String {
+    tui.inner
+        .lock()
+        .unwrap()
+        .agents
+        .get(idx)
+        .map(|a| a.name.clone())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent conductor task
+// ---------------------------------------------------------------------------
+
+async fn run_agent(
+    name: String,
+    agent: AcpAgent,
+    durable_streams: EmbeddedDurableStreams,
+    tui: TuiState,
+    mut prompt_rx: mpsc::UnboundedReceiver<String>,
+    mut perm_response_rx: mpsc::UnboundedReceiver<Option<String>>,
+) {
+    let app = match AppState::with_shared_streams(durable_streams).await {
+        Ok(app) => Arc::new(app),
+        Err(e) => {
+            tui.set_state(&name, "error");
+            tui.push_text(&name, &format!("[error] {}\n", e));
+            return;
+        }
+    };
+
+    // Register in peer registry
+    let _ = durable_acp_rs::registry::register(durable_acp_rs::registry::AgentEntry {
+        name: name.clone(),
+        api_url: "in-process".to_string(),
+        logical_connection_id: app.logical_connection_id.clone(),
+        registered_at: durable_acp_rs::app::now_ms(),
+    });
+
+    // In-memory transport: client <-> conductor
+    let (client_out, conductor_in) = duplex(64 * 1024);
+    let (conductor_out, client_in) = duplex(64 * 1024);
+
+    let conductor_transport =
+        sacp::ByteStreams::new(conductor_out.compat_write(), conductor_in.compat());
+    let client_transport =
+        sacp::ByteStreams::new(client_out.compat_write(), client_in.compat());
+
+    let name2 = name.clone();
+    let tui2 = tui.clone();
+
+    // Permission channel for this agent
+    let (perm_output_tx, mut perm_output_rx) = mpsc::unbounded_channel::<PermReq>();
+
+    // Merge permission requests into the perm_response flow
+    let tui_for_perm = tui.clone();
+    let name_for_perm = name.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(req) = perm_output_rx.recv().await {
+            tui_for_perm.set_perm(&name_for_perm, Some(req));
+        }
+    });
+
+    let result = Client
+        .builder()
+        .name(&format!("{}-client", name))
+        .on_receive_request(
+            {
+                let perm_tx = perm_output_tx;
+                let perm_rx = Arc::new(tokio::sync::Mutex::new(perm_response_rx));
+                let name = name.clone();
+                let tui = tui.clone();
+                async move |req: RequestPermissionRequest, responder, cx| {
+                    let title = req
+                        .tool_call
+                        .fields
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Permission".to_string());
+                    let options: Vec<(String, String)> = req
+                        .options
+                        .iter()
+                        .map(|o| (o.option_id.0.to_string(), o.name.clone()))
+                        .collect();
+
+                    let _ = perm_tx.send(PermReq {
+                        title: title.clone(),
+                        options: options.clone(),
+                    });
+
+                    let perm_rx = perm_rx.clone();
+                    let tui = tui.clone();
+                    let name = name.clone();
+
+                    cx.spawn(async move {
+                        let response = perm_rx.lock().await.recv().await.flatten();
+                        let outcome = if let Some(option_id) = response {
+                            RequestPermissionOutcome::Selected(
+                                SelectedPermissionOutcome::new(option_id),
+                            )
+                        } else {
+                            tui.push_text(&name, "[denied]\n");
+                            RequestPermissionOutcome::Cancelled
+                        };
+                        responder.respond(RequestPermissionResponse::new(outcome))
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .with_spawned({
+            let app = app.clone();
+            move |_cx| async move {
+                ConductorImpl::new_agent(
+                    name2.clone(),
+                    ProxiesAndAgent::new(agent)
+                        .proxy(DurableStateProxy { app })
+                        .proxy(PeerMcpProxy),
+                    McpBridgeMode::default(),
+                )
+                .run(conductor_transport)
+                .await
+            }
+        })
+        .connect_with(client_transport, {
+            let name = name.clone();
+            let tui = tui2;
+            async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+
+                connection
+                    .build_session_cwd()?
+                    .block_task()
+                    .run_until(async |mut session| {
+                        tui.set_state(&name, "ready");
+                        tui.push_text(&name, &format!("[{}] Ready\n", name));
+
+                        while let Some(text) = prompt_rx.recv().await {
+                            tui.push_text(&name, &format!("> {}\n", text));
+                            session.send_prompt(&text)?;
+
+                            loop {
+                                let msg = match session.read_update().await {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        let s = e.to_string();
+                                        if s.contains("Parse error")
+                                            || s.contains("unknown variant")
+                                        {
+                                            continue;
+                                        }
+                                        tui.push_text(&name, &format!("[error] {}\n", s));
+                                        break;
+                                    }
+                                };
+
+                                match msg {
+                                    SessionMessage::SessionMessage(dispatch) => {
+                                        if let Dispatch::Notification(ref m) = dispatch {
+                                            let params = serde_json::to_value(m.params())
+                                                .unwrap_or_default();
+                                            if let Ok(notif) =
+                                                serde_json::from_value::<SessionNotification>(params)
+                                            {
+                                                match notif.update {
+                                                    SessionUpdate::AgentMessageChunk(
+                                                        ContentChunk {
+                                                            content: ContentBlock::Text(t),
+                                                            ..
+                                                        },
+                                                    ) => {
+                                                        tui.push_text(&name, &t.text);
+                                                    }
+                                                    SessionUpdate::ToolCall(tc) => {
+                                                        tui.push_text(
+                                                            &name,
+                                                            &format!("\n[tool] {}\n", tc.title),
+                                                        );
+                                                    }
+                                                    SessionUpdate::ToolCallUpdate(tc) => {
+                                                        if let Some(title) = &tc.fields.title {
+                                                            tui.push_text(
+                                                                &name,
+                                                                &format!("[update] {}\n", title),
+                                                            );
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    SessionMessage::StopReason(_) => {
+                                        tui.push_text(&name, "\n");
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        Ok(())
+                    })
+                    .await
+            }
+        })
+        .await;
+
+    if let Err(e) = result {
+        tui.set_state(&name, "error");
+        tui.push_text(&name, &format!("[error] {}\n", e));
+    }
 }

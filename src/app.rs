@@ -42,6 +42,16 @@ pub struct QueuedPrompt {
 impl AppState {
     pub async fn new(bind: SocketAddr, state_stream: impl Into<String>) -> Result<Self> {
         let durable_streams = EmbeddedDurableStreams::start(bind, state_stream).await?;
+        Self::init(durable_streams).await
+    }
+
+    /// Create an AppState that shares an existing durable streams server.
+    /// Used by the multi-agent dashboard so all agents write to one state stream.
+    pub async fn with_shared_streams(durable_streams: EmbeddedDurableStreams) -> Result<Self> {
+        Self::init(durable_streams).await
+    }
+
+    async fn init(durable_streams: EmbeddedDurableStreams) -> Result<Self> {
         let logical_connection_id = Uuid::new_v4().to_string();
         let app = Self {
             logical_connection_id: logical_connection_id.clone(),
