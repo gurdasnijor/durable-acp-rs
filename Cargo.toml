@@ -46,3 +46,7 @@ path = "src/bin/peer.rs"
 [[bin]]
 name = "run"
 path = "src/bin/run.rs"
+
+[[bin]]
+name = "install"
+path = "src/bin/install.rs"
