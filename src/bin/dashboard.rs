@@ -294,7 +294,7 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
             }
 
             // Main: sidebar + output
-            View(flex_grow: 1.0, flex_direction: FlexDirection::Row, margin_top: 1) {
+            View(flex_grow: 1.0, flex_direction: FlexDirection::Row, margin_top: 1, overflow: Overflow::Hidden) {
                 // Sidebar
                 View(width: 22, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
@@ -317,8 +317,8 @@ fn Dashboard(props: &DashboardProps, mut hooks: Hooks) -> impl Into<AnyElement<'
                     }))
                 }
 
-                // Output — min_width:0 + overflow:Hidden prevents flex child from expanding beyond parent
-                View(flex_grow: 1.0, min_width: 0, flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border, margin_left: 1, overflow: Overflow::Hidden) {
+                // Output — flex_basis:Length(0) forces the flex child to not size from content
+                View(flex_grow: 1.0, flex_shrink: 1.0, flex_basis: FlexBasis::Length(0), flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border, margin_left: 1, overflow: Overflow::Hidden) {
                     View(padding_left: 1, border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
                         Text(content: format!("{}", sel_name), weight: Weight::Bold, color: header)
                     }
