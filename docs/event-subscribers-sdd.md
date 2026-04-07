@@ -254,6 +254,39 @@ All three read from the same broadcast channel. All three filter by
 session/event type. All three deliver the same `SessionEvent` payload.
 The only difference is the transport.
 
+## Relationship to `DurableACPClient` (TypeScript)
+
+This SDD is the **server side**. The `DurableACPClient` from
+`~/gurdasnijor/distributed-acp/packages/durable-acp-client/` is the
+**client side**. They're two halves of the same system:
+
+```
+DurableACPClient (TS)              durable-acp-rs (Rust)
+─────────────────────              ─────────────────────
+                                   StreamDb::subscribe_changes()
+                                          │
+                                   SubscriberManager
+                                   ┌──────┼──────────┐
+subscribes via WS  ◄────────────── WsSubscriber      │
+subscribes via SSE ◄──────────────────────────── SseSubscriber
+                                          │
+Slack/PagerDuty    ◄────────────── WebhookSubscriber
+```
+
+The `DurableACPClient` currently supports SSE (read-only) and HTTP POST
+(commands). The WsSubscriber adds the WebSocket transport that Flamecast's
+React UI expects — bidirectional, with channel multiplexing, prompt
+submission, and permission resolution over one connection.
+
+**Dependency chain:**
+1. This SDD → implements WsSubscriber (Flamecast's WS channel protocol)
+2. `DurableACPClient` → connects via WS (already has `WsTransport` class)
+3. Flamecast React UI → uses `DurableACPClient` hooks
+4. Flamecast cuts event bus + custom WS server
+
+Without this SDD, Flamecast can only use SSE (read-only). With it,
+Flamecast gets the full bidirectional protocol it already expects.
+
 ## What This Gives Flamecast
 
 1. **Drop the custom WebSocket server** — use the unified subscriber model
