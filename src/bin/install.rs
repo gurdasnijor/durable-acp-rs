@@ -1,11 +1,11 @@
 //! Interactive agent installer.
 //!
-//! Fetches the ACP registry, lets you pick agents, and installs them locally
-//! so they boot fast (no npx/uvx fetch on every start).
+//! Fetches the ACP registry, lets you pick agents with a checkbox UI,
+//! installs them locally to .agent-bin/, and updates agents.toml.
 //!
 //! Usage:
-//!   cargo run --bin install              # interactive select
-//!   cargo run --bin install -- claude-acp gemini  # install specific agents
+//!   cargo run --bin install              # interactive multi-select
+//!   cargo run --bin install -- claude-acp gemini  # install by ID
 //!   cargo run --bin install -- --list    # show installed agents
 
 use std::io::Write as _;
@@ -13,6 +13,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use console::style;
+use dialoguer::MultiSelect;
 use serde::Deserialize;
 
 #[derive(Debug, Parser)]
@@ -45,16 +47,15 @@ async fn main() -> Result<()> {
         return list_installed(&dir);
     }
 
-    eprintln!("Fetching ACP agent registry...");
+    eprintln!("{}", style("Fetching ACP agent registry...").dim());
     let registry = durable_acp_rs::acp_registry::fetch_registry().await?;
 
     let selected = if cli.agents.is_empty() {
-        interactive_select(&registry)?
+        interactive_select(&registry, &dir)?
     } else {
-        // Validate IDs
         for id in &cli.agents {
             if !registry.agents.iter().any(|a| a.id == *id) {
-                bail!("Unknown agent '{}'. Run with --list or no args to browse.", id);
+                bail!("Unknown agent '{}'. Run without args to browse.", id);
             }
         }
         cli.agents.clone()
@@ -66,89 +67,107 @@ async fn main() -> Result<()> {
     }
 
     std::fs::create_dir_all(&dir)?;
+    eprintln!();
 
+    let mut installed = Vec::new();
     for id in &selected {
         let agent = registry.agents.iter().find(|a| a.id == *id).unwrap();
-        install_agent(&dir, agent).await?;
+        if install_agent(&dir, agent).await? {
+            installed.push(id.clone());
+        }
     }
 
-    eprintln!("\nInstalled {} agent(s) to {}/", selected.len(), dir.display());
+    if installed.is_empty() {
+        return Ok(());
+    }
 
-    // Update agents.toml with installed agents
+    // Update agents.toml
     let toml_path = PathBuf::from("agents.toml");
-    update_agents_toml(&toml_path, &dir, &selected, &registry)?;
+    update_agents_toml(&toml_path, &dir, &installed, &registry)?;
+
+    eprintln!(
+        "\n{}",
+        style(format!(
+            "Installed {} agent(s). Run: cargo run --bin run",
+            installed.len()
+        ))
+        .green()
+        .bold()
+    );
 
     Ok(())
 }
 
 fn interactive_select(
     registry: &durable_acp_rs::acp_registry::RemoteRegistry,
+    install_dir: &PathBuf,
 ) -> Result<Vec<String>> {
-    let stdin = std::io::stdin();
+    // Check which are already installed
+    let installed: std::collections::HashSet<String> = if install_dir.exists() {
+        std::fs::read_dir(install_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().join("agent.json").exists())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
-    eprintln!("\nAvailable ACP agents:\n");
-    for (i, agent) in registry.agents.iter().enumerate() {
-        let dist = if agent.distribution.npx.is_some() {
-            "npx"
-        } else if agent.distribution.uvx.is_some() {
-            "uvx"
-        } else {
-            "bin"
-        };
-
-        let desc = if agent.description.len() > 45 {
-            format!("{}...", &agent.description[..42])
-        } else {
-            agent.description.clone()
-        };
-
-        eprintln!(
-            "  {:>2}) {:<20} [{:<3}] {}",
-            i + 1,
-            agent.id,
-            dist,
-            desc
-        );
-    }
-
-    eprintln!();
-    eprint!("Enter numbers separated by spaces (e.g. 1 4 5), or 'all': ");
-    std::io::stderr().flush()?;
-
-    let mut input = String::new();
-    stdin.read_line(&mut input)?;
-    let input = input.trim();
-
-    if input.is_empty() {
-        return Ok(vec![]);
-    }
-
-    if input == "all" {
-        return Ok(registry.agents.iter().map(|a| a.id.clone()).collect());
-    }
-
-    let mut selected = Vec::new();
-    for part in input.split_whitespace() {
-        if let Ok(n) = part.parse::<usize>() {
-            if n >= 1 && n <= registry.agents.len() {
-                selected.push(registry.agents[n - 1].id.clone());
+    let items: Vec<String> = registry
+        .agents
+        .iter()
+        .map(|a| {
+            let dist = if a.distribution.npx.is_some() {
+                "npx"
+            } else if a.distribution.uvx.is_some() {
+                "uvx"
             } else {
-                eprintln!("  Skipping invalid number: {}", n);
-            }
-        } else if registry.agents.iter().any(|a| a.id == part) {
-            selected.push(part.to_string());
-        } else {
-            eprintln!("  Skipping unknown: {}", part);
-        }
-    }
+                "bin"
+            };
 
-    Ok(selected)
+            let status = if installed.contains(&a.id) {
+                " [installed]"
+            } else {
+                ""
+            };
+
+            let desc = if a.description.len() > 40 {
+                format!("{}...", &a.description[..37])
+            } else {
+                a.description.clone()
+            };
+
+            format!(
+                "{:<18} {:>5}  {:<3}  {}{}",
+                a.id, a.version, dist, desc, status
+            )
+        })
+        .collect();
+
+    // Pre-select already installed agents
+    let defaults: Vec<bool> = registry
+        .agents
+        .iter()
+        .map(|a| installed.contains(&a.id))
+        .collect();
+
+    let selections = MultiSelect::new()
+        .with_prompt("Select agents to install (space to toggle, enter to confirm)")
+        .items(&items)
+        .defaults(&defaults)
+        .interact()?;
+
+    Ok(selections
+        .into_iter()
+        .map(|i| registry.agents[i].id.clone())
+        .filter(|id| !installed.contains(id)) // skip already installed
+        .collect())
 }
 
 async fn install_agent(
     dir: &PathBuf,
     agent: &durable_acp_rs::acp_registry::RemoteAgent,
-) -> Result<()> {
+) -> Result<bool> {
     let agent_dir = dir.join(&agent.id);
     std::fs::create_dir_all(&agent_dir)?;
 
@@ -164,24 +183,32 @@ async fn install_agent(
         serde_json::to_string_pretty(&meta)?,
     )?;
 
-    // For npx agents: pre-install the package
     if let Some(npx) = &agent.distribution.npx {
-        eprint!("  Installing {} (npm)...", agent.id);
+        eprint!(
+            "  {} {}...",
+            style("Installing").cyan(),
+            style(&agent.id).bold()
+        );
         std::io::stderr().flush()?;
 
         let status = std::process::Command::new("npm")
-            .args(["install", "--prefix", &agent_dir.to_string_lossy(), &npx.package])
+            .args([
+                "install",
+                "--prefix",
+                &agent_dir.to_string_lossy(),
+                &npx.package,
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .context("run npm install")?;
 
         if !status.success() {
-            eprintln!(" FAILED (npm exit {})", status.code().unwrap_or(-1));
-            return Ok(());
+            eprintln!(" {}", style("FAILED").red());
+            return Ok(false);
         }
 
-        // Write a launcher script
+        // Create launcher script
         let bin_name = npx.package.split('/').last().unwrap_or(&agent.id);
         let bin_name = bin_name.split('@').next().unwrap_or(bin_name);
         let launcher = agent_dir.join("run.sh");
@@ -203,9 +230,16 @@ async fn install_agent(
             std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
         }
 
-        eprintln!(" OK ({})", npx.package);
-    } else if let Some(uvx) = &agent.distribution.uvx {
-        eprint!("  Installing {} (pip)...", agent.id);
+        eprintln!(" {}", style("OK").green());
+        return Ok(true);
+    }
+
+    if let Some(uvx) = &agent.distribution.uvx {
+        eprint!(
+            "  {} {}...",
+            style("Installing").cyan(),
+            style(&agent.id).bold()
+        );
         std::io::stderr().flush()?;
 
         let status = std::process::Command::new("uv")
@@ -215,14 +249,27 @@ async fn install_agent(
             .status();
 
         match status {
-            Ok(s) if s.success() => eprintln!(" OK ({})", uvx.package),
-            _ => eprintln!(" SKIP (uv not available or install failed)"),
+            Ok(s) if s.success() => {
+                eprintln!(" {}", style("OK").green());
+                return Ok(true);
+            }
+            _ => {
+                eprintln!(" {} (uv not available)", style("SKIP").yellow());
+                return Ok(false);
+            }
         }
-    } else if let Some(binaries) = &agent.distribution.binary {
+    }
+
+    if let Some(binaries) = &agent.distribution.binary {
         let platform = durable_acp_rs::acp_registry::current_platform();
         if let Some(bin) = binaries.get(&platform) {
             if let Some(archive_url) = &bin.archive {
-                eprint!("  Downloading {} ({})...", agent.id, platform);
+                eprint!(
+                    "  {} {} ({})...",
+                    style("Downloading").cyan(),
+                    style(&agent.id).bold(),
+                    platform
+                );
                 std::io::stderr().flush()?;
 
                 let client = reqwest::Client::new();
@@ -232,35 +279,50 @@ async fn install_agent(
                 let archive_path = agent_dir.join("archive");
                 std::fs::write(&archive_path, &bytes)?;
 
-                // Extract based on extension
                 if archive_url.ends_with(".tar.gz") || archive_url.ends_with(".tgz") {
                     let status = std::process::Command::new("tar")
-                        .args(["xzf", &archive_path.to_string_lossy(), "-C", &agent_dir.to_string_lossy()])
+                        .args([
+                            "xzf",
+                            &archive_path.to_string_lossy(),
+                            "-C",
+                            &agent_dir.to_string_lossy(),
+                        ])
                         .status()?;
                     if !status.success() {
-                        eprintln!(" FAILED (tar)");
-                        return Ok(());
+                        eprintln!(" {}", style("FAILED").red());
+                        return Ok(false);
                     }
                 } else if archive_url.ends_with(".zip") {
                     let status = std::process::Command::new("unzip")
-                        .args(["-o", &archive_path.to_string_lossy().to_string(), "-d", &agent_dir.to_string_lossy().to_string()])
+                        .args([
+                            "-o",
+                            &archive_path.to_string_lossy().to_string(),
+                            "-d",
+                            &agent_dir.to_string_lossy().to_string(),
+                        ])
                         .stdout(std::process::Stdio::null())
                         .status()?;
                     if !status.success() {
-                        eprintln!(" FAILED (unzip)");
-                        return Ok(());
+                        eprintln!(" {}", style("FAILED").red());
+                        return Ok(false);
                     }
                 }
 
                 std::fs::remove_file(&archive_path).ok();
-                eprintln!(" OK");
+                eprintln!(" {}", style("OK").green());
+                return Ok(true);
             }
         } else {
-            eprintln!("  Skipping {} (no binary for {})", agent.id, platform);
+            eprintln!(
+                "  {} {} (no binary for {})",
+                style("Skip").yellow(),
+                agent.id,
+                platform
+            );
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 fn update_agents_toml(
@@ -269,7 +331,6 @@ fn update_agents_toml(
     selected: &[String],
     registry: &durable_acp_rs::acp_registry::RemoteRegistry,
 ) -> Result<()> {
-    // Read existing config to find which names/ports are taken
     let existing: Vec<AgentTomlEntry> = if path.exists() {
         let content = std::fs::read_to_string(path)?;
         let config: TomlConfig = toml::from_str(&content).unwrap_or_default();
@@ -283,47 +344,35 @@ fn update_agents_toml(
     let max_port = existing.iter().map(|a| a.port).max().unwrap_or(4435);
 
     let mut new_entries = Vec::new();
-    let mut next_port = max_port + 2; // ports are used in pairs (streams, api)
+    let mut next_port = max_port + 2;
 
     for id in selected {
-        // Skip if already in config
         if existing_names.contains(id.as_str()) {
-            eprintln!("  {} already in agents.toml, skipping", id);
             continue;
         }
 
         let agent = registry.agents.iter().find(|a| a.id == *id).unwrap();
         let agent_dir = install_dir.join(id);
 
-        // Build command: use local run.sh if it exists, otherwise resolve from registry
         let command = if agent_dir.join("run.sh").exists() {
-            vec![
-                agent_dir
-                    .join("run.sh")
-                    .canonicalize()
-                    .unwrap_or_else(|_| agent_dir.join("run.sh"))
-                    .to_string_lossy()
-                    .to_string(),
-            ]
+            vec![agent_dir
+                .canonicalize()
+                .unwrap_or(agent_dir.clone())
+                .join("run.sh")
+                .to_string_lossy()
+                .to_string()]
         } else {
             agent.resolve_command()?
         };
 
-        new_entries.push(AgentTomlEntry {
-            name: id.clone(),
-            port: next_port,
-            agent: None,
-            command: Some(command),
-        });
+        new_entries.push((id.clone(), next_port, command));
         next_port += 2;
     }
 
     if new_entries.is_empty() {
-        eprintln!("agents.toml already up to date.");
         return Ok(());
     }
 
-    // Append new entries to the file
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -331,27 +380,25 @@ fn update_agents_toml(
 
     if existing.is_empty() && !path.exists() {
         writeln!(file, "# Durable ACP agent configuration")?;
-        writeln!(file, "# Generated by: cargo run --bin install")?;
         writeln!(file)?;
     }
 
-    for entry in &new_entries {
+    for (name, port, command) in &new_entries {
         writeln!(file)?;
         writeln!(file, "[[agent]]")?;
-        writeln!(file, "name = \"{}\"", entry.name)?;
-        writeln!(file, "port = {}", entry.port)?;
-        if let Some(cmd) = &entry.command {
-            let cmd_str = cmd
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            writeln!(file, "command = [{}]", cmd_str)?;
-        }
+        writeln!(file, "name = \"{}\"", name)?;
+        writeln!(file, "port = {}", port)?;
+        let cmd_str = command
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(file, "command = [{}]", cmd_str)?;
     }
 
     eprintln!(
-        "Updated agents.toml with {} new agent(s).",
+        "\n{} Updated agents.toml with {} new agent(s).",
+        style("+").green(),
         new_entries.len()
     );
     Ok(())
@@ -364,6 +411,7 @@ struct TomlConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AgentTomlEntry {
     name: String,
     port: u16,
@@ -373,14 +421,22 @@ struct AgentTomlEntry {
 
 fn list_installed(dir: &PathBuf) -> Result<()> {
     if !dir.exists() {
-        eprintln!("No agents installed (directory {} doesn't exist).", dir.display());
-        eprintln!("Run: cargo run --bin install");
+        eprintln!(
+            "{}",
+            style("No agents installed. Run: cargo run --bin install").dim()
+        );
         return Ok(());
     }
 
-    println!("{:<20} {:<12} {}", "ID", "VERSION", "PATH");
+    println!(
+        "{:<20} {:<12} {}",
+        style("ID").bold(),
+        style("VERSION").bold(),
+        style("PATH").bold()
+    );
     println!("{}", "-".repeat(60));
 
+    let mut count = 0;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -392,11 +448,19 @@ fn list_installed(dir: &PathBuf) -> Result<()> {
                 serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
             println!(
                 "{:<20} {:<12} {}",
-                meta["id"].as_str().unwrap_or("?"),
+                style(meta["id"].as_str().unwrap_or("?")).green(),
                 meta["version"].as_str().unwrap_or("?"),
-                entry.path().display()
+                style(entry.path().display()).dim()
             );
+            count += 1;
         }
+    }
+
+    if count == 0 {
+        eprintln!(
+            "{}",
+            style("No agents installed. Run: cargo run --bin install").dim()
+        );
     }
 
     Ok(())

@@ -9,6 +9,8 @@ async-stream = "0.3"
 axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+console = "0.15"
+dialoguer = "0.11"
 dirs = "6"
 durable-streams-server = "0.1.3"
 futures = "0.3"
