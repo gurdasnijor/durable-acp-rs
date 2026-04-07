@@ -81,11 +81,10 @@ once dependencies are met.
 ```
                     ┌──────────────┐
                     │ W1: sacp-proxy│
-                    │ migration    │
-                    └──────┬───────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
+                    │ BLOCKED      │ sacp-proxy 3.0.0 depends on sacp 2.0.0
+                    │ (we're 11.0) │ Wait for upstream update
+                    └──────────────┘
+
        ┌───────────┐ ┌───────────┐ ┌──────────┐
        │W2: proxy  │ │W3: dash   │ │W4: API   │
        │binaries   │ │subprocess │ │fix       │
@@ -119,67 +118,74 @@ once dependencies are met.
 Independent: W6 (storage), W11 (filesystem), W12 (terminals)
 ```
 
-### Track A: SDK Alignment (critical path, ~3 days)
+### Track A: SDK Alignment (critical path, ~2 days)
 
 | W# | Task | Effort | Depends | SDD |
 |---|---|---|---|---|
-| W1 | Migrate to `sacp-proxy` v3.0.0 | 1-2d | — | [sdk-alignment.md](sdk-alignment.md) §1.1 |
-| W2 | Standalone proxy binaries | 0.5d | W1 | [sdk-alignment.md](sdk-alignment.md) §1.2 |
+| W1 | ~~Migrate to `sacp-proxy` v3.0.0~~ | BLOCKED | — | `sacp-proxy` 3.0.0 depends on `sacp` 2.0.0; we're on 11.0.0. Wait for upstream. |
+| W2 | Standalone proxy binaries | 0.5d | — | [sdk-alignment.md](sdk-alignment.md) §1.2 |
 | W3 | Dashboard → subprocess model | 1d | W2 | [sdk-alignment.md](sdk-alignment.md) §1.3 |
-| W4 | API prompt routing fix | 0.5d | W1 | [known-limitations-sdd.md](known-limitations-sdd.md) §2 |
+| W4 | API prompt routing fix | 0.5d | — | [known-limitations-sdd.md](known-limitations-sdd.md) §2 |
 | W5 | Conductor config support | 0.5d | W2 | [sdk-alignment.md](sdk-alignment.md) §1.2 |
 
-**What changes:**
+**What changes (W2-W4, using current sacp 11.0.0 APIs):**
 
 | File | Current | After | How |
 |---|---|---|---|
-| `conductor.rs` | 400 lines | 150 lines | `JrHandlerChain` + `ProxyHandler` replaces `Proxy.builder()` |
-| `peer_mcp.rs` | 230 lines | merged into proxy | `McpServiceRegistry` + `McpTool` impls replace manual MCP wiring |
-| `dashboard.rs` | 794 lines | 200 lines | Subprocess model — thin TUI over REST+SSE, no `LocalSet`/channels |
-| `api.rs` | 315 lines | 150 lines | Delete bypass hack, `submit_prompt` drops 63→10 lines |
-| `app.rs` | 284 lines | 240 lines | Delete `proxy_connection`, `set_next_prompt_turn_id` |
+| `conductor.rs` | 400 lines | 400 lines | Stays as-is (W1 blocked). Proxy binaries wrap it. |
+| `peer_mcp.rs` | 230 lines | 230 lines | Stays as-is (W1 blocked). Proxy binary wraps it. |
+| `dashboard.rs` | 794 lines | 200 lines | Subprocess model — thin TUI over REST+SSE |
+| `api.rs` | 315 lines | 150 lines | Delete bypass hack, route through conductor |
+| `app.rs` | 284 lines | 240 lines | Delete `proxy_connection` |
 | `agent_router.rs` | 80 lines | deleted | HTTP peering replaces in-process channels |
-| **Total** | **~2100 lines** | **~740 lines** | **-65%** |
+| **Total core** | **~2100 lines** | **~1220 lines** | **-42%** (W1 adds another -23% when unblocked) |
 
-**Key migrations:**
-- `sacp::Proxy.builder()` → `sacp_proxy::JrHandlerChain` (auto init/forward/session/MCP)
-- `McpServer::builder()` + `ConnectTo<Conductor>` → `McpServiceRegistry` + `McpTool` trait
+**Key migrations (W2-W4):**
+- In-process `ConductorImpl` → conductor subprocess per agent
 - In-process `AgentRouter` channels → HTTP peering (already works)
 - `proxy_connection` bypass hack → prompts route through conductor subprocess
-- `ClientSideConnection` (v0) in `run.rs` → subprocess model or `Client.builder()` (v1)
+- `ClientSideConnection` (v0) in `run.rs` → subprocess model
 
-### Track B: Infrastructure (parallelizable, ~4 days)
+### Track B: Infrastructure (parallelizable, ~2.5 days)
 
 | W# | Task | Effort | Depends | SDD |
 |---|---|---|---|---|
-| W6 | File-backed storage | 0.5d | — | [known-limitations-sdd.md](known-limitations-sdd.md) §1 |
-| W7 | EventSubscriber trait + manager | 0.5d | — | [event-subscribers-sdd.md](event-subscribers-sdd.md) |
-| W7a | WebSocket subscriber (Flamecast protocol) | 1.5d | W7 | [event-subscribers-sdd.md](event-subscribers-sdd.md) |
-| W7b | Webhook subscriber (HMAC) | 0.5d | W7 | [event-subscribers-sdd.md](event-subscribers-sdd.md) |
-| W7c | Generalized SSE endpoints | 0.5d | W7 | [event-subscribers-sdd.md](event-subscribers-sdd.md) |
+| W6 | File-backed storage (Rust-side) | 0.5d | — | [known-limitations-sdd.md](known-limitations-sdd.md) §1 |
+| W7 | ~~EventSubscriber trait~~ | ELIMINATED | — | Not needed — `@durable-acp/state` StreamDB IS the subscriber |
+| W7a | ~~WebSocket subscriber~~ | ELIMINATED | — | StreamDB subscribes via SSE directly |
+| W7b | Webhook forwarder | 0.5d | — | Tiny SSE→HTTP script (~50 lines) |
+| W7c | ~~Generalized SSE~~ | ELIMINATED | — | DS server SSE already works |
 | W11 | File system access API | 0.5d | — | [known-limitations-sdd.md](known-limitations-sdd.md) §4 |
 | W12 | Terminal management API | 1d | — | [known-limitations-sdd.md](known-limitations-sdd.md) §5 |
 
-**Delivers:** Persistent storage, real-time events via WS/webhook/SSE, filesystem and terminal access. All Flamecast feature gaps closed.
+**Key discovery:** The `@durable-acp/state` and `@durable-acp/client`
+packages (in `~/gurdasnijor/distributed-acp/`) already provide the
+TypeScript integration layer. They subscribe to the DS stream via SSE,
+materialize into TanStack DB collections, and provide reactive queries.
+See [electric-sync-sdd.md](electric-sync-sdd.md) for details.
 
-### Track C: Integration (depends on A + B, ~4-6 days)
+### Track C: Integration (depends on A + B, ~3-4 days)
 
 | W# | Task | Effort | Depends | SDD |
 |---|---|---|---|---|
-| W8 | Flamecast API + TS client | 2-3d | W7a | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) |
+| W8 | ~~Flamecast TS client~~ → verify schema compat | 0.5d | — | Client already exists (`@durable-acp/client`). Just verify Rust schema matches TS Zod schemas. |
 | W9 | Pluggable transports (TCP/WS) | 1d | W2 | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) |
 | W10 | Runtime providers (Docker/E2B) | 2-3d | W9 | [known-limitations-sdd.md](known-limitations-sdd.md) §6 |
 
-**Delivers:** Flamecast React UI points at durable-acp-rs. `FlamecastStorage` → `DurableStreamStorage`. Remote agents via TCP/WS. Docker/E2B sandboxes.
+**Key discovery:** The `@durable-acp/client` TypeScript package already
+exists. `FlamecastStorage` becomes a thin adapter wrapping `DurableACPClient`.
+See [electric-sync-sdd.md](electric-sync-sdd.md).
 
 ### Recommended Sequence (single developer)
 
 ```
-Week 1: W1 → W2 → W3 + W4     SDK alignment (clears tech debt)
-Week 2: W6 + W7 → W7a + W7b   Storage + event subscribers
-Week 3: W8 + W11 + W12         Flamecast API + missing features
-Week 4: W9 → W10               Transports + runtime providers
+Week 1: W2 → W3 + W4           Standalone binaries + subprocess dashboard + API fix
+Week 2: W6 + W8 + W11 + W12    File storage + schema verify + filesystem + terminals
+Week 3: W9 → W10               Transports + runtime providers
 ```
+
+**Total: ~3 weeks.** W1 (sacp-proxy) deferred until upstream updates.
+W7/W7a/W7c/W8-build eliminated (existing TS packages).
 
 ## Flamecast Integration Shape
 
@@ -214,13 +220,14 @@ Flamecast reads from durable stream (replaces FlamecastStorage):
 
 ## SDDs
 
-| Doc | Phase | What It Covers |
+| Doc | Status | What It Covers |
 |---|---|---|
-| [sdk-alignment.md](sdk-alignment.md) | Track A | `sacp-proxy` v3.0.0, standalone binaries, subprocess model |
-| [known-limitations-sdd.md](known-limitations-sdd.md) | Track A+B | Storage, API routing, filesystem, terminals, runtime providers |
-| [event-subscribers-sdd.md](event-subscribers-sdd.md) | Track B | WebSocket + webhook + SSE unified subscriber model |
-| [flamecast-integration-sdd.md](flamecast-integration-sdd.md) | Track C | Flamecast API, TS client, pluggable transports |
-| [workstreams.md](workstreams.md) | Reference | Detailed per-workstream specs + dependency analysis |
+| [sdk-alignment.md](sdk-alignment.md) | 🔜 Track A | Standalone binaries, subprocess model. W1 (sacp-proxy) BLOCKED. |
+| [known-limitations-sdd.md](known-limitations-sdd.md) | 🔜 Track A+B | Storage, API routing, filesystem, terminals, runtime providers |
+| [electric-sync-sdd.md](electric-sync-sdd.md) | 🔜 Track B+C | Native StreamDB integration — eliminates W7/W7a/W7c/W8-build |
+| [event-subscribers-sdd.md](event-subscribers-sdd.md) | ⚠️ Superseded | Replaced by StreamDB approach in `electric-sync-sdd.md` |
+| [flamecast-integration-sdd.md](flamecast-integration-sdd.md) | 🔜 Track C | Flamecast API, pluggable transports, what to cut |
+| [workstreams.md](workstreams.md) | Reference | Detailed per-workstream specs |
 | [multi-agent-conductor-sdd.md](multi-agent-conductor-sdd.md) | ✅ Done | In-process model (superseded by subprocess in Track A) |
 
 ## Key References
