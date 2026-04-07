@@ -7,3 +7,15 @@ agent = "claude-acp"
 name = "agent-b"
 port = 4439
 agent = "claude-acp"
+
+[[agent]]
+name = "codex-acp"
+port = 4441
+agent = "codex-acp"
+command = ["/Users/gnijor/gurdasnijor/durable-acp-rs/.agent-bin/codex-acp/run.sh"]
+
+[[agent]]
+name = "pi-acp"
+port = 4443
+agent = "pi-acp"
+command = ["/Users/gnijor/gurdasnijor/durable-acp-rs/.agent-bin/pi-acp/run.sh"]

@@ -152,38 +152,65 @@ fn RegistryPicker(props: &RegistryPickerProps, mut hooks: Hooks) -> impl Into<An
 
     let bits = selected.get();
 
+    // Muted palette for dark terminals
+    let border = Color::AnsiValue(60);   // dusty purple
+    let header = Color::AnsiValue(145);  // muted silver
+    let id_color = Color::AnsiValue(110); // soft blue
+    let id_dim = Color::AnsiValue(243);  // dim for configured
+    let ver_color = Color::AnsiValue(244); // subtle grey
+    let desc_color = Color::AnsiValue(249); // light grey
+    let check_on = Color::AnsiValue(114);  // soft green
+    let check_off = Color::AnsiValue(240); // dark grey
+    let cursor_bg = Color::AnsiValue(236); // very subtle highlight
+    let stripe_bg = Color::AnsiValue(234); // barely visible stripe
+    let hint = Color::AnsiValue(242);      // dim hint text
+    let type_npx = Color::AnsiValue(179);  // warm yellow
+    let type_uvx = Color::AnsiValue(139);  // muted purple
+    let type_bin = Color::AnsiValue(109);  // steel blue
+
     element! {
         View(flex_direction: FlexDirection::Column, width: 90) {
             View(margin_bottom: 1) {
-                Text(content: "Select agents to add (space=toggle, enter=confirm, q=cancel)", color: Color::Grey)
+                Text(content: "Select agents to add  ", color: header)
+                Text(content: "space", color: id_color, weight: Weight::Bold)
+                Text(content: "=toggle  ", color: hint)
+                Text(content: "enter", color: id_color, weight: Weight::Bold)
+                Text(content: "=confirm  ", color: hint)
+                Text(content: "q", color: id_color, weight: Weight::Bold)
+                Text(content: "=cancel", color: hint)
             }
-            View(flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: Color::Blue) {
-                View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
-                    View(width: 4) { Text(content: "", weight: Weight::Bold) }
-                    View(width: 22pct) { Text(content: "ID", weight: Weight::Bold, color: Color::White) }
-                    View(width: 12pct) { Text(content: "Version", weight: Weight::Bold, color: Color::White) }
-                    View(width: 6pct) { Text(content: "Type", weight: Weight::Bold, color: Color::White) }
-                    View(width: 55pct) { Text(content: "Description", weight: Weight::Bold, color: Color::White) }
+            View(flex_direction: FlexDirection::Column, border_style: BorderStyle::Round, border_color: border) {
+                View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: border) {
+                    View(width: 4) { Text(content: "") }
+                    View(width: 22pct) { Text(content: "ID", weight: Weight::Bold, color: header) }
+                    View(width: 12pct) { Text(content: "Version", weight: Weight::Bold, color: header) }
+                    View(width: 6pct) { Text(content: "Type", weight: Weight::Bold, color: header) }
+                    View(width: 55pct) { Text(content: "Description", weight: Weight::Bold, color: header) }
                 }
                 #(props.agents.iter().enumerate().map(|(i, a)| {
                     let is_cursor = i == cursor.get();
                     let is_selected = bits & (1 << i) != 0;
                     let marker = if is_selected { "[x]" } else { "[ ]" };
-                    let bg = if is_cursor { Some(Color::DarkBlue) } else if i % 2 == 1 { Some(Color::DarkGrey) } else { None };
+                    let bg = if is_cursor { Some(cursor_bg) } else if i % 2 == 1 { Some(stripe_bg) } else { None };
                     let tag = if a.configured { " *" } else { "" };
+                    let tc = match a.dist.as_str() {
+                        "npx" => type_npx,
+                        "uvx" => type_uvx,
+                        _ => type_bin,
+                    };
                     element! {
                         View(background_color: bg) {
-                            View(width: 4) { Text(content: marker, color: if is_selected { Color::Green } else { Color::Grey }) }
-                            View(width: 22pct) { Text(content: format!("{}{}", a.id, tag), color: if a.configured { Color::DarkGrey } else { Color::Cyan }) }
-                            View(width: 12pct) { Text(content: a.version.clone(), color: Color::Grey) }
-                            View(width: 6pct) { Text(content: a.dist.clone()) }
-                            View(width: 55pct) { Text(content: a.desc.clone(), color: Color::Grey) }
+                            View(width: 4) { Text(content: marker, color: if is_selected { check_on } else { check_off }) }
+                            View(width: 22pct) { Text(content: format!("{}{}", a.id, tag), color: if a.configured { id_dim } else { id_color }) }
+                            View(width: 12pct) { Text(content: a.version.clone(), color: ver_color) }
+                            View(width: 6pct) { Text(content: a.dist.clone(), color: tc) }
+                            View(width: 55pct) { Text(content: a.desc.clone(), color: desc_color) }
                         }
                     }
                 }))
             }
             View(margin_top: 1) {
-                Text(content: "* = already configured", color: Color::DarkGrey)
+                Text(content: "* = already configured", color: hint)
             }
         }
     }
