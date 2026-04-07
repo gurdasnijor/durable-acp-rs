@@ -207,18 +207,39 @@ for agent in &agents {
 }
 ```
 
-### 4. Agent-to-agent (peer) communication
+### 4. Shared state infrastructure
 
-Same as before — the `PeerMcpProxy` provides `list_agents` and `prompt_agent`
-tools. These still use the REST API to talk to peers because each conductor
-has its own `AppState` with its own embedded durable streams server and REST
-API. The REST API remains useful for:
+Per the reference architecture, there is **one** durable streams server and
+**one** state stream for all agents. Multiple conductors write to the same
+stream, differentiated by `logical_connection_id`.
+
+```rust
+// One shared durable streams server + StreamDB
+let durable_streams = EmbeddedDurableStreams::start(bind, "durable-acp-state").await?;
+
+// Each agent gets its own AppState but shares the durable streams server
+let app_a = AppState::with_shared_streams(durable_streams.clone(), "agent-a");
+let app_b = AppState::with_shared_streams(durable_streams.clone(), "agent-b");
+```
+
+This means:
+- **One HTTP port** for durable streams (not N)
+- **One REST API port** for all agents (not N)
+- **One state stream** with all connections, turns, chunks
+- External clients see all agents' state in one subscription
+- The `StreamDB` already keys everything by `logical_connection_id`
+
+### 5. Agent-to-agent (peer) communication
+
+The `PeerMcpProxy` provides `list_agents` and `prompt_agent` tools. Since
+all agents share one process, peer communication can go through in-process
+channels instead of HTTP. The `prompt_agent` tool sends a prompt to a peer's
+channel and streams the response back — zero network overhead.
+
+The REST API remains for:
 - External clients subscribing to state
-- Agent-to-agent messaging across process boundaries
+- Remote agent-to-agent messaging (future)
 - Programmatic access from scripts/CLIs
-
-The difference: the REST API is no longer needed for the TUI's own prompt
-submission. That goes through in-process channels.
 
 ## Key Decisions
 
@@ -232,8 +253,12 @@ submission. That goes through in-process channels.
 3. **In-process channels for TUI ↔ agent** — `mpsc` channels carry prompts
    down and streamed chunks up. No HTTP round-trips.
 
-4. **REST API still runs per-agent** — for external access and peer messaging.
-   The TUI just doesn't use it for its own prompts.
+4. **Shared durable streams** — one embedded server, one state stream, one
+   REST API. All conductors write to the same stream, keyed by
+   `logical_connection_id`. Matches the reference architecture.
+
+5. **In-process peering** — `prompt_agent` routes through channels, not HTTP,
+   when the target agent is in the same process.
 
 5. **Single `LocalSet`** — all conductors share one LocalSet on one thread.
    sacp futures are `!Send`, so everything runs on the same thread. This is
@@ -266,9 +291,11 @@ submission. That goes through in-process channels.
 
 | File | Change |
 |---|---|
-| `src/bin/dashboard.rs` | Rewrite: remove subprocess spawning, use `Client.builder().with_spawned()` pattern |
+| `src/bin/dashboard.rs` | Rewrite: remove subprocess spawning, use `Client.builder().with_spawned()` pattern, shared durable streams |
+| `src/app.rs` | Add `AppState::with_shared_streams()` constructor for shared durable streams |
 | `src/conductor.rs` | No changes — `build_conductor_with_peer_mcp` already returns `ConductorImpl` |
-| `src/app.rs` | No changes — each agent gets its own `AppState` |
+| `src/peer_mcp.rs` | Add in-process peer routing option alongside HTTP |
+| `src/api.rs` | Serve all agents' state from shared StreamDB (filter by connection ID or show all) |
 | `Cargo.toml` | No new deps needed |
 
 ## What This Replaces
