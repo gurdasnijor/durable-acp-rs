@@ -20,6 +20,7 @@ schemars = { version = "1.0", features = ["derive"] }
 sacp-conductor = "11.0.0"
 sacp-tokio = "11.0.0"
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
@@ -41,3 +42,7 @@ path = "src/bin/chat.rs"
 [[bin]]
 name = "peer"
 path = "src/bin/peer.rs"
+
+[[bin]]
+name = "run"
+path = "src/bin/run.rs"

@@ -1,3 +1,4 @@
+pub mod acp_registry;
 pub mod api;
 pub mod app;
 pub mod conductor;
