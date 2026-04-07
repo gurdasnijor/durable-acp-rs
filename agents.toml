@@ -1,34 +1,9 @@
-# Durable ACP agent configuration
-#
-# Each [[agent]] entry defines an agent to run. The CLI args mirror this structure:
-#   --name, --port, --agent (registry ID or command)
-#
-# Run all agents:  cargo run --bin run
-# Run one agent:   cargo run -- --name agent-a --port 4437 --agent claude-acp
-
 [[agent]]
 name = "agent-a"
 port = 4437
-agent = "claude-acp"   # ACP registry ID — resolved to `npx @agentclientprotocol/claude-agent-acp`
+agent = "claude-acp"
 
 [[agent]]
 name = "agent-b"
 port = 4439
 agent = "claude-acp"
-
-# Examples of other agents from the ACP registry:
-# [[agent]]
-# name = "gemini"
-# port = 4441
-# agent = "gemini"
-#
-# [[agent]]
-# name = "cline"
-# port = 4443
-# agent = "cline"
-#
-# You can also specify a raw command instead of a registry ID:
-# [[agent]]
-# name = "custom"
-# port = 4445
-# command = ["node", "my-agent.js", "--acp"]

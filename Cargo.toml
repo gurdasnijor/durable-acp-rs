@@ -52,3 +52,7 @@ path = "src/bin/run.rs"
 [[bin]]
 name = "install"
 path = "src/bin/install.rs"
+
+[[bin]]
+name = "agents"
+path = "src/bin/agents.rs"
