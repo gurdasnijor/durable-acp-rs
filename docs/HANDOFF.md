@@ -141,12 +141,26 @@ instead of `cx.send_request_to(Agent, ...)`. This sends through the
 client transport → conductor queue → proxy chain (correct path). See
 `known-limitations-sdd.md` §2.
 
-**1c. Use SDK v1 naming conventions**
+**1c. Migrate `run.rs` from v0 to v1 API** (~0.5 day)
 
-The v1 RFD uses directional link types (`ClientToAgent`, `AgentToClient`,
-`ProxyToConductor`). Our code uses `sacp::Client`, `sacp::Agent`,
-`sacp::Conductor` which map to these. No code change needed, but comments
-and docs should reference the v1 terminology.
+`run.rs` uses `agent-client-protocol::ClientSideConnection` — the v0
+trait-based API that the v1 RFD explicitly replaces. Should use
+`sacp::Client.builder().connect_with()` like `dashboard.rs` already does.
+
+**1d. Audit `agent_router.rs`**
+
+The `AgentRouter` is a custom `HashMap<String, mpsc::Sender>` with a
+global `OnceLock`. It works but reinvents routing that could potentially
+use `ConnectionTo<Agent>` directly. The `PeerPromptRequest` type
+duplicates what `PromptRequest` already is. Consider whether the SDK's
+session/connection primitives can replace the custom channels.
+
+**1e. Remove manual JSON deserialization workaround**
+
+Both `chat.rs` and `dashboard.rs` manually deserialize `SessionNotification`
+via `serde_json::from_value` to skip unknown variants (the `usage_update`
+issue). With `unstable_session_usage` enabled, this workaround may no
+longer be needed — test using `MatchDispatch::if_notification` directly.
 
 ### Priority 2: Close Remaining Gaps (see `known-limitations-sdd.md`)
 
