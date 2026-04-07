@@ -14,6 +14,7 @@ async fn stream_db_applies_state_events() {
         logical_connection_id: "conn-1".to_string(),
         state: ConnectionState::Created,
         latest_session_id: None,
+        cwd: None,
         last_error: None,
         queue_paused: Some(false),
         created_at: 1,

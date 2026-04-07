@@ -69,6 +69,7 @@ impl AppState {
             logical_connection_id: logical_connection_id.clone(),
             state: ConnectionState::Created,
             latest_session_id: None,
+            cwd: None,
             last_error: None,
             queue_paused: Some(false),
             created_at: now_ms(),

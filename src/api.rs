@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,8 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/api/v1/prompt-turns/{id}/stream", get(stream_prompt_turn))
         .route("/api/v1/prompt-turns/{id}/chunks", get(get_chunks))
         .route("/api/v1/registry", get(get_registry))
+        .route("/api/v1/connections/{id}/files", get(get_file))
+        .route("/api/v1/connections/{id}/fs/tree", get(get_tree))
         .with_state(app)
 }
 
@@ -236,4 +239,80 @@ async fn get_registry(
 
 fn is_terminal_chunk(chunk: &ChunkRow) -> bool {
     matches!(chunk.chunk_type, ChunkType::Stop | ChunkType::Error)
+}
+
+// --- File system access ---
+
+#[derive(Debug, Deserialize)]
+struct FileQuery {
+    path: Option<String>,
+}
+
+/// Resolve the cwd for a connection, validating that the requested path
+/// doesn't escape it.
+fn resolve_path(
+    app: &AppState,
+    snapshot: &crate::state::Collections,
+    id: &str,
+    rel: &str,
+) -> Result<PathBuf, axum::http::StatusCode> {
+    let conn = snapshot.connections.get(id)
+        .or_else(|| {
+            // Fall back to matching by logical_connection_id prefix or any connection
+            snapshot.connections.values().find(|c| c.logical_connection_id == app.logical_connection_id)
+        })
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    let cwd = conn.cwd.as_deref().ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    let cwd = PathBuf::from(cwd);
+    let full = cwd.join(rel);
+    // Canonicalize to resolve ../ traversals, then check prefix
+    let canonical = full.canonicalize().map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+    let cwd_canonical = cwd.canonicalize().map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+    if !canonical.starts_with(&cwd_canonical) {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    Ok(canonical)
+}
+
+async fn get_file(
+    Path(id): Path<String>,
+    Query(query): Query<FileQuery>,
+    State(app): State<Arc<AppState>>,
+) -> Result<String, axum::http::StatusCode> {
+    let rel = query.path.as_deref().unwrap_or(".");
+    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let path = resolve_path(&app, &snapshot, &id, rel)?;
+    std::fs::read_to_string(path).map_err(|_| axum::http::StatusCode::NOT_FOUND)
+}
+
+#[derive(Debug, Serialize)]
+struct TreeEntry {
+    name: String,
+    #[serde(rename = "type")]
+    entry_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+}
+
+async fn get_tree(
+    Path(id): Path<String>,
+    Query(query): Query<FileQuery>,
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<Vec<TreeEntry>>, axum::http::StatusCode> {
+    let rel = query.path.as_deref().unwrap_or(".");
+    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let path = resolve_path(&app, &snapshot, &id, rel)?;
+    let entries = std::fs::read_dir(&path).map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+    let mut result = Vec::new();
+    for entry in entries.flatten() {
+        let meta = entry.metadata().ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        result.push(TreeEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            entry_type: if is_dir { "directory" } else { "file" },
+            size: if is_dir { None } else { meta.map(|m| m.len()) },
+        });
+    }
+    result.sort_by(|a, b| a.entry_type.cmp(&b.entry_type).then(a.name.cmp(&b.name)));
+    Ok(Json(result))
 }

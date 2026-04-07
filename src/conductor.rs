@@ -45,6 +45,7 @@ impl ConnectTo<Conductor> for DurableStateProxy {
                     let app = app.clone();
                     async move |req: sacp::schema::NewSessionRequest, responder, cx| {
                         app.capture_proxy_connection(cx.clone()).await;
+                        let cwd = req.cwd.to_string_lossy().to_string();
                         cx.send_request_to(Agent, req).on_receiving_result({
                             let app = app.clone();
                             async move |result| {
@@ -54,6 +55,7 @@ impl ConnectTo<Conductor> for DurableStateProxy {
                                         .update_connection(|row| {
                                             row.state = crate::state::ConnectionState::Attached;
                                             row.latest_session_id = Some(session_id.clone());
+                                            row.cwd = Some(cwd.clone());
                                         })
                                         .await;
                                 }
