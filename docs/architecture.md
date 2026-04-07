@@ -55,11 +55,30 @@ The conductor handles:
 - Message ordering via central `ConductorMessage` queue
 - Process lifecycle (kill agent subprocess on conductor drop)
 
-**Not yet used:**
-- Dynamic chain construction (closure-based, examines `InitializeRequest`)
-- Proxy mode (`ConductorImpl<Proxy>` — conductor as proxy in larger chain)
-- `sacp-proxy` v3.0.0 framework (`JrHandlerChain`, `ProxyHandler`) — our
-  proxies use the lower-level `sacp::Proxy.builder()` API
+**Migration opportunity: `sacp-proxy` v3.0.0**
+
+Our proxies use `sacp::Proxy.builder()` (low-level, ~400 lines in
+`conductor.rs`). The `sacp-proxy` crate provides a higher-level framework
+that would reduce this to ~150 lines:
+
+- `JrHandlerChain` — builder with `.on_request_from_client()`,
+  `.on_notification_from_agent()` — type-safe, concise
+- `ProxyHandler` — handles `InitializeProxyRequest` forwarding,
+  `NewSessionRequest` session tracking, `_proxy/successor/*` wrapping,
+  and default pass-through automatically
+- `McpServiceRegistry` — replaces manual `McpServer::builder()` in
+  `PeerMcpProxy`
+- `.proxy()` + `.serve(ByteStreams)` — one call to wire up the full
+  proxy lifecycle, transport-agnostic
+
+This would also enable:
+- **Dynamic chain construction** — inspect `InitializeRequest` capabilities
+  to conditionally include proxies (e.g., only add PeerMcpProxy when
+  multiple agents are running)
+- **Composable proxy crates** — package proxies as separate crates,
+  chain them via `agents.toml`
+- **Proxy mode** (`ConductorImpl<Proxy>`) — run our conductor as a proxy
+  in a larger chain (e.g., nested inside Flamecast's conductor)
 
 ### DurableStateProxy (`src/conductor.rs`)
 
