@@ -211,6 +211,119 @@ tools in the agent's session.
 For in-process routing, the `AgentRouter` handles it with zero HTTP.
 For cross-process (different Flamecast instances), the HTTP fallback works.
 
+## TypeScript Client: `@durable-acp/client`
+
+The integration point for Flamecast is the existing `DurableACPClient`
+from `~/gurdasnijor/distributed-acp/packages/durable-acp-client/`. This
+TypeScript client already provides exactly what Flamecast needs:
+
+### What `DurableACPClient` does
+
+```typescript
+const client = new DurableACPClient({
+  stateStreamUrl: "http://localhost:4437/streams/durable-acp-state",
+  serverUrl: "http://localhost:4438",
+  connectionId: "..."
+});
+
+// Reactive collections (subscribed via SSE/WS)
+client.connections       // ConnectionRow[]
+client.promptTurns       // PromptTurnRow[]
+client.chunks            // ChunkRow[]
+client.permissions       // PermissionRow[]
+client.queuedTurns       // derived: state == "queued"
+client.activeTurns       // derived: state == "active"
+client.pendingPermissions // derived: state == "pending"
+
+// Commands (POST to REST API)
+await client.prompt("hello")
+await client.cancel()
+await client.pause()
+await client.resume()
+await client.reorder(turnIds)
+await client.resolvePermission(requestId, optionId)
+
+// Subscriptions
+client.subscribePromptTurns(callback)
+client.subscribeChunks(callback)
+```
+
+### How Flamecast uses it
+
+`FlamecastStorage` becomes a thin wrapper over `DurableACPClient`:
+
+```typescript
+// Before: FlamecastStorage queries PGLite/Postgres
+class PgLiteStorage implements FlamecastStorage {
+  async listAllSessions() { return db.select().from(sessions); }
+  async getSessionMeta(id) { return db.select().from(sessions).where(...); }
+}
+
+// After: FlamecastStorage reads from DurableACPClient
+class DurableStreamStorage implements FlamecastStorage {
+  private client: DurableACPClient;
+
+  async listAllSessions() {
+    return this.client.connections.map(toSessionMeta);
+  }
+  async getSessionMeta(id) {
+    return toSessionMeta(this.client.getConnection(id));
+  }
+  async createSession(meta) {
+    // Session created by conductor startup, not by storage
+    // Just track the connection ID
+  }
+}
+```
+
+The event bus becomes `client.subscribePromptTurns()` +
+`client.subscribeChunks()`. The React UI hooks become:
+
+```typescript
+// Before: useFlamecastSession polls WebSocket
+function useSession(id) {
+  const [chunks, setChunks] = useState([]);
+  ws.on("event", (e) => { if (e.sessionId === id) setChunks(...) });
+}
+
+// After: useSession subscribes to DurableACPClient
+function useSession(id) {
+  const client = useDurableACPClient(id);
+  return {
+    chunks: client.chunks,
+    turns: client.promptTurns,
+    permissions: client.pendingPermissions,
+  };
+}
+```
+
+### What needs to change in the TypeScript client
+
+The `DurableACPClient` from `distributed-acp` was built for the TypeScript
+conductor. For durable-acp-rs integration:
+
+1. **Verify schema compatibility** — the STATE-PROTOCOL events from the
+   Rust conductor must match the schema the TypeScript client expects.
+   Both use the same `@durable-acp/state` schema design.
+
+2. **REST API endpoint mapping** — the client POSTs to `/api/v1/connections/{id}/prompt`.
+   Verify the Rust REST API matches exactly (field names, camelCase, etc.)
+
+3. **Publish as `@durable-acp/client`** — the client should be a standalone
+   npm package that Flamecast imports. It's currently in the `distributed-acp`
+   monorepo.
+
+### What Flamecast cuts after integration
+
+| Flamecast Component | Replaced By | Cut? |
+|---|---|---|
+| `FlamecastStorage` interface | `DurableACPClient` collections | Implement `DurableStreamStorage` adapter |
+| `@flamecast/psql` package | Not needed — no SQL | Delete |
+| Event bus (`eventBus`) | `client.subscribe*()` | Delete |
+| Session metadata tables | `ConnectionRow` in stream | Delete |
+| `AcpBridge` class | Still needed — connects to conductor stdio | Keep |
+| React UI hooks | Rewire to `DurableACPClient` | Modify |
+
 ## Durable Streams as the Universal Integration Point
 
 The durable stream is the key architectural primitive:
