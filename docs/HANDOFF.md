@@ -147,13 +147,22 @@ client transport → conductor queue → proxy chain (correct path). See
 trait-based API that the v1 RFD explicitly replaces. Should use
 `sacp::Client.builder().connect_with()` like `dashboard.rs` already does.
 
-**1d. Audit `agent_router.rs`**
+**1d. Simplify `agent_router.rs`**
 
-The `AgentRouter` is a custom `HashMap<String, mpsc::Sender>` with a
-global `OnceLock`. It works but reinvents routing that could potentially
-use `ConnectionTo<Agent>` directly. The `PeerPromptRequest` type
-duplicates what `PromptRequest` already is. Consider whether the SDK's
-session/connection primitives can replace the custom channels.
+The `AgentRouter` fills a gap the SDK intentionally doesn't address —
+cross-conductor peer routing. The SDK's `ActiveSession` manages one
+session on one chain. Our router serializes access across N chains.
+
+The custom `PeerPromptRequest` + oneshot channel + bridge task pattern
+works but is verbose. Potential simplification: store `ActiveSession`
+references directly (wrapped in `Rc<RefCell>` since `!Send` on LocalSet)
+and call `session.send_prompt()` / `session.read_to_string()` without
+the channel indirection. The serialization concern (one prompt at a time)
+is handled by the `&mut self` borrow on `ActiveSession`.
+
+This would eliminate `PeerPromptRequest`, the bridge task in `dashboard.rs`,
+and the oneshot response channel — replacing ~100 lines of custom wiring
+with direct SDK calls.
 
 **1e. Remove manual JSON deserialization workaround**
 
