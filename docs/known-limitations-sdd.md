@@ -171,8 +171,21 @@ if let Some(result) = router.prompt(&agent_name, &text).await {
 This is the cleanest fix — zero code duplication, proper proxy routing,
 and it unifies the API, TUI, and peer prompt paths into one channel.
 
-**Recommended:** Option C. The `AgentRouter` is already wired. Just make
-the REST API use it instead of `cx.send_request_to`.
+**Recommended:** Option C. This is the architecturally correct solution
+per the conductor's design:
+
+The conductor uses an actor-based architecture where ALL messages flow
+through a central `ConductorMessage` queue to maintain ordering. When
+`session.send_prompt()` fires, it writes to the client side of the
+`duplex` transport → enters the conductor's main connection as an
+incoming "editor" message → routes through the central queue → hits
+the proxy chain → `DurableStateProxy` intercepts properly.
+
+`cx.send_request_to(Agent, ...)` bypasses all of this — it sends from
+inside the conductor directly to the agent, skipping the central queue
+and proxy handlers.
+
+The `AgentRouter` is already wired. Just make the REST API use it.
 
 **Files to change:**
 - `src/api.rs` — use `AgentRouter::prompt()` instead of `cx.send_request_to`
