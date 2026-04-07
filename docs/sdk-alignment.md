@@ -170,11 +170,31 @@ works directly. If yes, remove the workaround (~30 lines per file).
 - Core stays: `enqueue_prompt`, `record_chunk`, `finish_prompt_turn`, `write_state_event`, queue management
 
 **`src/api.rs` (~315 lines → ~150)**
-- `submit_prompt` drops from 63 to ~10 lines — forward to conductor subprocess, no bypass hack
+- `submit_prompt` drops from 63 to ~10 lines — no manual state recording
 - `cancel_turn` simplifies — no `proxy_connection`
-- `stream_prompt_turn` replaced by `SseSubscriber` when W7 lands
-- Delete all `proxy_connection` usage
-- Simple read endpoints (`list_connections`, `get_queue`, `get_chunks`, `get_registry`) stay unchanged
+- Delete all `proxy_connection` usage and manual state recording
+- Simple read endpoints stay unchanged
+
+**How the API bypass is fixed:**
+
+The conductor presents as a normal ACP Agent. The REST API should be an
+ACP Client connecting to it — not embedded inside bypassing the chain.
+
+In `main.rs`, create a second client connection via `duplex`:
+
+```rust
+// External client (editor/dashboard) connects via stdin/stdout
+// Internal client (REST API) connects via duplex
+let (api_out, conductor_api_in) = tokio::io::duplex(64 * 1024);
+let (conductor_api_out, api_in) = tokio::io::duplex(64 * 1024);
+
+// The conductor multiplexes both — same proxy chain for both
+// api.rs submit_prompt: just send PromptRequest on the internal client
+// DurableStateProxy intercepts and records state automatically
+```
+
+This is the same pattern `dashboard.rs` uses with `ClientSideConnection`.
+The REST API becomes a thin ACP Client wrapper — zero manual state recording.
 
 **`src/peer_mcp.rs` (~230 lines → merged into proxy config)**
 - `McpServiceRegistry` + `McpTool` impls replace manual `ConnectTo<Conductor>` + `McpServer::builder()`
