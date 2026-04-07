@@ -5,15 +5,15 @@ use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, Sse};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use agent_client_protocol::{CancelNotification, ContentBlock, PromptRequest};
+use agent_client_protocol::{CancelNotification, ContentBlock, CreateTerminalRequest, PromptRequest};
 use futures::stream::Stream;
 use sacp::Agent;
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
-use crate::state::{ChunkRow, ChunkType, CollectionChange, ConnectionRow, PromptTurnRow, PromptTurnState};
+use crate::state::{ChunkRow, ChunkType, CollectionChange, ConnectionRow, PromptTurnRow, PromptTurnState, TerminalRow, TerminalState};
 
 pub fn router(app: Arc<AppState>) -> Router {
     Router::new()
@@ -29,6 +29,9 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/api/v1/registry", get(get_registry))
         .route("/api/v1/connections/{id}/files", get(get_file))
         .route("/api/v1/connections/{id}/fs/tree", get(get_tree))
+        .route("/api/v1/connections/{id}/terminals", get(list_terminals).post(create_terminal))
+        .route("/api/v1/connections/{id}/terminals/{tid}", get(get_terminal).delete(kill_terminal))
+        .route("/api/v1/connections/{id}/terminals/{tid}/output", get(stream_terminal_output))
         .with_state(app)
 }
 
@@ -355,4 +358,151 @@ async fn get_tree(
     }
     result.sort_by(|a, b| a.entry_type.cmp(&b.entry_type).then(a.name.cmp(&b.name)));
     Ok(Json(result))
+}
+
+// --- Terminal management ---
+
+async fn list_terminals(
+    Path(id): Path<String>,
+    State(app): State<Arc<AppState>>,
+) -> Json<Vec<TerminalRow>> {
+    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    Json(snapshot.terminals.into_values()
+        .filter(|t| t.logical_connection_id == id || id == app.logical_connection_id)
+        .collect())
+}
+
+async fn get_terminal(
+    Path((_id, tid)): Path<(String, String)>,
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<TerminalRow>, axum::http::StatusCode> {
+    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    snapshot.terminals.get(&tid).cloned()
+        .map(Json)
+        .ok_or(axum::http::StatusCode::NOT_FOUND)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateTerminalBody {
+    session_id: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+async fn create_terminal(
+    Path(_id): Path<String>,
+    State(app): State<Arc<AppState>>,
+    Json(body): Json<CreateTerminalBody>,
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    let cx = app.proxy_connection.lock().await.clone()
+        .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let mut req = CreateTerminalRequest::new(body.session_id, body.command);
+    req.args = body.args;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cx.clone().spawn(async move {
+        let result = cx.send_request_to(Agent, req).block_task().await;
+        let _ = tx.send(result);
+        Ok(())
+    }).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let response = rx.await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| axum::http::StatusCode::BAD_GATEWAY)?;
+
+    Ok(Json(serde_json::json!({
+        "terminalId": response.terminal_id.0.to_string(),
+    })))
+}
+
+async fn kill_terminal(
+    Path((_id, tid)): Path<(String, String)>,
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    // Update terminal state to Released in the state stream
+    let mut snapshot = app.durable_streams.stream_db.snapshot().await;
+    let row = snapshot.terminals.get_mut(&tid)
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    row.state = TerminalState::Released;
+    row.updated_at = crate::app::now_ms();
+    let updated = row.clone();
+    drop(snapshot);
+    app.write_state_event("terminal", "update", &tid, Some(&updated))
+        .await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "killed": tid })))
+}
+
+async fn stream_terminal_output(
+    Path((_id, tid)): Path<(String, String)>,
+    State(app): State<Arc<AppState>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut rx = app.durable_streams.stream_db.subscribe_changes();
+
+    let stream = async_stream::stream! {
+        // Send current terminal state
+        let snapshot = app.durable_streams.stream_db.snapshot().await;
+        if let Some(term) = snapshot.terminals.get(&tid) {
+            if let Ok(json) = serde_json::to_string(term) {
+                yield Ok(Event::default().event("terminal").data(json));
+            }
+        }
+
+        // Stream chunks associated with this terminal's prompt turn
+        let prompt_turn_id = snapshot.terminals.get(&tid)
+            .and_then(|t| t.prompt_turn_id.clone());
+        let mut last_seq: i64 = -1;
+
+        if let Some(ref pt_id) = prompt_turn_id {
+            let mut existing: Vec<&ChunkRow> = snapshot.chunks.values()
+                .filter(|c| c.prompt_turn_id == *pt_id).collect();
+            existing.sort_by_key(|c| c.seq);
+            for chunk in &existing {
+                last_seq = chunk.seq;
+                if let Ok(json) = serde_json::to_string(chunk) {
+                    yield Ok(Event::default().event("chunk").data(json));
+                }
+            }
+        }
+        drop(snapshot);
+
+        // Stream new chunks as they arrive
+        loop {
+            match tokio::time::timeout(Duration::from_secs(120), rx.recv()).await {
+                Ok(Ok(CollectionChange::Chunks)) => {
+                    if let Some(ref pt_id) = prompt_turn_id {
+                        let snapshot = app.durable_streams.stream_db.snapshot().await;
+                        let mut new: Vec<&ChunkRow> = snapshot.chunks.values()
+                            .filter(|c| c.prompt_turn_id == *pt_id && c.seq > last_seq).collect();
+                        new.sort_by_key(|c| c.seq);
+                        for chunk in &new {
+                            last_seq = chunk.seq;
+                            if let Ok(json) = serde_json::to_string(chunk) {
+                                yield Ok(Event::default().event("chunk").data(json));
+                            }
+                        }
+                    }
+                }
+                Ok(Ok(CollectionChange::Terminals)) => {
+                    let snapshot = app.durable_streams.stream_db.snapshot().await;
+                    if let Some(term) = snapshot.terminals.get(&tid) {
+                        if let Ok(json) = serde_json::to_string(term) {
+                            yield Ok(Event::default().event("terminal").data(json));
+                        }
+                        if matches!(term.state, TerminalState::Exited | TerminalState::Released | TerminalState::Broken) {
+                            return;
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => return,
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)).text(""),
+    )
 }

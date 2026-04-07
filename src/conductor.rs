@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use agent_client_protocol::{
-    self as acp, ContentBlock, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionNotification, SessionUpdate,
+    self as acp, ContentBlock, CreateTerminalRequest, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionNotification, SessionUpdate, TerminalOutputRequest,
 };
 use sacp::{Agent, Client, Conductor, ConnectTo, Proxy, on_receive_notification, on_receive_request};
 use serde_json::json;
@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::app::AppState;
 use crate::state::{
     ChunkType, PendingRequestState, PermissionOptionRow, PermissionRow, PromptTurnState,
+    TerminalRow, TerminalState,
 };
 
 #[derive(Clone)]
@@ -138,6 +139,55 @@ impl ConnectTo<Conductor> for DurableStateProxy {
                                 responder.respond_with_result(result)
                             }
                         })?;
+                        Ok(())
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request_from(
+                Agent,
+                {
+                    let app = app.clone();
+                    async move |req: CreateTerminalRequest, responder, cx| {
+                        let terminal_id = uuid::Uuid::new_v4().to_string();
+                        let prompt_turn_id = app
+                            .session_to_prompt_turn.read().await
+                            .get(req.session_id.0.as_ref()).cloned();
+                        let row = TerminalRow {
+                            terminal_id: terminal_id.clone(),
+                            logical_connection_id: app.logical_connection_id.clone(),
+                            session_id: req.session_id.0.to_string(),
+                            prompt_turn_id,
+                            state: TerminalState::Open,
+                            command: Some(req.command.clone()),
+                            exit_code: None,
+                            signal: None,
+                            created_at: crate::app::now_ms(),
+                            updated_at: crate::app::now_ms(),
+                        };
+                        let _ = app.write_state_event("terminal", "insert", &terminal_id, Some(&row)).await;
+                        cx.send_request_to(Client, req).forward_response_to(responder)?;
+                        Ok(())
+                    }
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request_from(
+                Agent,
+                {
+                    let app = app.clone();
+                    async move |req: TerminalOutputRequest, responder, cx| {
+                        let prompt_turn_id = app
+                            .session_to_prompt_turn.read().await
+                            .get(req.session_id.0.as_ref()).cloned();
+                        if let Some(prompt_turn_id) = prompt_turn_id {
+                            let _ = app.record_chunk(
+                                &prompt_turn_id,
+                                ChunkType::ToolResult,
+                                serde_json::to_string(&req).unwrap_or_default(),
+                            ).await;
+                        }
+                        cx.send_request_to(Client, req).forward_response_to(responder)?;
                         Ok(())
                     }
                 },
