@@ -256,12 +256,11 @@ async fn main() -> Result<()> {
                     }
                     let p = if agents.len() == 1 { port } else { None };
                     let p = p.unwrap_or_else(|| next_port(&config));
-                    let command = local_command(agent_id);
                     config.agent.push(AgentEntry {
                         name: agent_name.clone(),
                         port: p,
                         agent: Some(agent_id.clone()),
-                        command,
+                        command: None, // resolved from registry at runtime
                     });
                     eprintln!("+ {} (port {}/{})", agent_name, p, p + 1);
                 }
@@ -348,17 +347,12 @@ async fn add_interactive(config_path: &PathBuf) -> Result<()> {
         }
 
         let port = next_port(&config);
-        let agent = &registry.agents[idx];
-
-        // Auto-install npx agents
-        maybe_install(&item.id, agent).await;
-        let command = local_command(&item.id);
 
         config.agent.push(AgentEntry {
             name: item.id.clone(),
             port,
             agent: Some(item.id.clone()),
-            command,
+            command: None, // resolved from registry at runtime
         });
 
         eprintln!("+ {} (port {}/{})", item.id, port, port + 1);
@@ -377,47 +371,3 @@ fn next_port(config: &Config) -> u16 {
     config.agent.iter().map(|a| a.port).max().unwrap_or(4435) + 2
 }
 
-fn local_command(id: &str) -> Option<Vec<String>> {
-    let p = PathBuf::from(".agent-bin").join(id).join("run.sh");
-    if p.exists() {
-        Some(vec![p.canonicalize().unwrap_or(p).to_string_lossy().to_string()])
-    } else {
-        None
-    }
-}
-
-async fn maybe_install(id: &str, agent: &durable_acp_rs::acp_registry::RemoteAgent) {
-    let agent_dir = PathBuf::from(".agent-bin").join(id);
-    if agent_dir.join("run.sh").exists() {
-        return;
-    }
-    if let Some(npx) = &agent.distribution.npx {
-        eprint!("  Installing {}...", id);
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        let _ = std::fs::create_dir_all(&agent_dir);
-        let ok = std::process::Command::new("npm")
-            .args(["install", "--prefix", &agent_dir.to_string_lossy(), &npx.package])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            let bin_name = npx.package.split('/').last().unwrap_or(id);
-            let bin_name = bin_name.split('@').next().unwrap_or(bin_name);
-            let args = npx.args.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(" ");
-            let _ = std::fs::write(
-                agent_dir.join("run.sh"),
-                format!("#!/bin/bash\nexec \"$(dirname \"$0\")/node_modules/.bin/{bin_name}\" {args} \"$@\"\n"),
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(agent_dir.join("run.sh"), std::fs::Permissions::from_mode(0o755));
-            }
-            eprintln!(" OK");
-        } else {
-            eprintln!(" FAILED");
-        }
-    }
-}
