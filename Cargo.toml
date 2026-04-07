@@ -37,14 +37,18 @@ name = "durable-acp-rs"
 path = "src/main.rs"
 
 [[bin]]
-name = "peer"
-path = "src/bin/peer.rs"
-
-[[bin]]
 name = "agents"
 path = "src/bin/agents.rs"
 
 [[bin]]
 name = "dashboard"
 path = "src/bin/dashboard.rs"
+
+[[bin]]
+name = "durable-state-proxy"
+path = "src/bin/durable-state-proxy.rs"
+
+[[bin]]
+name = "peer-mcp-proxy"
+path = "src/bin/peer-mcp-proxy.rs"
 
