@@ -1,58 +1,62 @@
 # durable-acp-rs
 
-A Rust [ACP Conductor](https://agentclientprotocol.github.io/symposium-acp/conductor.html) that persists all ACP messages to a durable state stream. From the editor's perspective, it's a standard [ACP agent](https://agentclientprotocol.com/protocol/overview#agent). Under the hood, it intercepts all ACP traffic, persists it, and routes to the actual agent.
-
-Any [ACP client](https://agentclientprotocol.com/protocol/overview#client) (editors, CLIs, browser UIs) gets durable history, queue management, multi-session support, and real-time observability without requiring the client or agent to change.
+A Rust [ACP Conductor](https://agentclientprotocol.github.io/symposium-acp/conductor.html) with durable state, multi-agent orchestration, and a fullscreen TUI dashboard. Run any combination of [27+ ACP agents](https://agentclientprotocol.com/registry) in a single process with in-process peer-to-peer messaging.
 
 ## Quick Start
 
 ```bash
-# Install agents from the ACP registry (interactive picker)
-cargo run --bin install
+# 1. Add agents from the ACP registry (interactive picker)
+cargo run --bin agents -- add
 
-# Start all agents from agents.toml
-cargo run --bin run
-
-# Or chat interactively with a single agent
-cargo run --bin chat
+# 2. Launch the multi-agent dashboard
+cargo run --bin dashboard
 ```
 
-## Install Agents
+That's it. The dashboard spawns all agents from `agents.toml`, shows a fullscreen TUI with agent sidebar, streaming output, and a prompt input bar. Tab between agents, type prompts, watch responses stream in real-time.
 
-Browse and install agents from the [ACP Registry](https://agentclientprotocol.com/registry) (27+ agents):
+## Dashboard
 
-```bash
-# Interactive multi-select with checkbox UI
-cargo run --bin install
-
-# Install specific agents by ID
-cargo run --bin install -- claude-acp gemini cline
-
-# List what's installed
-cargo run --bin install -- --list
-
-# Browse the registry without installing
-cargo run --bin run -- --list
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ durable-acp  5 agents  tab=switch  esc=quit                        │
+│                                                                     │
+│ ╭─ Agents ──╮ ╭─ agent-a ────────────────────────────────────────╮ │
+│ │ ● agent-a │ │ [agent-a] Ready                                  │ │
+│ │ > ● agent-b│ │ > hi                                            │ │
+│ │ ● codex   │ │ Hi! How can I help you?                          │ │
+│ │ ● deep    │ │ > talk to agent-b                                │ │
+│ │ ● gemini  │ │ [tool] mcp__peer__prompt_agent                   │ │
+│ │           │ │ Agent-b responded: "Hi! I'm Claude..."           │ │
+│ ╰───────────╯ ╰──────────────────────────────────────────────────╯ │
+│ ╭───────────────────────────────────────────────────────────────╮   │
+│ │ [agent-b] > _                                                 │   │
+│ ╰───────────────────────────────────────────────────────────────╯   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-Agents are installed to `.agent-bin/` and automatically added to `agents.toml`.
+**Features:**
+- Fullscreen TUI with iocraft (React-like terminal components)
+- Agent sidebar with live status (● ready, ○ starting, ✕ error)
+- ScrollView output pane with text wrapping
+- Tab/Shift-Tab to switch agents
+- Interactive permission prompts
+- In-process conductors — no subprocess management
+- Shared durable streams — one state stream for all agents
 
 ## Manage Agents
 
 ```bash
-cargo run --bin agents                          # list configured agents
-cargo run --bin agents -- add claude-acp        # add from ACP registry (auto-assigns port)
-cargo run --bin agents -- add gemini --port 4441  # add with explicit port
-cargo run --bin agents -- add cline --name my-cline  # add with custom name
-cargo run --bin agents -- remove agent-b        # remove by name
-cargo run --bin agents -- clear                 # remove all
+cargo run --bin agents                      # list configured agents
+cargo run --bin agents -- add               # interactive: browse ACP registry + select
+cargo run --bin agents -- add claude-acp    # add specific agent by ID
+cargo run --bin agents -- add gemini --name my-gemini  # custom name
+cargo run --bin agents -- remove agent-b    # remove by name
+cargo run --bin agents -- clear             # remove all
 ```
 
-## Multi-Agent Setup
+Agent IDs resolve from the [ACP Registry](https://agentclientprotocol.com/registry) at runtime — no local installation needed. `npx`, `uvx`, and binary distributions are all supported.
 
 ### agents.toml
-
-Define agents to run. Agent IDs are resolved from the [ACP registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json), or specify a raw command:
 
 ```toml
 [[agent]]
@@ -65,236 +69,152 @@ name = "agent-b"
 port = 4439
 agent = "claude-acp"
 
+[[agent]]
+name = "gemini"
+port = 4441
+agent = "gemini"
+
 # Raw command (no registry lookup)
 # [[agent]]
 # name = "custom"
-# port = 4441
+# port = 4443
 # command = ["node", "my-agent.js", "--acp"]
 ```
 
-CLI args mirror the TOML structure:
+## Agent-to-Agent Messaging
 
-```bash
-cargo run --bin run -- --agent claude-acp --name my-agent --port 4437
-```
-
-### Start All Agents
-
-```bash
-cargo run --bin run
-```
-
-This fetches the ACP registry, resolves agent IDs to commands, spawns all conductors, initializes ACP sessions, and keeps everything alive. Ctrl-C stops all.
-
-## Agent-to-Agent Messaging (MCP Peering)
-
-Each conductor injects two [MCP tools](https://agentclientprotocol.com/rfds/mcp-over-acp) into the agent's session via the proxy chain:
-
-- **`list_agents`** -- discover peer agents from the local registry
-- **`prompt_agent`** -- send a prompt to a named peer and get the complete response
-
-These appear as native tools alongside the agent's built-in tools (Bash, Read, Write, etc.). No special prompting needed -- agents discover peers automatically.
-
-### How It Works
+Each agent automatically gets `list_agents` and `prompt_agent` [MCP tools](https://agentclientprotocol.com/rfds/mcp-over-acp) injected via the proxy chain. Agents discover and message peers without any configuration.
 
 ```
-Agent A                    Registry                    Agent B
-   |                          |                           |
-   |  list_agents() --------->|                           |
-   |  <-- [{name: "agent-b",  |                           |
-   |        api_url: ":4440"}]|                           |
-   |                          |                           |
-   |  prompt_agent(                                       |
-   |    name="agent-b",       POST /api/v1/.../prompt --->|
-   |    text="write a haiku") GET  /api/v1/.../stream --->|
-   |                          |  <-- SSE chunks           |
-   |  <-- "Ownership and     |                           |
-   |       borrowing dance..." |                           |
+Agent A                     AgentRouter                   Agent B
+   |                            |                            |
+   |  list_agents() ----------->|                            |
+   |  <-- [agent-a, agent-b,   |                            |
+   |       codex-acp, ...]     |                            |
+   |                            |                            |
+   |  prompt_agent(             |                            |
+   |    name="agent-b",         |  in-process channel ------>|
+   |    text="write a haiku")   |  <-- streamed response     |
+   |  <-- complete text         |                            |
 ```
 
-The `prompt_agent` tool:
-1. Looks up the peer in the local registry (`~/.config/durable-acp/registry.json`)
-2. Finds the peer's active connection and session via REST API
-3. Submits a prompt via `POST /api/v1/connections/{id}/prompt`
-4. Streams the response via SSE (`GET /api/v1/prompt-turns/{id}/stream`)
-5. Returns the accumulated text as the tool result
+In the dashboard, peer communication routes through **in-process channels** — zero HTTP overhead. The `prompt_agent` tool sends a prompt through the peer's session channel, collects streamed text from `read_update`, and returns the complete response.
 
-### Example
+When agents run in separate processes, `prompt_agent` falls back to the REST API (HTTP POST + SSE streaming).
 
-With two agents running:
-
-```bash
-# In agent-a's session, the agent can:
-# 1. Call list_agents → discovers agent-b
-# 2. Call prompt_agent(name="agent-b", text="write a haiku about rust")
-# 3. Receive agent-b's complete response as a tool result
-```
-
-Via the REST API:
-
-```bash
-# Ask agent-a to talk to agent-b
-curl -X POST localhost:4438/api/v1/connections/{id}/prompt \
-  -H 'Content-Type: application/json' \
-  -d '{"sessionId": "...", "text": "use list_agents to find peers, then prompt_agent to ask agent-b to write a haiku"}'
-```
-
-### Peer CLI
-
-For agent-to-agent messaging from the command line (without going through a conductor):
-
-```bash
-# List registered agents
-cargo run --bin peer -- list
-
-# Send a prompt to a peer
-cargo run --bin peer -- prompt --agent agent-b "write a haiku about rust"
-```
-
-## Binaries
+## All Binaries
 
 | Binary | Purpose |
 |---|---|
-| `agents` | Manage `agents.toml` -- add, remove, list configured agents |
-| `install` | Interactive agent installer -- browse ACP registry, install to `.agent-bin/` |
-| `run` | Multi-agent runner -- start all agents from `agents.toml`, maintain ACP sessions |
-| `chat` | Interactive terminal chat -- connect directly to an agent, stream responses |
-| `peer` | Agent-to-agent CLI -- list running peers, send prompts via REST API |
-| `durable-acp-rs` | Conductor binary -- spawned by clients/editors as `agent_command` |
-
-## REST API
-
-While conductors are running, query state at `http://localhost:{port+1}`:
-
-```bash
-# List connections
-curl localhost:4438/api/v1/connections
-
-# Submit a prompt (returns promptTurnId for tracking)
-curl -X POST localhost:4438/api/v1/connections/{id}/prompt \
-  -H 'Content-Type: application/json' \
-  -d '{"sessionId": "...", "text": "hello"}'
-# => {"queued": true, "promptTurnId": "uuid"}
-
-# Stream response chunks via SSE
-curl -N localhost:4438/api/v1/prompt-turns/{promptTurnId}/stream
-
-# Get all chunks (non-streaming)
-curl localhost:4438/api/v1/prompt-turns/{promptTurnId}/chunks
-
-# Resume streaming from a sequence number
-curl localhost:4438/api/v1/prompt-turns/{id}/stream?afterSeq=3
-
-# View queued prompts
-curl localhost:4438/api/v1/connections/{id}/queue
-
-# Cancel / pause / resume
-curl -X POST localhost:4438/api/v1/connections/{id}/cancel \
-  -H 'Content-Type: application/json' -d '{"sessionId": "..."}'
-curl -X POST localhost:4438/api/v1/connections/{id}/queue/pause
-curl -X POST localhost:4438/api/v1/connections/{id}/queue/resume
-
-# View peer registry
-curl localhost:4438/api/v1/registry
-```
-
-## Durable Streams
-
-The conductor embeds a [Durable Streams](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) HTTP server. All state is persisted as [STATE-PROTOCOL](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md) events.
-
-```bash
-# Read the raw state stream
-curl http://localhost:4437/streams/durable-acp-state
-
-# Subscribe via SSE (live updates)
-curl http://localhost:4437/streams/durable-acp-state?live=sse
-```
+| `dashboard` | Fullscreen multi-agent TUI — the main interface |
+| `agents` | Manage `agents.toml` — add/remove agents with iocraft registry picker |
+| `chat` | Single-agent interactive chat (direct ACP connection, no conductor) |
+| `run` | Headless multi-agent runner (no TUI, for scripts/CI) |
+| `peer` | Agent-to-agent CLI — list peers, send prompts |
+| `durable-acp-rs` | Conductor binary — spawned by editors as `agent_command` |
 
 ## Architecture
 
+### Single-Process Multi-Agent
+
+The dashboard runs N `ConductorImpl` instances in one process, each managing its own proxy chain + agent subprocess. All conductors share one tokio `LocalSet` — the iocraft render loop and conductor tasks interleave on the same thread.
+
 ```
-                        ┌─────────────────────────────────────────────┐
-Client ──ACP──► Conductor                                             │
-                │  DurableStateProxy  (intercept + persist)           │
-                │  PeerMcpProxy       (list_agents, prompt_agent)     │
-                │  Agent (claude-agent-acp, gemini, cline, etc.)      │
-                │                                                     │
-                │  Embedded Durable Streams Server (:4437)            │
-                │  REST API (:4438)                                   │
-                │  StreamDB (in-memory materialized state)            │
-                └─────────────────────────────────────────────────────┘
-                         ▲                              ▲
-                    stdio (ACP)                    HTTP/SSE
-                         │                              │
-                    Editor/CLI                   @durable-acp/client
-                                                 or peer agents
+┌──────────────────────────────────────────────────────────────┐
+│  Dashboard Process                                            │
+│                                                              │
+│  TUI (iocraft) ←── in-process channels ──→ Agent Manager     │
+│                                                              │
+│  Conductor A:  Client → DurableStateProxy → PeerMcpProxy → Agent (claude-acp)
+│  Conductor B:  Client → DurableStateProxy → PeerMcpProxy → Agent (gemini)
+│  Conductor C:  Client → DurableStateProxy → PeerMcpProxy → Agent (codex-acp)
+│                                                              │
+│  Shared: EmbeddedDurableStreams (:4437) + REST API (:4438)   │
+│  Shared: StreamDB (in-memory, all agents' state)             │
+│  Shared: AgentRouter (in-process peer messaging)             │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Proxy chain: `Client → DurableStateProxy → PeerMcpProxy → Agent`
+### Proxy Chain
 
-- **DurableStateProxy** -- intercepts all ACP messages, persists to state stream
-- **PeerMcpProxy** -- injects `list_agents` and `prompt_agent` MCP tools via [MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp)
-- **Agent** -- any ACP-compatible agent from the [registry](https://agentclientprotocol.com/registry)
+Each conductor manages one proxy chain per the [ACP Conductor Spec](https://agentclientprotocol.github.io/symposium-acp/conductor.html):
+
+- **DurableStateProxy** — intercepts all ACP messages, persists to durable state stream
+- **PeerMcpProxy** — injects `list_agents` + `prompt_agent` MCP tools via [MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp)
+- **Agent** — any ACP-compatible agent from the [registry](https://agentclientprotocol.com/registry)
+
+### Durable State
+
+All state persists to a single [durable stream](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) as [STATE-PROTOCOL](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md) events. Collections: connections, prompt turns, chunks, permissions, terminals.
+
+## REST API
+
+```bash
+curl localhost:4438/api/v1/connections                          # list all agents' connections
+curl localhost:4438/api/v1/connections/{id}/prompt -X POST \    # submit prompt
+  -H 'Content-Type: application/json' \
+  -d '{"sessionId": "...", "text": "hello"}'
+curl -N localhost:4438/api/v1/prompt-turns/{id}/stream          # SSE stream chunks
+curl localhost:4438/api/v1/prompt-turns/{id}/chunks             # all chunks
+curl localhost:4438/api/v1/registry                             # peer registry
+curl localhost:4438/api/v1/connections/{id}/queue                # queued prompts
+curl -X POST localhost:4438/api/v1/connections/{id}/queue/pause  # pause queue
+```
 
 ## Project Structure
 
 ```
 src/
-  main.rs              Conductor CLI entry point
-  lib.rs               Module exports
-  conductor.rs         DurableStateProxy + PeerMcpProxy wiring
-  peer_mcp.rs          MCP server with list_agents + prompt_agent tools
+  main.rs              Conductor CLI (for editor integration)
+  conductor.rs         DurableStateProxy + conductor wiring
+  peer_mcp.rs          MCP tools: list_agents, prompt_agent
+  agent_router.rs      In-process peer routing channels
   acp_registry.rs      ACP registry client (cdn.agentclientprotocol.com)
-  registry.rs          Local agent registry (~/.config/durable-acp/)
-  app.rs               AppState -- runtime state, queue, chunk recording
-  state.rs             StreamDB + schema types
+  registry.rs          Local peer registry (~/.config/durable-acp/)
+  app.rs               AppState, queue management, chunk recording
+  state.rs             StreamDB, schema types, collections
   durable_streams.rs   Embedded durable streams HTTP server
-  api.rs               REST API endpoints (axum)
+  api.rs               REST API (axum)
   bin/
-    agents.rs          Agent config manager (add/remove/list)
-    install.rs         Interactive agent installer
-    run.rs             Multi-agent runner
-    chat.rs            Interactive terminal chat client
+    dashboard.rs       Fullscreen multi-agent TUI
+    agents.rs          Agent config manager with registry picker
+    chat.rs            Single-agent interactive chat
+    run.rs             Headless multi-agent runner
     peer.rs            Agent-to-agent CLI
-agents.toml            Multi-agent configuration
-tests/
-  basic.rs             Unit tests
+docs/
+  architecture.md      System architecture
+  multi-agent-conductor-sdd.md  Single-process multi-agent design
+agents.toml            Agent configuration
 ```
 
 ## Development
 
 ```bash
-cargo build            # build all binaries
-cargo test             # run tests
-cargo build --release  # optimized build
+cargo build                     # all binaries
+cargo test                      # unit tests
+cargo build --release           # optimized
 
-# Debug logging
-RUST_LOG=debug cargo run --bin chat
-RUST_LOG=sacp=trace cargo run --bin run
+RUST_LOG=debug cargo run --bin dashboard   # debug logging
+RUST_LOG=sacp=trace cargo run --bin chat   # trace ACP messages
 ```
 
 ### Prerequisites
 
 - Rust 2024 edition (1.85+)
-- Node.js / npm (for npx-based agents)
-- `ANTHROPIC_API_KEY` (for Claude), `GEMINI_API_KEY` (for Gemini), etc.
-
-### Known Issues
-
-- `agent-client-protocol-schema v0.11.4` doesn't include `usage_update` sent by `claude-agent-acp v0.25.3`. Handled gracefully by skipping unknown variants.
-- The `submit_prompt` API sends directly to the agent (bypasses the proxy's inbound handler). State recording is done explicitly in the API handler.
+- Node.js / npm (for npx-based agents like claude-acp, gemini, cline)
+- API keys: `ANTHROPIC_API_KEY` (Claude), `GEMINI_API_KEY` (Gemini), etc.
 
 ## References
 
 **ACP:**
 - [Protocol Overview](https://agentclientprotocol.com/protocol/overview)
+- [Conductor Spec](https://agentclientprotocol.github.io/symposium-acp/conductor.html)
 - [Proxy Chains RFD](https://agentclientprotocol.com/rfds/proxy-chains)
 - [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp)
-- [Conductor Spec](https://agentclientprotocol.github.io/symposium-acp/conductor.html)
 - [Agent Registry](https://agentclientprotocol.com/registry)
 - [Rust SDK](https://github.com/agentclientprotocol/rust-sdk)
 - [Cookbook](https://github.com/agentclientprotocol/rust-sdk/tree/main/src/agent-client-protocol-cookbook)
 
 **Durable Streams:**
 - [Protocol Spec](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md)
-- [STATE-PROTOCOL Spec](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md)
+- [STATE-PROTOCOL](https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md)
