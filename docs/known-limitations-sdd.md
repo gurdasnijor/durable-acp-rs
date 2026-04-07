@@ -139,13 +139,44 @@ The API endpoint is only needed for external clients. If external clients
 use the WebSocket protocol instead (from `event-subscribers-sdd.md`),
 the REST prompt endpoint becomes unnecessary.
 
-**Recommended:** Option B now, Option A later if raw transport injection
-proves necessary.
+### Option C: Route through the session channel (paved road)
+
+The dashboard already solves this correctly. `run_agent` has a prompt
+channel that feeds into `session.send_prompt()`, which writes to the
+client side of the ACP connection. This goes through the full
+Client → Conductor → DurableStateProxy → Agent path:
+
+```rust
+// Dashboard: prompt goes through proper ACP path
+prompt_tx.send(text);  // TUI or peer sends via channel
+// Inside run_agent:
+session.send_prompt(&text)?;  // writes to ACP client connection
+// → Conductor routes through proxy chain
+// → DurableStateProxy intercepts, enqueues, persists
+// → Agent receives the prompt
+```
+
+The REST API should route through the same channel instead of calling
+`cx.send_request_to(Agent, ...)` directly. The `AgentRouter` already
+has per-agent prompt channels. The API just needs to use them:
+
+```rust
+// In submit_prompt API handler:
+let router = agent_router::global_router();
+if let Some(result) = router.prompt(&agent_name, &text).await {
+    // Routed through session.send_prompt() — full proxy chain
+}
+```
+
+This is the cleanest fix — zero code duplication, proper proxy routing,
+and it unifies the API, TUI, and peer prompt paths into one channel.
+
+**Recommended:** Option C. The `AgentRouter` is already wired. Just make
+the REST API use it instead of `cx.send_request_to`.
 
 **Files to change:**
-- `src/app.rs` — extract shared enqueue logic
-- `src/api.rs` — call shared function
-- `src/conductor.rs` — call shared function from proxy handler
+- `src/api.rs` — use `AgentRouter::prompt()` instead of `cx.send_request_to`
+- Remove `proxy_connection` from `AppState` (no longer needed for API prompts)
 
 ---
 
