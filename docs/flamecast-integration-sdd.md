@@ -227,3 +227,162 @@ This means Flamecast's React UI could drop its own event bus and WebSocket
 protocol in favor of subscribing to the durable stream directly. The
 STATE-PROTOCOL events are designed to be compatible with the TypeScript
 `@durable-acp/state` package.
+
+## Pluggable Transports — Agents Over Network Boundaries
+
+The current model is local-only: the conductor spawns the agent as a
+subprocess and connects via stdio. But the transport layer is already
+abstracted — `ConductorImpl::run()` takes `ByteStreams` (any `AsyncRead +
+AsyncWrite`), and `AcpAgent` is just one `ConnectTo<Client>` implementation.
+
+### Transport abstraction
+
+```
+ConductorImpl::run(transport: ByteStreams<W, R>)
+                                  ▲
+                                  │
+                    ┌─────────────┼─────────────┐
+                    │             │             │
+              stdio (local)   TCP/TLS     WebSocket
+              AcpAgent        TcpStream   tokio-tungstenite
+              (today)         (trivial)   (trivial)
+```
+
+All three are `AsyncRead + AsyncWrite`. The conductor doesn't care which
+one it gets.
+
+### What this enables
+
+**1. Remote agents** — an agent runs on a different machine (GPU server,
+cloud VM, E2B sandbox). The conductor connects via TCP or WebSocket instead
+of stdio:
+
+```rust
+// Local (today)
+let agent = AcpAgent::from_args(command);  // spawns subprocess
+conductor.run(agent_byte_streams).await;
+
+// Remote (new)
+let stream = TcpStream::connect("agent-host:9000").await?;
+let transport = ByteStreams::new(stream.clone(), stream);
+conductor.run(transport).await;
+```
+
+The conductor's proxy chain (DurableStateProxy, PeerMcpProxy) works
+identically — it doesn't know if the agent is local or remote.
+
+**2. Remote conductors** — the dashboard connects to conductors running
+on remote machines. Currently uses `tokio::io::duplex` (in-memory).
+Replace with TCP:
+
+```rust
+// In-process (today)
+let (client_out, conductor_in) = duplex(64 * 1024);
+let transport = ByteStreams::new(client_out.compat_write(), client_in.compat());
+
+// Remote (new)
+let stream = TcpStream::connect("conductor-host:4436").await?;
+let transport = ByteStreams::new(stream.clone(), stream);
+```
+
+**3. Durable streams over network** — the embedded durable streams server
+already listens on HTTP. Remote clients subscribe via SSE. Remote
+conductors could write to a shared durable streams server:
+
+```
+Dashboard (machine A)
+  ├── Conductor-local (in-process, machine A)
+  └── Conductor-remote (TCP to machine B)
+         └── Agent (running on machine B)
+              └── Writes to shared durable stream (machine A, HTTP)
+```
+
+### Implementation: transport registry
+
+```rust
+enum Transport {
+    /// Spawn local subprocess, connect via stdio (default)
+    Local { command: Vec<String> },
+    /// Connect to remote agent via TCP
+    Tcp { host: String, port: u16, tls: bool },
+    /// Connect to remote agent via WebSocket
+    WebSocket { url: String },
+}
+```
+
+In `agents.toml`:
+
+```toml
+# Local agent (default — same as today)
+[[agent]]
+name = "agent-a"
+agent = "claude-acp"
+
+# Remote agent via TCP
+[[agent]]
+name = "remote-claude"
+transport = "tcp"
+host = "gpu-server.internal"
+port = 9000
+
+# Remote agent via WebSocket
+[[agent]]
+name = "cloud-agent"
+transport = "ws"
+url = "wss://agents.example.com/agent-b"
+
+# Remote agent in E2B sandbox
+[[agent]]
+name = "sandbox-agent"
+transport = "tcp"
+host = "sandbox-12345.e2b.dev"
+port = 9000
+```
+
+### What changes
+
+| Component | Change Needed |
+|---|---|
+| `agents.toml` schema | Add `transport`, `host`, `port`, `url` fields |
+| `dashboard.rs` | Match on `Transport` enum, create appropriate `ByteStreams` |
+| `AgentRouter` | Add HTTP fallback for remote peers (already exists) |
+| `PeerMcpProxy` | Already falls back to HTTP for cross-process — works for remote too |
+| Durable streams | Already HTTP — remote agents can write to shared server |
+| `ConductorImpl` | No changes — already takes generic `ByteStreams` |
+
+### Peering across network boundaries
+
+The `prompt_agent` MCP tool already has two paths:
+
+1. **In-process** — `AgentRouter` channels (zero overhead)
+2. **HTTP fallback** — REST API + SSE (works cross-process)
+
+Path 2 works across machines with no changes — the peer registry just
+needs the remote agent's API URL:
+
+```json
+{
+  "agents": [
+    { "name": "local-claude", "api_url": "http://127.0.0.1:4438" },
+    { "name": "remote-gemini", "api_url": "https://gpu-server:4438" }
+  ]
+}
+```
+
+`prompt_agent(name="remote-gemini", text="...")` would POST to the
+remote server's REST API and stream the response via SSE. The MCP tool
+doesn't know or care that the agent is on a different machine.
+
+### Flamecast runtime providers
+
+Flamecast already has Docker and E2B runtime providers that spin up agents
+in containers/sandboxes. These could be adapted to:
+
+1. Start the container/sandbox with `durable-acp-rs` as the entrypoint
+2. The conductor inside the container listens on a TCP port
+3. The dashboard connects to it via TCP transport
+4. All durable state flows back to the central durable streams server
+
+This gives you sandboxed agents with full durability and peering — the
+container runs the agent, the conductor proxies ACP, the durable stream
+captures everything, and peer agents can message it via HTTP.
