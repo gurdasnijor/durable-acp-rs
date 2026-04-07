@@ -27,6 +27,7 @@ pub fn router(app: Arc<AppState>) -> Router {
             get(stream_prompt_turn),
         )
         .route("/api/v1/prompt-turns/{id}/chunks", get(get_chunks))
+        .route("/api/v1/registry", get(get_registry))
         .with_state(app)
 }
 
@@ -237,6 +238,14 @@ async fn stream_prompt_turn(
             .interval(Duration::from_secs(15))
             .text(""),
     )
+}
+
+async fn get_registry(
+    State(_app): State<Arc<AppState>>,
+) -> Result<Json<crate::registry::Registry>, axum::http::StatusCode> {
+    crate::registry::read_registry()
+        .map(Json)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn is_terminal_chunk(chunk: &ChunkRow) -> bool {
