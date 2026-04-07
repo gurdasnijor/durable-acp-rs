@@ -177,24 +177,49 @@ works directly. If yes, remove the workaround (~30 lines per file).
 
 **How the API bypass is fixed:**
 
-The conductor presents as a normal ACP Agent. The REST API should be an
-ACP Client connecting to it — not embedded inside bypassing the chain.
+The conductor presents as a normal ACP Agent. The REST API should send
+prompts through the ACP Client's connection — not bypass the chain.
 
-In `main.rs`, create a second client connection via `duplex`:
+`ActiveSession::connection()` returns `ConnectionTo<Link>` — the client's
+handle to the conductor. Sending a `PromptRequest` through it enters from
+the Client side → conductor routes through the proxy chain → `DurableStateProxy`
+records state automatically.
+
+The dashboard already has this session (via `ClientSideConnection` bootstrap).
+Share the connection with the REST API:
 
 ```rust
-// External client (editor/dashboard) connects via stdin/stdout
-// Internal client (REST API) connects via duplex
-let (api_out, conductor_api_in) = tokio::io::duplex(64 * 1024);
-let (conductor_api_out, api_in) = tokio::io::duplex(64 * 1024);
+// In dashboard.rs, after bootstrapping:
+let session = conn.new_session(...).await?;
+let client_conn = session.connection();  // ConnectionTo — client-side handle
 
-// The conductor multiplexes both — same proxy chain for both
-// api.rs submit_prompt: just send PromptRequest on the internal client
-// DurableStateProxy intercepts and records state automatically
+// Share with REST API via Arc
+api_state.set_client_connection(Arc::new(client_conn));
+
+// In api.rs submit_prompt:
+async fn submit_prompt(...) {
+    let conn = app.client_connection();
+    conn.send_request(PromptRequest::new(session_id, text))
+        .block_task().await?;
+    // That's it. Enters from Client side → proxy chain → agent
+    // DurableStateProxy records PromptTurnRow, chunks, stop — automatically
+}
 ```
 
-This is the same pattern `dashboard.rs` uses with `ClientSideConnection`.
-The REST API becomes a thin ACP Client wrapper — zero manual state recording.
+No duplex, no second conductor, no manual state recording. One line:
+`session.connection()` — the paved road from the SDK.
+
+**Delete after this fix:**
+- `proxy_connection` from `AppState`
+- `capture_proxy_connection` from `conductor.rs`
+- All manual state recording from `api.rs` (`write_state_event`,
+  `record_chunk`, `finish_prompt_turn`, `session_to_prompt_turn`)
+
+**Standalone `main.rs` case:** The external client (editor) owns the
+session. The REST API shouldn't submit prompts — the editor does. The
+REST API remains read-only (connections, chunks, queue, registry) in
+standalone mode. Prompt submission is only available when a client
+(dashboard) provides the session connection.
 
 **`src/peer_mcp.rs` (~230 lines → merged into proxy config)**
 - `McpServiceRegistry` + `McpTool` impls replace manual `ConnectTo<Conductor>` + `McpServer::builder()`

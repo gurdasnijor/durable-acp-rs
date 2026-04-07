@@ -67,28 +67,33 @@ Client (transport) → ConductorMessage queue → proxy chain → Agent  ✅
 API → cx.send_to(Agent) → Agent directly                           ❌
 ```
 
-**Fix:** Route API prompts through the `AgentRouter` channel, which feeds
-into `session.send_prompt()`. This writes to the client side of the ACP
-transport, entering the conductor from the Client direction and flowing
-through the full proxy chain:
+**Fix:** Use `ActiveSession::connection()` — the SDK's paved road.
+
+The dashboard bootstraps each conductor with `ClientSideConnection` and
+gets an `ActiveSession`. `session.connection()` returns the client-side
+`ConnectionTo` handle. Sending a `PromptRequest` through it enters the
+conductor from the Client side → proxy chain fires → `DurableStateProxy`
+records state automatically.
 
 ```rust
-// API handler (fixed):
-let router = agent_router::global_router();
-router.prompt(&agent_name, &text).await;
-// → prompt_tx channel → session.send_prompt()
-// → writes to duplex client transport
-// → conductor ConductorMessage queue
-// → DurableStateProxy intercepts
-// → agent receives prompt
+// Share the session's connection with the REST API
+let client_conn = session.connection();
+api_state.set_client_connection(Arc::new(client_conn));
+
+// api.rs submit_prompt — one call, zero manual state recording:
+conn.send_request(PromptRequest::new(session_id, text))
+    .block_task().await?;
 ```
 
-This unifies all three prompt paths (TUI, peer MCP, REST API) into one
-channel. Zero code duplication.
+No duplex transport, no AgentRouter, no manual state recording.
 
-**Effort:** ~0.5 day. Remove `proxy_connection` from `AppState`.
+**Delete:** `proxy_connection` from `AppState`, `capture_proxy_connection`
+from `conductor.rs`, all manual `write_state_event`/`record_chunk`/
+`finish_prompt_turn`/`session_to_prompt_turn` from `api.rs`.
 
-**Files:** `src/api.rs` (use `AgentRouter`), `src/app.rs` (remove `proxy_connection`)
+**Effort:** ~0.5 day.
+
+**Files:** `src/api.rs`, `src/app.rs`, `src/conductor.rs`
 
 ---
 
