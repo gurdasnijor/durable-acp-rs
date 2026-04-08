@@ -14,9 +14,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sacp::{ByteStreams, Conductor, ConnectTo};
 
-use durable_acp_rs::app::AppState;
+use durable_acp_rs::conductor_state::ConductorState;
 use durable_acp_rs::durable_state_proxy::DurableStateProxy;
-use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
+use durable_acp_rs::stream_server::StreamServer;
 
 #[derive(Debug, Parser)]
 #[command(name = "durable-state-proxy")]
@@ -36,8 +36,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.port);
-    let durable_streams = EmbeddedDurableStreams::start(bind, cli.state_stream).await?;
-    let app = Arc::new(AppState::with_shared_streams(durable_streams).await?);
+    let stream_server = StreamServer::start(bind, cli.state_stream).await?;
+    let app = Arc::new(ConductorState::with_shared_streams(stream_server).await?);
 
     ConnectTo::<Conductor>::connect_to(
         DurableStateProxy { app },

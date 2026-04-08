@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use durable_acp_rs::api;
-use durable_acp_rs::app::AppState;
+use durable_acp_rs::conductor_state::ConductorState;
 use durable_acp_rs::conductor::build_conductor;
 use durable_acp_rs::registry;
 
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.port);
-    let app = Arc::new(AppState::new(bind, cli.state_stream).await?);
+    let app = Arc::new(ConductorState::new(bind, cli.state_stream).await?);
     let api_port = cli.port + 1;
 
     let agent_name = cli.name.clone();
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         name: agent_name.clone(),
         api_url: format!("http://127.0.0.1:{api_port}"),
         logical_connection_id: app.logical_connection_id.clone(),
-        registered_at: durable_acp_rs::app::now_ms(),
+        registered_at: durable_acp_rs::conductor_state::now_ms(),
     })
     .context("register agent")?;
 
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
 
     let acp_config = api::AcpEndpointConfig {
         agent_command: cli.agent_command.clone(),
-        durable_streams: app.durable_streams.clone(),
+        stream_server: app.stream_server.clone(),
     };
     let api_router = api::router(app.clone(), Some(acp_config));
     spawn_api_server(api_port, api_router).await?;

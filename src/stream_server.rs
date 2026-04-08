@@ -30,14 +30,14 @@ fn default_storage_dir() -> PathBuf {
 }
 
 #[derive(Clone)]
-pub struct EmbeddedDurableStreams {
+pub struct StreamServer {
     pub storage: Arc<FileStorage>,
     pub state_stream: String,
     pub stream_db: StreamDb,
     pub base_url: Arc<str>,
 }
 
-impl EmbeddedDurableStreams {
+impl StreamServer {
     pub async fn start(bind: SocketAddr, state_stream: impl Into<String>) -> Result<Self> {
         Self::start_with_dir(bind, state_stream, default_storage_dir()).await
     }

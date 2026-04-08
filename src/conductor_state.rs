@@ -9,7 +9,7 @@ use sacp::Responder;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::durable_streams::EmbeddedDurableStreams;
+use crate::stream_server::StreamServer;
 use crate::state::{
     ChunkRow, ChunkType, ConnectionRow, ConnectionState, PendingRequestDirection,
     PendingRequestRow, PendingRequestState, PromptTurnRow, PromptTurnState, StateEnvelope,
@@ -17,9 +17,9 @@ use crate::state::{
 };
 
 #[derive(Clone)]
-pub struct AppState {
+pub struct ConductorState {
     pub logical_connection_id: String,
-    pub durable_streams: EmbeddedDurableStreams,
+    pub stream_server: StreamServer,
     pub runtime: Arc<Mutex<RuntimeState>>,
     pub session_to_prompt_turn: Arc<RwLock<HashMap<String, String>>>,
 }
@@ -37,23 +37,23 @@ pub struct QueuedPrompt {
     pub responder: Responder<PromptResponse>,
 }
 
-impl AppState {
+impl ConductorState {
     pub async fn new(bind: SocketAddr, state_stream: impl Into<String>) -> Result<Self> {
-        let durable_streams = EmbeddedDurableStreams::start(bind, state_stream).await?;
-        Self::init(durable_streams).await
+        let stream_server = StreamServer::start(bind, state_stream).await?;
+        Self::init(stream_server).await
     }
 
-    /// Create an AppState that shares an existing durable streams server.
+    /// Create an ConductorState that shares an existing durable streams server.
     /// Used by the multi-agent dashboard so all agents write to one state stream.
-    pub async fn with_shared_streams(durable_streams: EmbeddedDurableStreams) -> Result<Self> {
-        Self::init(durable_streams).await
+    pub async fn with_shared_streams(stream_server: StreamServer) -> Result<Self> {
+        Self::init(stream_server).await
     }
 
-    async fn init(durable_streams: EmbeddedDurableStreams) -> Result<Self> {
+    async fn init(stream_server: StreamServer) -> Result<Self> {
         let logical_connection_id = Uuid::new_v4().to_string();
         let app = Self {
             logical_connection_id: logical_connection_id.clone(),
-            durable_streams,
+            stream_server,
             runtime: Arc::new(Mutex::new(RuntimeState {
                 paused: false,
                 active_prompt_turn: None,
@@ -79,8 +79,8 @@ impl AppState {
     }
 
     pub fn state_stream_url(&self) -> String {
-        self.durable_streams
-            .stream_url(&self.durable_streams.state_stream)
+        self.stream_server
+            .stream_url(&self.stream_server.state_stream)
     }
 
     pub async fn write_state_event<T: serde::Serialize>(
@@ -98,8 +98,8 @@ impl AppState {
             key: key.into(),
             value,
         };
-        self.durable_streams
-            .append_json(&self.durable_streams.state_stream, &envelope)
+        self.stream_server
+            .append_json(&self.stream_server.state_stream, &envelope)
             .await
     }
 
@@ -107,7 +107,7 @@ impl AppState {
         &self,
         mut update: impl FnMut(&mut ConnectionRow),
     ) -> Result<()> {
-        let mut snapshot = self.durable_streams.stream_db.snapshot().await;
+        let mut snapshot = self.stream_server.stream_db.snapshot().await;
         let row = snapshot
             .connections
             .get_mut(&self.logical_connection_id)
@@ -216,7 +216,7 @@ impl AppState {
         stop_reason: String,
         state: PromptTurnState,
     ) -> Result<()> {
-        let mut snapshot = self.durable_streams.stream_db.snapshot().await;
+        let mut snapshot = self.stream_server.stream_db.snapshot().await;
         if let Some(row) = snapshot.prompt_turns.get_mut(prompt_turn_id) {
             row.state = state;
             row.stop_reason = Some(stop_reason);

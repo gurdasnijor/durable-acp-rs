@@ -17,7 +17,7 @@ use agent_client_protocol::{
 use sacp::{Agent, Client, Conductor, ConnectTo, Proxy, on_receive_notification, on_receive_request};
 use serde_json::json;
 
-use crate::app::AppState;
+use crate::conductor_state::ConductorState;
 use crate::state::{
     ChunkType, PendingRequestState, PermissionOptionRow, PermissionRow, PromptTurnState,
     TerminalRow, TerminalState,
@@ -26,7 +26,7 @@ use crate::state::{
 /// ACP proxy that intercepts all messages and persists state to a durable stream.
 #[derive(Clone)]
 pub struct DurableStateProxy {
-    pub app: Arc<AppState>,
+    pub app: Arc<ConductorState>,
 }
 
 impl ConnectTo<Conductor> for DurableStateProxy {
@@ -118,7 +118,7 @@ impl ConnectTo<Conductor> for DurableStateProxy {
                             }).collect()),
                             state: PendingRequestState::Pending,
                             outcome: None,
-                            created_at: crate::app::now_ms(),
+                            created_at: crate::conductor_state::now_ms(),
                             resolved_at: None,
                         };
                         let _ = app
@@ -133,11 +133,11 @@ impl ConnectTo<Conductor> for DurableStateProxy {
                                     RequestPermissionOutcome::Selected(sel) => sel.option_id.0.to_string(),
                                     _ => "unknown".to_string(),
                                 });
-                                let mut snapshot = app.durable_streams.stream_db.snapshot().await;
+                                let mut snapshot = app.stream_server.stream_db.snapshot().await;
                                 if let Some(row) = snapshot.permissions.get_mut(&request_id) {
                                     row.state = PendingRequestState::Resolved;
                                     row.outcome = outcome;
-                                    row.resolved_at = Some(crate::app::now_ms());
+                                    row.resolved_at = Some(crate::conductor_state::now_ms());
                                     let updated = row.clone();
                                     drop(snapshot);
                                     let _ = app
@@ -170,8 +170,8 @@ impl ConnectTo<Conductor> for DurableStateProxy {
                             command: Some(req.command.clone()),
                             exit_code: None,
                             signal: None,
-                            created_at: crate::app::now_ms(),
-                            updated_at: crate::app::now_ms(),
+                            created_at: crate::conductor_state::now_ms(),
+                            updated_at: crate::conductor_state::now_ms(),
                         };
                         let _ = app.write_state_event("terminal", "insert", &terminal_id, Some(&row)).await;
                         cx.send_request_to(Client, req).forward_response_to(responder)?;
@@ -207,7 +207,7 @@ impl ConnectTo<Conductor> for DurableStateProxy {
 }
 
 /// Drive the prompt queue — takes the next queued prompt and sends it to the agent.
-pub fn drive_queue(app: Arc<AppState>, cx: sacp::ConnectionTo<Conductor>) -> Result<(), sacp::Error> {
+pub fn drive_queue(app: Arc<ConductorState>, cx: sacp::ConnectionTo<Conductor>) -> Result<(), sacp::Error> {
     cx.clone().spawn(async move {
         let Some(queued) = app.take_next_prompt().await else {
             return Ok(());
@@ -248,7 +248,7 @@ pub fn drive_queue(app: Arc<AppState>, cx: sacp::ConnectionTo<Conductor>) -> Res
     Ok(())
 }
 
-async fn handle_session_notification(app: &AppState, notif: &SessionNotification) -> Result<()> {
+async fn handle_session_notification(app: &ConductorState, notif: &SessionNotification) -> Result<()> {
     let prompt_turn_id = app
         .session_to_prompt_turn
         .read()

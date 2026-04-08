@@ -8,7 +8,7 @@ async fn main() -> anyhow::Result<()> {
     let tmp = std::env::temp_dir().join(format!("ds-test-{}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
 
-    let ds = durable_acp_rs::durable_streams::EmbeddedDurableStreams::start_with_dir(
+    let ds = durable_acp_rs::stream_server::StreamServer::start_with_dir(
         bind, "durable-acp-state", tmp,
     ).await?;
 

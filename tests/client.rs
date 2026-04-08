@@ -10,10 +10,10 @@ use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
 use tokio::io::duplex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use durable_acp_rs::app::AppState;
+use durable_acp_rs::conductor_state::ConductorState;
 use durable_acp_rs::client::{self, AcpClientHandler};
 use durable_acp_rs::durable_state_proxy::DurableStateProxy;
-use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
+use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::peer_mcp::PeerMcpProxy;
 
 // ---------------------------------------------------------------------------
@@ -47,19 +47,19 @@ impl AcpClientHandler for TestHandler {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn test_app() -> Arc<AppState> {
+async fn test_app() -> Arc<ConductorState> {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = EmbeddedDurableStreams::start_with_dir(
+    let ds = StreamServer::start_with_dir(
         bind, "durable-acp-state", tmp.path().to_path_buf(),
     ).await.unwrap();
     std::mem::forget(tmp);
-    Arc::new(AppState::with_shared_streams(ds).await.unwrap())
+    Arc::new(ConductorState::with_shared_streams(ds).await.unwrap())
 }
 
 /// Set up in-process conductor + Testy, return the client-side transport.
 fn setup_conductor(
-    app: Arc<AppState>,
+    app: Arc<ConductorState>,
 ) -> (sacp::DynConnectTo<sacp::Client>, tokio::task::JoinHandle<Result<(), sacp::Error>>) {
     let (editor_write, conductor_read) = duplex(8192);
     let (conductor_write, editor_read) = duplex(8192);

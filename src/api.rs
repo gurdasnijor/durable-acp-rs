@@ -20,17 +20,17 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::app::AppState;
+use crate::conductor_state::ConductorState;
 use crate::state::TerminalState;
 
 /// Config for the WebSocket ACP endpoint — spawns a new conductor per connection.
 #[derive(Clone)]
 pub struct AcpEndpointConfig {
     pub agent_command: Vec<String>,
-    pub durable_streams: crate::durable_streams::EmbeddedDurableStreams,
+    pub stream_server: crate::stream_server::StreamServer,
 }
 
-pub fn router(app: Arc<AppState>, acp_config: Option<AcpEndpointConfig>) -> Router {
+pub fn router(app: Arc<ConductorState>, acp_config: Option<AcpEndpointConfig>) -> Router {
     let api = Router::new()
         // Queue management
         .route("/api/v1/connections/{id}/queue/pause", post(pause_queue))
@@ -78,7 +78,7 @@ async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
         }
     };
 
-    let app = match AppState::with_shared_streams(config.durable_streams.clone()).await {
+    let app = match ConductorState::with_shared_streams(config.stream_server.clone()).await {
         Ok(a) => Arc::new(a),
         Err(e) => {
             tracing::error!("Failed to create app state: {}", e);
@@ -100,7 +100,7 @@ async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
 
 async fn pause_queue(
     Path(_id): Path<String>,
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ConductorState>>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     app.set_paused(true).await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "paused": true })))
@@ -108,7 +108,7 @@ async fn pause_queue(
 
 async fn resume_queue(
     Path(_id): Path<String>,
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ConductorState>>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     app.set_paused(false).await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "paused": false })))
@@ -116,7 +116,7 @@ async fn resume_queue(
 
 async fn cancel_queued_turn(
     Path((_id, turn_id)): Path<(String, String)>,
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ConductorState>>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let removed = app.cancel_queued_turn(&turn_id).await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -129,7 +129,7 @@ async fn cancel_queued_turn(
 
 async fn clear_queue(
     Path(_id): Path<String>,
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ConductorState>>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let count = app.cancel_all_queued().await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -143,7 +143,7 @@ struct ReorderBody {
 
 async fn reorder_queue(
     Path(_id): Path<String>,
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ConductorState>>,
     Json(body): Json<ReorderBody>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     app.reorder_queue(&body.order).await
@@ -161,7 +161,7 @@ struct FileQuery {
 }
 
 fn resolve_path(
-    app: &AppState,
+    app: &ConductorState,
     snapshot: &crate::state::Collections,
     id: &str,
     rel: &str,
@@ -183,10 +183,10 @@ fn resolve_path(
 async fn get_file(
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ConductorState>>,
 ) -> Result<String, axum::http::StatusCode> {
     let rel = query.path.as_deref().unwrap_or(".");
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let path = resolve_path(&app, &snapshot, &id, rel)?;
     std::fs::read_to_string(path).map_err(|_| axum::http::StatusCode::NOT_FOUND)
 }
@@ -203,10 +203,10 @@ struct TreeEntry {
 async fn get_tree(
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ConductorState>>,
 ) -> Result<Json<Vec<TreeEntry>>, axum::http::StatusCode> {
     let rel = query.path.as_deref().unwrap_or(".");
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let path = resolve_path(&app, &snapshot, &id, rel)?;
     let entries = std::fs::read_dir(&path).map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
     let mut result = Vec::new();
@@ -228,20 +228,20 @@ async fn get_tree(
 // ---------------------------------------------------------------------------
 
 async fn get_registry(
-    State(_app): State<Arc<AppState>>,
+    State(_app): State<Arc<ConductorState>>,
 ) -> Result<Json<crate::registry::Registry>, axum::http::StatusCode> {
     crate::registry::read_registry().map(Json).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn kill_terminal(
     Path((_id, tid)): Path<(String, String)>,
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ConductorState>>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let mut snapshot = app.durable_streams.stream_db.snapshot().await;
+    let mut snapshot = app.stream_server.stream_db.snapshot().await;
     let row = snapshot.terminals.get_mut(&tid)
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
     row.state = TerminalState::Released;
-    row.updated_at = crate::app::now_ms();
+    row.updated_at = crate::conductor_state::now_ms();
     let updated = row.clone();
     drop(snapshot);
     app.write_state_event("terminal", "update", &tid, Some(&updated))

@@ -1,13 +1,13 @@
 pub mod acp_registry;
 pub mod api;
-pub mod app;
 pub mod client;
 pub mod conductor;
-pub mod durable_session;
+pub mod conductor_state;
 pub mod durable_state_proxy;
-pub mod durable_streams;
 pub mod peer_mcp;
 pub mod registry;
 pub mod state;
+pub mod stream_server;
+pub mod stream_subscriber;
 pub mod transport;
 pub mod webhook;

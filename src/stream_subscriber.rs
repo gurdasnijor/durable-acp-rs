@@ -12,7 +12,7 @@
 //! Durable Streams Server (:4437)
 //!   GET /streams/durable-acp-state?live=sse
 //!       ↓ SSE: event: data / event: control
-//! DurableSession
+//! StreamSubscriber
 //!   → parses SSE frames
 //!   → feeds JSON into StreamDb::apply_json_message()
 //!   → tracks offset for reconnection
@@ -31,7 +31,7 @@ use crate::state::StreamDb;
 
 /// A durable session that subscribes to a remote durable stream via SSE
 /// and materializes state into a local `StreamDb`.
-pub struct DurableSession {
+pub struct StreamSubscriber {
     stream_url: String,
     stream_db: StreamDb,
     up_to_date: Arc<Notify>,
@@ -49,7 +49,7 @@ struct ControlPayload {
     stream_closed: Option<bool>,
 }
 
-impl DurableSession {
+impl StreamSubscriber {
     /// Create a new durable session pointing at a stream URL.
     ///
     /// Does not connect until `connect()` or `preload()` is called.
@@ -104,7 +104,7 @@ impl DurableSession {
     }
 }
 
-impl Drop for DurableSession {
+impl Drop for StreamSubscriber {
     fn drop(&mut self) {
         self.disconnect();
     }

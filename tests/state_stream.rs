@@ -7,15 +7,15 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use durable_acp_rs::app::AppState;
-use durable_acp_rs::durable_session::DurableSession;
-use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
+use durable_acp_rs::conductor_state::ConductorState;
+use durable_acp_rs::stream_subscriber::StreamSubscriber;
+use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::state::*;
 
-async fn test_ds() -> EmbeddedDurableStreams {
+async fn test_ds() -> StreamServer {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = EmbeddedDurableStreams::start_with_dir(
+    let ds = StreamServer::start_with_dir(
         bind,
         "durable-acp-state",
         tmp.path().to_path_buf(),
@@ -26,9 +26,9 @@ async fn test_ds() -> EmbeddedDurableStreams {
     ds
 }
 
-async fn test_app() -> AppState {
+async fn test_app() -> ConductorState {
     let ds = test_ds().await;
-    AppState::with_shared_streams(ds).await.unwrap()
+    ConductorState::with_shared_streams(ds).await.unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -38,8 +38,8 @@ async fn test_app() -> AppState {
 #[tokio::test]
 async fn connection_insert_materializes() {
     let app = test_app().await;
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
-    // AppState::init auto-inserts a connection
+    let snapshot = app.stream_server.stream_db.snapshot().await;
+    // ConductorState::init auto-inserts a connection
     assert_eq!(snapshot.connections.len(), 1);
     let conn = snapshot.connections.get(&app.logical_connection_id).unwrap();
     assert_eq!(conn.state, ConnectionState::Created);
@@ -66,7 +66,7 @@ async fn prompt_turn_insert_materializes() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.prompt_turns.len(), 1);
     let turn = &snapshot.prompt_turns["pt-1"];
     assert_eq!(turn.text, Some("hello agent".to_string()));
@@ -87,7 +87,7 @@ async fn chunk_insert_materializes() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.chunks.len(), 3);
 
     let mut chunks: Vec<_> = snapshot.chunks.values().collect();
@@ -133,7 +133,7 @@ async fn permission_insert_materializes() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.permissions.len(), 1);
     let p = &snapshot.permissions["perm-1"];
     assert_eq!(p.title, Some("Read /etc/passwd".to_string()));
@@ -160,7 +160,7 @@ async fn terminal_insert_materializes() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.terminals.len(), 1);
     let t = &snapshot.terminals["term-1"];
     assert_eq!(t.state, TerminalState::Open);
@@ -185,7 +185,7 @@ async fn pending_request_insert_materializes() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.pending_requests.len(), 1);
     let pr = &snapshot.pending_requests["pr-1"];
     assert_eq!(pr.method, "session/prompt");
@@ -206,7 +206,7 @@ async fn runtime_instance_insert_materializes() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.runtime_instances.len(), 1);
     assert_eq!(snapshot.runtime_instances["ri-1"].status, RuntimeStatus::Running);
 }
@@ -227,7 +227,7 @@ async fn connection_update_tracks_state_transition() {
     .await
     .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let conn = snapshot.connections.get(&app.logical_connection_id).unwrap();
     assert_eq!(conn.state, ConnectionState::Attached);
     assert_eq!(conn.latest_session_id, Some("session-abc".to_string()));
@@ -262,7 +262,7 @@ async fn prompt_turn_lifecycle_queued_active_completed() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.prompt_turns["lc-1"].state, PromptTurnState::Active);
 
     // Complete
@@ -270,7 +270,7 @@ async fn prompt_turn_lifecycle_queued_active_completed() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let turn = &snapshot.prompt_turns["lc-1"];
     assert_eq!(turn.state, PromptTurnState::Completed);
     assert_eq!(turn.stop_reason, Some("end_turn".to_string()));
@@ -308,7 +308,7 @@ async fn permission_lifecycle_pending_to_resolved() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let p = &snapshot.permissions["plc-1"];
     assert_eq!(p.state, PendingRequestState::Resolved);
     assert_eq!(p.outcome, Some("opt-allow".to_string()));
@@ -326,7 +326,7 @@ async fn delete_removes_from_collection() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.chunks.len(), 1);
     let chunk_id = snapshot.chunks.keys().next().unwrap().clone();
 
@@ -335,7 +335,7 @@ async fn delete_removes_from_collection() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.chunks.len(), 0);
 }
 
@@ -350,14 +350,14 @@ async fn state_replays_from_disk_into_new_stream_db() {
 
     // Instance 1: write diverse state
     {
-        let ds = EmbeddedDurableStreams::start_with_dir(
+        let ds = StreamServer::start_with_dir(
             bind,
             "durable-acp-state",
             tmp.path().to_path_buf(),
         )
         .await
         .unwrap();
-        let app = AppState::with_shared_streams(ds).await.unwrap();
+        let app = ConductorState::with_shared_streams(ds).await.unwrap();
 
         app.record_chunk("pt-1", ChunkType::Text, "survived restart".to_string())
             .await
@@ -372,7 +372,7 @@ async fn state_replays_from_disk_into_new_stream_db() {
 
     // Instance 2: same dir, new StreamDb — should replay everything
     let bind2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds2 = EmbeddedDurableStreams::start_with_dir(
+    let ds2 = StreamServer::start_with_dir(
         bind2,
         "durable-acp-state",
         tmp.path().to_path_buf(),
@@ -393,7 +393,7 @@ async fn state_replays_from_disk_into_new_stream_db() {
 }
 
 // ---------------------------------------------------------------------------
-// DurableSession: remote StreamDb materializes same state as local
+// StreamSubscriber: remote StreamDb materializes same state as local
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -428,11 +428,11 @@ async fn remote_session_matches_local_state() {
         .await
         .unwrap();
 
-    // Remote DurableSession connects via SSE
-    let mut session = DurableSession::new(app.state_stream_url());
+    // Remote StreamSubscriber connects via SSE
+    let mut session = StreamSubscriber::new(app.state_stream_url());
     session.preload().await.unwrap();
 
-    let local = app.durable_streams.stream_db.snapshot().await;
+    let local = app.stream_server.stream_db.snapshot().await;
     let remote = session.stream_db().snapshot().await;
 
     // Same number of entities
@@ -460,7 +460,7 @@ async fn remote_session_matches_local_state() {
 #[tokio::test]
 async fn subscribe_fires_for_all_entity_types() {
     let app = test_app().await;
-    let mut rx = app.durable_streams.stream_db.subscribe_changes();
+    let mut rx = app.stream_server.stream_db.subscribe_changes();
 
     // Drain connection insert from init
     let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;

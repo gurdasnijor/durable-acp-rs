@@ -12,16 +12,16 @@ use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
 use tokio::io::duplex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use durable_acp_rs::app::AppState;
+use durable_acp_rs::conductor_state::ConductorState;
 use durable_acp_rs::durable_state_proxy::DurableStateProxy;
-use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
+use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::peer_mcp::PeerMcpProxy;
 use durable_acp_rs::state::{ChunkType, ConnectionState, PromptTurnState};
 
-async fn test_app() -> Arc<AppState> {
+async fn test_app() -> Arc<ConductorState> {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = EmbeddedDurableStreams::start_with_dir(
+    let ds = StreamServer::start_with_dir(
         bind,
         "durable-acp-state",
         tmp.path().to_path_buf(),
@@ -29,12 +29,12 @@ async fn test_app() -> Arc<AppState> {
     .await
     .unwrap();
     std::mem::forget(tmp);
-    Arc::new(AppState::with_shared_streams(ds).await.unwrap())
+    Arc::new(ConductorState::with_shared_streams(ds).await.unwrap())
 }
 
 /// Wire up: client ↔ conductor (DurableStateProxy + PeerMcpProxy + Testy)
 /// Returns the response text from the agent.
-async fn run_prompt(app: Arc<AppState>, prompt: &str) -> String {
+async fn run_prompt(app: Arc<ConductorState>, prompt: &str) -> String {
     let (editor_write, conductor_read) = duplex(8192);
     let (conductor_write, editor_read) = duplex(8192);
 
@@ -106,7 +106,7 @@ async fn proxy_persists_connection_state() {
     let app = test_app().await;
 
     // Before prompt: connection exists but not attached
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(
         snapshot
             .connections
@@ -119,7 +119,7 @@ async fn proxy_persists_connection_state() {
     let _ = run_prompt(app.clone(), &TestyCommand::Greet.to_prompt()).await;
 
     // After prompt: connection should be attached with session_id and cwd
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let conn = snapshot
         .connections
         .get(&app.logical_connection_id)
@@ -134,7 +134,7 @@ async fn proxy_persists_prompt_turn_lifecycle() {
     let app = test_app().await;
     let _ = run_prompt(app.clone(), &TestyCommand::Greet.to_prompt()).await;
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
 
     // Should have exactly one prompt turn
     assert_eq!(snapshot.prompt_turns.len(), 1);
@@ -157,7 +157,7 @@ async fn proxy_persists_chunks() {
     )
     .await;
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
 
     // Should have at least a text chunk + stop chunk
     assert!(snapshot.chunks.len() >= 2, "expected >=2 chunks, got {}", snapshot.chunks.len());
@@ -188,7 +188,7 @@ async fn proxy_persists_pending_request() {
     let app = test_app().await;
     let _ = run_prompt(app.clone(), &TestyCommand::Greet.to_prompt()).await;
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
 
     // Should have a pending_request for the prompt
     assert!(
@@ -198,7 +198,7 @@ async fn proxy_persists_pending_request() {
 }
 
 // ---------------------------------------------------------------------------
-// State survives across prompts (same AppState, same stream)
+// State survives across prompts (same ConductorState, same stream)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -222,7 +222,7 @@ async fn multiple_prompts_accumulate_state() {
     )
     .await;
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
 
     // Two prompt turns, both completed
     assert_eq!(snapshot.prompt_turns.len(), 2);

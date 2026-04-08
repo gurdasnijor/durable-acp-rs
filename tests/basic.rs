@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use durable_acp_rs::app::AppState;
-use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
+use durable_acp_rs::conductor_state::ConductorState;
+use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::state::{
     ChunkType, ConnectionRow, ConnectionState, PromptTurnRow, PromptTurnState, StateEnvelope,
     StateHeaders,
@@ -45,7 +45,7 @@ async fn stream_db_applies_state_events() {
 async fn embedded_durable_streams_serves_stream_protocol() {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let streams = EmbeddedDurableStreams::start_with_dir(bind, "state", tmp.path().to_path_buf())
+    let streams = StreamServer::start_with_dir(bind, "state", tmp.path().to_path_buf())
         .await
         .unwrap();
 
@@ -81,11 +81,11 @@ async fn embedded_durable_streams_serves_stream_protocol() {
 async fn app_state_persists_chunks_into_state_stream() {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let durable_streams =
-        EmbeddedDurableStreams::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
+    let stream_server =
+        StreamServer::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
             .await
             .unwrap();
-    let app = AppState::with_shared_streams(durable_streams).await.unwrap();
+    let app = ConductorState::with_shared_streams(stream_server).await.unwrap();
 
     let prompt_turn = PromptTurnRow {
         prompt_turn_id: "turn-1".to_string(),
@@ -106,7 +106,7 @@ async fn app_state_persists_chunks_into_state_stream() {
         .await
         .unwrap();
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.prompt_turns.len(), 1);
     assert_eq!(snapshot.chunks.len(), 1);
     assert_eq!(snapshot.chunks.values().next().unwrap().content, "hi");
@@ -119,14 +119,14 @@ async fn file_storage_survives_restart() {
 
     // First instance: write state
     {
-        let ds = EmbeddedDurableStreams::start_with_dir(
+        let ds = StreamServer::start_with_dir(
             bind,
             "durable-acp-state",
             tmp.path().to_path_buf(),
         )
         .await
         .unwrap();
-        let app = AppState::with_shared_streams(ds).await.unwrap();
+        let app = ConductorState::with_shared_streams(ds).await.unwrap();
         app.record_chunk("turn-1", ChunkType::Text, "persisted".to_string())
             .await
             .unwrap();
@@ -134,7 +134,7 @@ async fn file_storage_survives_restart() {
 
     // Second instance: state should be replayed from disk
     let bind2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds2 = EmbeddedDurableStreams::start_with_dir(
+    let ds2 = StreamServer::start_with_dir(
         bind2,
         "durable-acp-state",
         tmp.path().to_path_buf(),

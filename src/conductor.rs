@@ -9,14 +9,14 @@ use std::sync::Arc;
 use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
 use sacp_tokio::AcpAgent;
 
-use crate::app::AppState;
+use crate::conductor_state::ConductorState;
 use crate::durable_state_proxy::DurableStateProxy;
 use crate::peer_mcp::PeerMcpProxy;
 
 /// Build a conductor with the durable state + peer MCP proxy chain.
 ///
 /// Chain: Client → DurableStateProxy → PeerMcpProxy → Agent
-pub fn build_conductor(app: Arc<AppState>, agent: AcpAgent) -> ConductorImpl<sacp::Agent> {
+pub fn build_conductor(app: Arc<ConductorState>, agent: AcpAgent) -> ConductorImpl<sacp::Agent> {
     ConductorImpl::new_agent(
         "durable-acp".to_string(),
         ProxiesAndAgent::new(agent)

@@ -9,9 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use durable_acp_rs::api;
-use durable_acp_rs::app::AppState;
-use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
-use durable_acp_rs::durable_session::DurableSession;
+use durable_acp_rs::conductor_state::ConductorState;
+use durable_acp_rs::stream_server::StreamServer;
+use durable_acp_rs::stream_subscriber::StreamSubscriber;
 use durable_acp_rs::state::{
     ChunkType, CollectionChange, ConnectionState, PendingRequestState, PermissionRow,
     PromptTurnRow, PromptTurnState, TerminalRow, TerminalState,
@@ -21,19 +21,19 @@ use durable_acp_rs::state::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn test_app() -> Arc<AppState> {
+async fn test_app() -> Arc<ConductorState> {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = EmbeddedDurableStreams::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
+    let ds = StreamServer::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
         .await
         .unwrap();
     // Leak the tempdir so it lives for the test duration
     std::mem::forget(tmp);
-    Arc::new(AppState::with_shared_streams(ds).await.unwrap())
+    Arc::new(ConductorState::with_shared_streams(ds).await.unwrap())
 }
 
 /// Spin up the REST API on an ephemeral port, return the base URL.
-async fn test_server(app: Arc<AppState>) -> String {
+async fn test_server(app: Arc<ConductorState>) -> String {
     let router = api::router(app, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -48,11 +48,11 @@ async fn test_server(app: Arc<AppState>) -> String {
 #[tokio::test]
 async fn stream_db_notifies_on_connection_insert() {
     let app = test_app().await;
-    let mut rx = app.durable_streams.stream_db.subscribe_changes();
+    let mut rx = app.stream_server.stream_db.subscribe_changes();
 
-    // AppState::init already inserted a connection — drain that notification
+    // ConductorState::init already inserted a connection — drain that notification
     // by checking the snapshot directly
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.connections.len(), 1);
 
     // Update the connection — should trigger a notification
@@ -66,7 +66,7 @@ async fn stream_db_notifies_on_connection_insert() {
         .unwrap();
     assert!(matches!(change, CollectionChange::Connections));
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let conn = snapshot.connections.values().next().unwrap();
     assert_eq!(conn.state, ConnectionState::Attached);
 }
@@ -74,7 +74,7 @@ async fn stream_db_notifies_on_connection_insert() {
 #[tokio::test]
 async fn stream_db_notifies_on_chunk_insert() {
     let app = test_app().await;
-    let mut rx = app.durable_streams.stream_db.subscribe_changes();
+    let mut rx = app.stream_server.stream_db.subscribe_changes();
 
     // Drain connection insert notification
     let _ = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
@@ -112,7 +112,7 @@ async fn queue_pause_resume_via_rest() {
     assert_eq!(body["paused"], true);
 
     // Verify state
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let conn = snapshot.connections.get(&conn_id).unwrap();
     assert_eq!(conn.queue_paused, Some(true));
 
@@ -126,7 +126,7 @@ async fn queue_pause_resume_via_rest() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["paused"], false);
 
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let conn = snapshot.connections.get(&conn_id).unwrap();
     assert_eq!(conn.queue_paused, Some(false));
 }
@@ -303,7 +303,7 @@ async fn kill_terminal_updates_stream_db() {
     assert!(resp.status().is_success());
 
     // Verify terminal state changed in StreamDB
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     let term = snapshot.terminals.get("term-1").unwrap();
     assert_eq!(term.state, TerminalState::Released);
 }
@@ -344,7 +344,7 @@ async fn webhook_detects_prompt_turn_completion() {
     };
 
     let _handle = webhook::spawn_forwarder(
-        app.durable_streams.stream_db.clone(),
+        app.stream_server.stream_db.clone(),
         vec![config],
     );
 
@@ -413,7 +413,7 @@ async fn webhook_detects_permission_request() {
     tokio::spawn(async move { axum::serve(mock_listener, mock_router).await.unwrap() });
 
     let _handle = webhook::spawn_forwarder(
-        app.durable_streams.stream_db.clone(),
+        app.stream_server.stream_db.clone(),
         vec![webhook::WebhookConfig {
             url: format!("http://{mock_addr}/webhook"),
             events: vec!["permission_request".to_string()],
@@ -480,13 +480,13 @@ async fn state_stream_accessible_via_http() {
 }
 
 // ---------------------------------------------------------------------------
-// AppState init: creates connection in StreamDB automatically
+// ConductorState init: creates connection in StreamDB automatically
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn app_state_init_creates_connection() {
     let app = test_app().await;
-    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.connections.len(), 1);
     let conn = snapshot.connections.get(&app.logical_connection_id).unwrap();
     assert_eq!(conn.state, ConnectionState::Created);
@@ -494,19 +494,19 @@ async fn app_state_init_creates_connection() {
 }
 
 // ---------------------------------------------------------------------------
-// Multiple AppState instances share one durable stream
+// Multiple ConductorState instances share one durable stream
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn shared_durable_streams_see_each_others_state() {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = EmbeddedDurableStreams::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
+    let ds = StreamServer::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
         .await
         .unwrap();
 
-    let app_a = AppState::with_shared_streams(ds.clone()).await.unwrap();
-    let app_b = AppState::with_shared_streams(ds.clone()).await.unwrap();
+    let app_a = ConductorState::with_shared_streams(ds.clone()).await.unwrap();
+    let app_b = ConductorState::with_shared_streams(ds.clone()).await.unwrap();
 
     // Both should see both connections
     let snapshot = ds.stream_db.snapshot().await;
@@ -561,7 +561,7 @@ async fn webhook_sends_hmac_signature() {
 
     let secret = "test-hmac-secret";
     let _handle = webhook::spawn_forwarder(
-        app.durable_streams.stream_db.clone(),
+        app.stream_server.stream_db.clone(),
         vec![webhook::WebhookConfig {
             url: format!("http://{mock_addr}/webhook"),
             events: vec!["*".to_string()],
@@ -633,7 +633,7 @@ async fn webhook_filters_by_event_type() {
 
     // Only subscribe to permission_request — not end_turn
     let _handle = webhook::spawn_forwarder(
-        app.durable_streams.stream_db.clone(),
+        app.stream_server.stream_db.clone(),
         vec![webhook::WebhookConfig {
             url: format!("http://{mock_addr}/webhook"),
             events: vec!["permission_request".to_string()],
@@ -718,7 +718,7 @@ async fn webhook_fires_error_on_broken_turn() {
     tokio::spawn(async move { axum::serve(mock_listener, mock_router).await.unwrap() });
 
     let _handle = webhook::spawn_forwarder(
-        app.durable_streams.stream_db.clone(),
+        app.stream_server.stream_db.clone(),
         vec![webhook::WebhookConfig {
             url: format!("http://{mock_addr}/webhook"),
             events: vec!["*".to_string()],
@@ -818,7 +818,7 @@ async fn queue_reorder_via_rest() {
 }
 
 // ---------------------------------------------------------------------------
-// DurableSession: SSE subscriber materializes remote state
+// StreamSubscriber: SSE subscriber materializes remote state
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -831,9 +831,9 @@ async fn durable_session_preloads_existing_state() {
         .await
         .unwrap();
 
-    // Connect a DurableSession to the same stream via SSE
+    // Connect a StreamSubscriber to the same stream via SSE
     let stream_url = app.state_stream_url();
-    let mut session = DurableSession::new(stream_url);
+    let mut session = StreamSubscriber::new(stream_url);
     session.preload().await.unwrap();
 
     // The session's StreamDb should have materialized the connection + chunk
@@ -859,7 +859,7 @@ async fn durable_session_receives_live_updates() {
     let app = test_app().await;
     let stream_url = app.state_stream_url();
 
-    let mut session = DurableSession::new(stream_url);
+    let mut session = StreamSubscriber::new(stream_url);
     session.preload().await.unwrap();
 
     // Subscribe to changes on the session's StreamDb

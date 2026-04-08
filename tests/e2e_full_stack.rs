@@ -3,11 +3,11 @@
 //! Verifies the complete system:
 //! 1. ACP client sends prompts through the conductor's proxy chain
 //! 2. DurableStateProxy persists all state to the durable stream
-//! 3. A remote DurableSession (SSE subscriber) materializes the same state
+//! 3. A remote StreamSubscriber (SSE subscriber) materializes the same state
 //!
 //! This proves the two-primitive architecture works:
 //! - In-band: ACP client → conductor (prompt, cancel, permissions)
-//! - Out-of-band: DurableSession → durable stream (reactive state)
+//! - Out-of-band: StreamSubscriber → durable stream (reactive state)
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -17,17 +17,17 @@ use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
 use tokio::io::duplex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use durable_acp_rs::app::AppState;
-use durable_acp_rs::durable_session::DurableSession;
+use durable_acp_rs::conductor_state::ConductorState;
+use durable_acp_rs::stream_subscriber::StreamSubscriber;
 use durable_acp_rs::durable_state_proxy::DurableStateProxy;
-use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
+use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::peer_mcp::PeerMcpProxy;
 use durable_acp_rs::state::{ChunkType, ConnectionState, PromptTurnState};
 
-async fn test_app() -> Arc<AppState> {
+async fn test_app() -> Arc<ConductorState> {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = EmbeddedDurableStreams::start_with_dir(
+    let ds = StreamServer::start_with_dir(
         bind,
         "durable-acp-state",
         tmp.path().to_path_buf(),
@@ -35,10 +35,10 @@ async fn test_app() -> Arc<AppState> {
     .await
     .unwrap();
     std::mem::forget(tmp);
-    Arc::new(AppState::with_shared_streams(ds).await.unwrap())
+    Arc::new(ConductorState::with_shared_streams(ds).await.unwrap())
 }
 
-async fn run_prompt(app: Arc<AppState>, prompt: &str) -> String {
+async fn run_prompt(app: Arc<ConductorState>, prompt: &str) -> String {
     let (editor_write, conductor_read) = duplex(8192);
     let (conductor_write, editor_read) = duplex(8192);
 
@@ -77,7 +77,7 @@ async fn run_prompt(app: Arc<AppState>, prompt: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// E2E: remote DurableSession observes in-band ACP prompt results
+// E2E: remote StreamSubscriber observes in-band ACP prompt results
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -95,12 +95,12 @@ async fn e2e_remote_session_observes_prompt_flow() {
     .await;
     assert_eq!(result, "e2e test");
 
-    // 2. Connect a remote DurableSession via SSE (out-of-band observer)
-    let mut session = DurableSession::new(app.state_stream_url());
+    // 2. Connect a remote StreamSubscriber via SSE (out-of-band observer)
+    let mut session = StreamSubscriber::new(app.state_stream_url());
     session.preload().await.unwrap();
 
     // 3. Verify the remote session sees the same state as the conductor's local StreamDb
-    let local = app.durable_streams.stream_db.snapshot().await;
+    let local = app.stream_server.stream_db.snapshot().await;
     let remote = session.stream_db().snapshot().await;
 
     // Connections
@@ -166,7 +166,7 @@ async fn e2e_remote_session_observes_multiple_prompts() {
     assert_eq!(r2, "second");
 
     // Remote observer connects after both prompts
-    let mut session = DurableSession::new(app.state_stream_url());
+    let mut session = StreamSubscriber::new(app.state_stream_url());
     session.preload().await.unwrap();
 
     let remote = session.stream_db().snapshot().await;
@@ -193,7 +193,7 @@ async fn e2e_change_subscriptions_fire_for_prompt_events() {
     let app = test_app().await;
 
     // Subscribe to changes BEFORE the prompt
-    let mut rx = app.durable_streams.stream_db.subscribe_changes();
+    let mut rx = app.stream_server.stream_db.subscribe_changes();
 
     // Drain the initial connection insert
     let _ = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
