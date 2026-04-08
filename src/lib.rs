@@ -3,6 +3,7 @@ pub mod api;
 pub mod app;
 pub mod client;
 pub mod conductor;
+pub mod durable_session;
 pub mod durable_state_proxy;
 pub mod durable_streams;
 pub mod peer_mcp;

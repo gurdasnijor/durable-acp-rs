@@ -11,6 +11,7 @@ use std::sync::Arc;
 use durable_acp_rs::api;
 use durable_acp_rs::app::AppState;
 use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
+use durable_acp_rs::durable_session::DurableSession;
 use durable_acp_rs::state::{
     ChunkType, CollectionChange, ConnectionState, PendingRequestState, PermissionRow,
     PromptTurnRow, PromptTurnState, TerminalRow, TerminalState,
@@ -814,4 +815,71 @@ async fn queue_reorder_via_rest() {
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["reordered"], true);
+}
+
+// ---------------------------------------------------------------------------
+// DurableSession: SSE subscriber materializes remote state
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn durable_session_preloads_existing_state() {
+    // Set up a conductor-side app that writes state
+    let app = test_app().await;
+
+    // Write some state before the session connects
+    app.record_chunk("turn-1", ChunkType::Text, "pre-existing".to_string())
+        .await
+        .unwrap();
+
+    // Connect a DurableSession to the same stream via SSE
+    let stream_url = app.state_stream_url();
+    let mut session = DurableSession::new(stream_url);
+    session.preload().await.unwrap();
+
+    // The session's StreamDb should have materialized the connection + chunk
+    let snapshot = session.stream_db().snapshot().await;
+    assert!(
+        !snapshot.connections.is_empty(),
+        "session should see the connection"
+    );
+    assert!(
+        !snapshot.chunks.is_empty(),
+        "session should see the pre-existing chunk"
+    );
+    assert_eq!(
+        snapshot.chunks.values().next().unwrap().content,
+        "pre-existing"
+    );
+
+    session.disconnect();
+}
+
+#[tokio::test]
+async fn durable_session_receives_live_updates() {
+    let app = test_app().await;
+    let stream_url = app.state_stream_url();
+
+    let mut session = DurableSession::new(stream_url);
+    session.preload().await.unwrap();
+
+    // Subscribe to changes on the session's StreamDb
+    let mut rx = session.stream_db().subscribe_changes();
+
+    // Write new state AFTER session is connected
+    app.record_chunk("turn-2", ChunkType::Text, "live update".to_string())
+        .await
+        .unwrap();
+
+    // The session should receive the live update via SSE
+    let change = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .expect("timeout waiting for live update")
+        .unwrap();
+    assert!(matches!(change, CollectionChange::Chunks));
+
+    let snapshot = session.stream_db().snapshot().await;
+    let live_chunk = snapshot.chunks.values().find(|c| c.content == "live update");
+    assert!(live_chunk.is_some(), "session should see the live chunk");
+
+    session.disconnect();
 }
