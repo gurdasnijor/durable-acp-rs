@@ -1,138 +1,87 @@
-# SDD: Flamecast Runtime Swap — Replace session-host with durable-acp-rs
+# SDD: Flamecast Integration — durable-acp-rs Owns Hosting, Flamecast Owns UI
 
-> **Goal:** Replace Flamecast's Go `session-host` binary and PGLite/Postgres
-> storage with `durable-acp-rs` as the conductor layer. The React UI stays.
-> State observation moves from EventBus+WebSocket to durable stream SSE.
+> **Goal:** Flamecast becomes a pure UI/API layer. durable-acp-rs owns all
+> agent hosting, lifecycle management, state persistence, and ACP transport.
+> Flamecast connects to running conductors — it does not spawn or manage them.
 >
 > **Scope:** Flamecast (`~/smithery/flamecast`) + durable-acp-rs + distributed-acp
 > (`~/gurdasnijor/distributed-acp` — `@durable-acp/state`, `@durable-acp/client`)
 
 ## Principle
 
-durable-acp-rs IS the session host. It already runs the conductor, persists
-all ACP state to a durable stream, serves a REST API for queue/filesystem,
-and accepts ACP clients via `/acp` WebSocket. Flamecast's runtime providers
-just need to spawn it instead of `session-host`.
+durable-acp-rs owns everything below the wire: agent processes, conductor
+proxy chains, durable state persistence, webhooks, queue management,
+filesystem access. Flamecast receives conductor endpoints (however they
+were started — Docker, k8s, E2B, manual) and connects with two primitives:
 
-## What Gets Cut
+1. **ACP client** → `ws://host:port+1/acp` (prompt, cancel, permissions)
+2. **Durable state** → `http://host:port/streams/durable-acp-state` (reactive collections)
 
-| Flamecast Component | Package/File | Reason |
+Flamecast does not spawn, manage, or monitor agent processes.
+
+## What Gets Cut from Flamecast
+
+| Component | Package/File | Why |
 |---|---|---|
-| `session-host-go` | `packages/session-host-go/` | Conductor replaces it entirely |
-| `@flamecast/psql` | `packages/flamecast-psql/` | StreamDB replaces session/runtime queries |
+| `session-host-go` | `packages/session-host-go/` | durable-acp-rs IS the session host |
+| Runtime providers | `packages/runtime-docker/`, `packages/runtime-e2b/` | durable-acp-rs owns hosting |
+| `SessionService` | `packages/flamecast/src/flamecast/session-service.ts` | No process management in Flamecast |
+| `@flamecast/psql` | `packages/flamecast-psql/` | StreamDB replaces all session/state queries |
 | `EventBus` | `packages/flamecast/src/flamecast/events/bus.ts` | Durable stream SSE replaces in-memory ring buffer |
 | WS multiplexer `/ws` | `packages/flamecast/src/flamecast/events/channels.ts` | SSE + ACP WS replaces channel-based WebSocket |
-| `WebhookDeliveryEngine` | `packages/flamecast/src/flamecast/events/webhooks.ts` | `durable-acp-rs/src/webhook.rs` replaces it |
-| Session callback protocol | `Flamecast.handleSessionEvent()` | `DurableStateProxy` intercepts ACP automatically |
+| `WebhookDeliveryEngine` | `packages/flamecast/src/flamecast/events/webhooks.ts` | `durable-acp-rs/src/webhook.rs` handles it |
+| Session callbacks | `Flamecast.handleSessionEvent()` | `DurableStateProxy` intercepts ACP automatically |
 | `FlamecastStorage` session methods | `packages/protocol/src/storage.ts` | `DurableACPClient` collections |
 
-## What Stays (Rewired)
+## What Stays in Flamecast (Rewired)
 
 | Component | Change |
 |---|---|
-| Runtime providers (Docker/E2B) | Spawn command → `durable-acp-rs --port X <agent>` |
 | Agent templates | Keep simple store (file/KV). Drop Postgres tables. |
-| Hono API | Thin proxy: templates CRUD + forward queue/file to conductor REST |
-| React UI + hooks | Rewire to `DurableACPClient` + `useLiveQuery` |
+| Hono API | Thin layer: templates CRUD + proxy queue/file requests to conductor REST |
+| React UI + hooks | Rewire to `DurableACPClient` (`@agentclientprotocol/sdk` + `@durable-acp/state`) |
 
 ## Seam Lines
 
-Four integration points between Flamecast (TypeScript) and durable-acp-rs (Rust):
+Two seams — that's it. Flamecast receives `ConductorEndpoints` and connects:
 
-### Seam 1: Runtime spawn
-
-Runtime providers create a container/sandbox running `durable-acp-rs`.
-
-```typescript
-// packages/runtime-docker/src/index.ts — change the spawn command
-// Before:
-cmd: ["session-host", "--port", "8080", "--callback-url", callbackUrl]
-
-// After:
-cmd: ["durable-acp-rs", "--port", "4437", agentCommand...]
-// No callback URL needed — state flows through the durable stream
-```
-
-The runtime returns two URLs:
 ```typescript
 interface ConductorEndpoints {
-  stateStreamUrl: string;  // http://host:4437/streams/durable-acp-state
-  websocketUrl: string;    // ws://host:4438/acp
-  apiUrl: string;          // http://host:4438
+  acpUrl: string;          // ws://host:4438/acp — ACP client connection
+  stateStreamUrl: string;  // http://host:4437/streams/durable-acp-state — SSE
+  apiUrl: string;          // http://host:4438 — queue mgmt + filesystem REST
 }
 ```
 
-### Seam 2: State observation (electric-sync-sdd.md)
+### Seam 1: ACP client (`@agentclientprotocol/sdk`)
 
-`@durable-acp/state` subscribes to the conductor's durable stream via SSE
-and materializes into reactive TanStack DB collections.
+Standard ACP protocol over WebSocket. All prompt/cancel/permission operations.
+Flamecast connects as a client — same as the Rust TUI dashboard does.
 
-```typescript
-import { createDurableACPDB } from "@durable-acp/state";
+### Seam 2: Durable state (`@durable-acp/state`)
 
-const db = createDurableACPDB({ stateStreamUrl });
-await db.preload();
+SSE subscription to durable stream. Materializes into reactive TanStack DB
+collections. Replaces EventBus, FlamecastStorage, WebSocket multiplexer.
 
-db.collections.connections     // ConnectionRow[] — reactive
-db.collections.promptTurns     // PromptTurnRow[] — reactive
-db.collections.chunks          // ChunkRow[] — reactive
-db.collections.permissions     // PermissionRow[] — reactive
-```
+### Queue/filesystem: REST proxy
 
-This replaces:
-- `FlamecastStorage.listAllSessions()` → `db.collections.connections`
-- `FlamecastStorage.getSessionMeta(id)` → `db.collections.connections.find(...)`
-- `EventBus.pushEvent()` → automatic (DurableStateProxy writes, SSE delivers)
-- `EventBus` ring buffer + seq numbering → durable stream offsets (built-in)
-
-### Seam 3: Prompt and control (ACP over WebSocket)
-
-Prompts go through ACP, not REST. The React UI connects as an ACP client:
-
-```typescript
-// New: ACP client connection for prompt/control
-// Uses @anthropic/acp-client or raw WebSocket with JSON-RPC
-const ws = new WebSocket(websocketUrl); // ws://host:4438/acp
-// → Initialize, NewSession, Prompt, RequestPermission responses
-```
-
-This replaces:
-- `POST /agents/:id/prompts` → ACP `PromptRequest` over WS
-- `POST /agents/:id/permissions/:reqId` → ACP `RequestPermissionResponse` over WS
-- `POST /agents/:id/cancel` → ACP cancellation over WS
-- `POST /agents/:id/terminate` → close WS connection (conductor terminates)
-
-### Seam 4: Queue and filesystem (REST proxy)
-
-Queue management and filesystem access stay as REST, proxied through Hono:
-
-```typescript
-// Hono route → forwards to conductor REST API
-app.post("/agents/:id/queue/pause", async (c) => {
-  const { apiUrl } = getEndpoints(c.req.param("id"));
-  return fetch(`${apiUrl}/api/v1/connections/${id}/queue/pause`, { method: "POST" });
-});
-```
-
-Endpoints proxied:
+Queue management and filesystem access proxied through Hono to conductor REST:
 - `POST /queue/pause`, `/queue/resume`
-- `DELETE /queue/:turnId`, `DELETE /queue`
-- `PUT /queue` (reorder)
+- `DELETE /queue/:turnId`, `DELETE /queue`, `PUT /queue`
 - `GET /files`, `GET /fs/tree`
 
 ## React Hook Migration
 
 ```typescript
-// Before: useFlamecastSession — WebSocket channel subscription
+// Before: useFlamecastSession — WebSocket channel subscription + EventBus
 function useFlamecastSession(sessionId: string, websocketUrl?: string) {
-  // Connects to ws://host/ws
-  // Subscribes to channel "session:{sessionId}"
-  // Parses multiplexed events from EventBus
+  // Connects to ws://host/ws, subscribes to channels, parses EventBus events
   return { events, prompt, cancel, respondToPermission, ... };
 }
 
-// After: useDurableACPSession — StreamDB + ACP WS
-function useDurableACPSession(sessionId: string, endpoints: ConductorEndpoints) {
+// After: useDurableACPSession — two primitives composed
+function useDurableACPSession(endpoints: ConductorEndpoints) {
+  // Primitive 1: Durable state (reactive collections from SSE)
   const db = useMemo(() => createDurableACPDB({
     stateStreamUrl: endpoints.stateStreamUrl,
   }), [endpoints.stateStreamUrl]);
@@ -141,13 +90,11 @@ function useDurableACPSession(sessionId: string, endpoints: ConductorEndpoints) 
   const turns = useLiveQuery(db.collections.promptTurns);
   const permissions = useLiveQuery(db.collections.permissions);
 
-  // ACP client for prompt/control
-  const acpClient = useAcpClient(endpoints.websocketUrl);
+  // Primitive 2: ACP client (prompt/control over WS)
+  const acpClient = useAcpClient(endpoints.acpUrl);
 
   return {
-    chunks,
-    turns,
-    permissions,
+    chunks, turns, permissions,
     prompt: (text) => acpClient.prompt(text),
     cancel: () => acpClient.cancel(),
     respondToPermission: (reqId, optionId) =>
@@ -158,80 +105,64 @@ function useDurableACPSession(sessionId: string, endpoints: ConductorEndpoints) 
 
 ## Phases
 
-### Phase 1: Runtime swap (~1 day)
-
-**Acceptance criteria:**
-- [ ] Docker runtime spawns `durable-acp-rs --port X <agent>` instead of `session-host`
-- [ ] `SessionService.startSession()` extracts `{ stateStreamUrl, websocketUrl, apiUrl }` from conductor
-- [ ] Conductor starts, agent subprocess runs, `/acp` WS accepts connections
-- [ ] `curl http://host:4437/streams/durable-acp-state` returns SSE events
-- [ ] Existing Flamecast tests pass with new spawn command
-
-**Changes:**
-- `packages/runtime-docker/src/index.ts` — swap spawn command
-- `packages/runtime-e2b/src/index.ts` — swap spawn command
-- `packages/protocol/src/runtime.ts` — add `stateStreamUrl` to `SessionRuntimeInfo`
-- Dockerfile — install `durable-acp-rs` binary + agent runtimes (node, etc.)
-
-**Does NOT change:** React UI, EventBus, FlamecastStorage, WebSocket protocol.
-Phase 1 is a backend-only swap. The old event path still works via
-session-host compatibility shim if needed.
-
-### Phase 2: State observation swap (~1-2 days)
+### Phase 1: Wire up the two primitives (~2 days)
 
 **Acceptance criteria:**
 - [ ] `@durable-acp/state` and `@durable-acp/client` published to npm
-- [ ] `useFlamecastSession` rewired to `useDurableACPSession` (StreamDB + ACP WS)
+- [ ] `DurableACPClient` uses `@agentclientprotocol/sdk` for ACP (not REST POSTs)
+- [ ] `useFlamecastSession` rewired to `useDurableACPSession` (StreamDB + ACP SDK)
 - [ ] React UI renders live chunks, prompt turns, permissions from durable stream SSE
-- [ ] EventBus deleted — all state flows through durable stream
-- [ ] WebSocket `/ws` handler deleted — SSE replaces it
-- [ ] Channel routing (`events/channels.ts`) deleted
+- [ ] Prompt/cancel/permissions work through ACP WS
+- [ ] Verified against a locally running `durable-acp-rs` conductor
 
 **Changes:**
-- `packages/ui/src/hooks/use-flamecast-session.ts` → rewrite to `useDurableACPSession`
-- `packages/ui/src/hooks/use-sessions.ts` → read from `db.collections.connections`
-- `packages/flamecast/src/flamecast/events/` → delete `bus.ts`, `channels.ts`
-- `packages/flamecast/src/flamecast/api.ts` → remove `/ws` upgrade handler
+- `distributed-acp/packages/durable-acp-client/` → replace REST POST commands with `@agentclientprotocol/sdk`
 - `distributed-acp/packages/durable-acp-state/` → npm publish
 - `distributed-acp/packages/durable-acp-client/` → npm publish
+- `packages/ui/src/hooks/use-flamecast-session.ts` → rewrite to `useDurableACPSession`
+- `packages/ui/src/hooks/use-sessions.ts` → read from `db.collections.connections`
 
-### Phase 3: Storage swap (~1 day)
-
-**Acceptance criteria:**
-- [ ] `FlamecastStorage` reduced to agent templates only (no session/runtime methods)
-- [ ] `@flamecast/psql` deleted — no Postgres/PGLite dependency
-- [ ] Agent templates stored in simple file/KV (or keep thin Postgres for templates only)
-- [ ] Session list page, session detail page work from StreamDB collections
-- [ ] `listAllSessions()` reads from `db.collections.connections`
-- [ ] `getStoredSession(id)` reads from StreamDB snapshot
-
-**Changes:**
-- `packages/protocol/src/storage.ts` — remove session/runtime methods
-- `packages/flamecast-psql/` → delete package
-- `packages/flamecast/src/flamecast/index.ts` → remove storage session calls
-- Agent templates → simple JSON file or lightweight store
-
-### Phase 4: Cleanup (~0.5 day)
+### Phase 2: Delete Flamecast backend (~1-2 days)
 
 **Acceptance criteria:**
 - [ ] `session-host-go` package deleted
-- [ ] `WebhookDeliveryEngine` deleted (conductor's `webhook.rs` handles it)
-- [ ] Hono API simplified to: agent templates CRUD + proxy to conductor REST
+- [ ] `packages/runtime-docker/` and `packages/runtime-e2b/` deleted
+- [ ] `SessionService` deleted
+- [ ] `EventBus`, WS multiplexer `/ws`, channel routing deleted
+- [ ] `WebhookDeliveryEngine` deleted
+- [ ] `FlamecastStorage` reduced to agent templates only
+- [ ] `@flamecast/psql` deleted — no Postgres/PGLite dependency
 - [ ] Session callback protocol (`handleSessionEvent`) deleted
-- [ ] Flamecast `package.json` has no `pg`, `drizzle-orm`, `pglite` deps
-- [ ] All existing Flamecast guide scenarios verified working
 
 **Changes:**
-- `packages/session-host-go/` → delete
-- `packages/flamecast/src/flamecast/events/webhooks.ts` → delete
-- `packages/flamecast/src/flamecast/api.ts` → simplify routes
-- `packages/flamecast/src/flamecast/session-service.ts` → simplify (no callback handling)
+- Delete: `packages/session-host-go/`, `packages/runtime-docker/`, `packages/runtime-e2b/`
+- Delete: `packages/flamecast-psql/`
+- Delete: `packages/flamecast/src/flamecast/events/` (bus, channels, webhooks)
+- Delete: `packages/flamecast/src/flamecast/session-service.ts`
+- Simplify: `packages/protocol/src/storage.ts` → templates only
+- Simplify: `packages/flamecast/src/flamecast/api.ts` → templates CRUD + REST proxy
+- Simplify: `packages/flamecast/src/flamecast/index.ts` → remove session/storage/callback handling
 
-## What durable-acp-rs Gains
+### Phase 3: Verify (~0.5 day)
 
-Nothing code-wise — durable-acp-rs is already complete for this integration.
-W10 (Docker/E2B runtime providers) accelerates Phase 1 but isn't blocking:
-the Dockerfile from `deployment-sdd.md` works today.
+**Acceptance criteria:**
+- [ ] Flamecast `package.json` has no `pg`, `drizzle-orm`, `pglite` deps
+- [ ] All Flamecast guide scenarios verified working
+- [ ] Session list, session detail, prompt, cancel, permissions all work
+- [ ] Queue management (pause/resume/reorder) works via REST proxy
+- [ ] File browser works via REST proxy
+
+## What durable-acp-rs Provides (already complete)
+
+| Capability | durable-acp-rs | Flamecast consumes via |
+|---|---|---|
+| Agent lifecycle | Conductor + proxy chain | (doesn't — durable-acp-rs owns it) |
+| ACP transport | `/acp` WebSocket | `@agentclientprotocol/sdk` (Seam 1) |
+| State persistence | DurableStateProxy → durable stream | `@durable-acp/state` SSE (Seam 2) |
+| Queue management | REST `/api/v1/*/queue/*` | REST proxy |
+| Filesystem access | REST `/api/v1/*/files`, `/fs/tree` | REST proxy |
+| Webhooks | `src/webhook.rs` (HMAC, retries) | (doesn't — durable-acp-rs owns it) |
+| Peer messaging | PeerMcpProxy (MCP tools) | Automatic via proxy chain |
 
 ## TypeScript Client Architecture: Two Independent Primitives
 
