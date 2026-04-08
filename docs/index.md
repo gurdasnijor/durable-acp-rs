@@ -74,7 +74,7 @@ come from one git repo at one commit — guaranteed compatible.
 | W2 | Standalone proxy binaries | ✅ Done | `durable-state-proxy`, `peer-mcp-proxy` binaries |
 | W3 | Dashboard → subprocess model | ✅ Done | Uses `Client.builder().connect_with()` (SDK) |
 | W4 | API → read-only (remove prompt bypass) | ✅ Done | REST is read-only; `submit_prompt`/`cancel_turn` removed. See [api-architecture-sdd.md](api-architecture-sdd.md) |
-| W5 | Conductor config support | 🔜 Ready | Depends on W2 (done) |
+| W5 | ~~Conductor config support~~ | ⏭ DEFERRED | Not needed — proxy chain is application-specific, hardcoded in `build_conductor()` |
 | W6 | File-backed storage | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §1 |
 | W7 | ~~EventSubscriber trait~~ | ⏭ ELIMINATED | StreamDB IS the subscriber — see [electric-sync-sdd.md](electric-sync-sdd.md) |
 | W7a | ~~WebSocket subscriber~~ | ⏭ ELIMINATED | StreamDB subscribes via SSE directly |
@@ -82,7 +82,7 @@ come from one git repo at one commit — guaranteed compatible.
 | W7c | ~~Generalized SSE~~ | ⏭ ELIMINATED | DS server SSE already works |
 | W8 | Schema compatibility verified | ✅ Done | Rust ↔ TypeScript match. See [schema-compatibility.md](schema-compatibility.md) |
 | W9 | Pluggable transports | ✅ Done | Server: `/acp` WS (AxumWsTransport→Lines). Client: WebSocketTransport (Lines), TcpTransport (ByteStreams). All use `conductor.run(transport)`. See [transport-sdd.md](transport-sdd.md) |
-| W10 | Runtime providers (Docker/E2B) | 🔜 Ready | Depends on W9 |
+| W10 | ~~Runtime providers~~ | ⏭ ELIMINATED | durable-acp-rs owns hosting. Flamecast is UI only. See [flamecast-runtime-swap-sdd.md](flamecast-runtime-swap-sdd.md) |
 | W11 | File system access API | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §4 |
 | W12 | Terminal management API | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §5 |
 | — | Queue CRUD (cancel, clear, reorder) | ✅ Done | REST endpoints for queue management |
@@ -90,7 +90,7 @@ come from one git repo at one commit — guaranteed compatible.
 
 ### Remaining Work
 
-- **W10** — runtime providers (Docker/E2B)
+All Rust workstreams complete. Next: Flamecast integration (Phase 1-3 in [flamecast-runtime-swap-sdd.md](flamecast-runtime-swap-sdd.md)).
 
 ### Architecture Principle
 
@@ -98,36 +98,24 @@ All prompt submission goes through ACP (the paved road per P/ACP spec).
 State observation via durable stream SSE — the REST API is **queue management + filesystem only**.
 No bypass of the conductor's proxy chain. See [api-architecture-sdd.md](api-architecture-sdd.md).
 
-## Flamecast Integration Shape
+## Flamecast Integration
 
-durable-acp-rs plugs into Flamecast as the conductor layer:
+Flamecast is UI only. durable-acp-rs owns all hosting and lifecycle.
 
-```
-Flamecast SessionService.startSession()
-  → spawns: sacp-conductor agent \
-      "durable-state-proxy --stream-url ..." \
-      "peer-mcp-proxy" \
-      "npx claude-agent-acp"
-  → AcpBridge connects via stdio (unchanged)
-  → DurableStateProxy persists → Durable Stream
-  → PeerMcpProxy injects peer tools
+```typescript
+import { startServer, connectWs, createDurableACPDB } from "@durable-acp/server";
 
-Flamecast reads from durable stream (replaces FlamecastStorage):
-  DurableACPClient (TypeScript) subscribes via WS/SSE
-  → reactive collections: connections, promptTurns, chunks, permissions
-  → commands: prompt, cancel, pause, resume, resolvePermission
+const server = await startServer({ agent: "claude-acp" });
+const acp = await connectWs(server.acpUrl);           // in-band: prompts
+const db = createDurableACPDB({ stateStreamUrl: server.streamUrl }); // out-of-band: state
 ```
 
-**What Flamecast cuts:**
-- `FlamecastStorage` (PGLite/Postgres) → `DurableStreamStorage` adapter
-- Event bus → `StreamDb::subscribe_changes()` via `DurableACPClient`
-- Session metadata tables → `ConnectionRow` + `PromptTurnRow` in stream
-- `@flamecast/psql` package → delete
+Two primitives, decoupled:
+- **ACP client** (`@agentclientprotocol/sdk` via `@durable-acp/transport`) — prompt, cancel, permissions
+- **Durable session** (`durable-session`) — reactive materialized state from SSE
 
-**What Flamecast gains:**
-- MCP peering across all sessions (automatic, free)
-- Durable sessions (replay from stream offset)
-- Stream-based observability (any HTTP client subscribes)
+See [flamecast-runtime-swap-sdd.md](flamecast-runtime-swap-sdd.md) for full integration plan + acceptance criteria.
+See [flamecast-import.md](flamecast-import.md) for npm package structure.
 
 ## SDDs
 
@@ -137,8 +125,11 @@ Flamecast reads from durable stream (replaces FlamecastStorage):
 | [schema-compatibility.md](schema-compatibility.md) | ✅ Done | Rust ↔ TypeScript schema verified compatible |
 | [known-limitations-sdd.md](known-limitations-sdd.md) | 🔄 Mostly done | Storage ✅, filesystem ✅, terminals ✅, runtime providers 🔜 |
 | [electric-sync-sdd.md](electric-sync-sdd.md) | ✅ Design done | Native StreamDB — TS client already exists |
-| [flamecast-integration-sdd.md](flamecast-integration-sdd.md) | 🔜 Track C | Flamecast API, transports, what to cut |
+| [flamecast-runtime-swap-sdd.md](flamecast-runtime-swap-sdd.md) | ✅ Ready | Flamecast → UI only. Two primitives, 3 phases. |
+| [flamecast-import.md](flamecast-import.md) | ✅ Ready | `@durable-acp/server` npm package + platform binaries |
+| [flamecast-integration-sdd.md](flamecast-integration-sdd.md) | ⏭ Superseded | Replaced by runtime-swap-sdd |
 | [flamecast-capabilities.md](flamecast-capabilities.md) | ✅ Done | Maps each Flamecast guide to our infrastructure |
+| [architecture-redesign.md](architecture-redesign.md) | ✅ Done (Option A) | Module renames for clarity |
 | [auth-sdd.md](auth-sdd.md) | 🔜 Ready | JWT auth proxy (Envoy/CF Access) |
 | [deployment-sdd.md](deployment-sdd.md) | 🔜 Ready | Control plane / data plane split |
 | [transport-sdd.md](transport-sdd.md) | ✅ Done | Pluggable transports — `/acp` WS, WebSocketTransport, TcpTransport |
@@ -154,20 +145,30 @@ Flamecast reads from durable stream (replaces FlamecastStorage):
 
 ```
 src/
-  main.rs              Conductor CLI — stdio + /acp WebSocket (81 lines)
-  conductor.rs         Pure composition — wires proxies + agent (27 lines)
-  durable_state_proxy.rs  DurableStateProxy — intercepts ACP → persists to stream (287 lines)
-  peer_mcp.rs          PeerMcpProxy — list_agents, prompt_agent (172 lines)
-  acp_registry.rs      ACP registry CDN client
-  registry.rs          Local peer registry
-  app.rs               AppState, queue, chunk recording (318 lines)
-  state.rs             StreamDB, collections, STATE-PROTOCOL (356 lines)
-  durable_streams.rs   Embedded durable streams server
-  api.rs               Queue mgmt + filesystem + /acp WebSocket (250 lines)
-  webhook.rs           RFC-aligned webhook forwarder (336 lines)
-  transport.rs         WebSocketTransport + TcpTransport + AxumWsTransport + TransportConfig (113 lines)
+  main.rs                Conductor CLI — stdio + /acp WebSocket (81 lines)
+  conductor.rs           Proxy chain composition — build_conductor() (27 lines)
+  conductor_state.rs     Queue runtime + state write helpers (318 lines)
+  durable_state_proxy.rs DurableStateProxy — intercepts ACP → persists to stream (287 lines)
+  peer_mcp.rs            PeerMcpProxy — list_agents, prompt_agent (172 lines)
+  client.rs              Reusable ACP client — handler trait + prompt channel (126 lines)
+  stream_server.rs       Embedded durable streams HTTP server (153 lines)
+  stream_subscriber.rs   SSE subscriber to remote durable stream (321 lines)
+  state.rs               StreamDB, collections, STATE-PROTOCOL (356 lines)
+  api.rs                 Queue mgmt + filesystem + /acp WebSocket (250 lines)
+  transport.rs           WebSocket/TCP/AxumWs transport impls (113 lines)
+  webhook.rs             RFC-aligned webhook forwarder (336 lines)
+  registry.rs            Local peer registry
+  acp_registry.rs        ACP registry CDN client
   bin/
-    dashboard.rs       TUI dashboard — Client.builder().connect_with() (435 lines)
-    agents.rs          Config manager + registry picker
-agents.toml            Agent configuration
+    dashboard.rs         TUI dashboard — Client.builder().connect_with() (407 lines)
+    ds_server.rs         Bare durable streams server for testing (18 lines)
+    agents.rs            Config manager + registry picker
+
+ts/
+  packages/
+    server/              @durable-acp/server — startServer(), platform binary resolution
+    acp-transport/       @durable-acp/transport — WebSocket adapter + connectWs()
+    durable-session/     durable-session — reactive materialized state from SSE
+
+agents.toml              Agent configuration
 ```
