@@ -15,7 +15,7 @@ use clap::Parser;
 use sacp::{ByteStreams, Conductor, ConnectTo};
 
 use durable_acp_rs::app::AppState;
-use durable_acp_rs::conductor::DurableStateProxy;
+use durable_acp_rs::durable_state_proxy::DurableStateProxy;
 use durable_acp_rs::durable_streams::EmbeddedDurableStreams;
 
 #[derive(Debug, Parser)]
