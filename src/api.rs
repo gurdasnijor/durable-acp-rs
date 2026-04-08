@@ -7,9 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use agent_client_protocol::{CancelNotification, ContentBlock, CreateTerminalRequest, PromptRequest};
 use futures::stream::Stream;
-use sacp::Agent;
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
@@ -22,8 +20,6 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/api/v1/connections/{id}/queue/{turn_id}", delete(cancel_queued_turn))
         .route("/api/v1/connections/{id}/queue/pause", post(pause_queue))
         .route("/api/v1/connections/{id}/queue/resume", post(resume_queue))
-        .route("/api/v1/connections/{id}/prompt", post(submit_prompt))
-        .route("/api/v1/connections/{id}/cancel", post(cancel_turn))
         .route("/api/v1/prompt-turns/{id}/stream", get(stream_prompt_turn))
         .route("/api/v1/prompt-turns/{id}/chunks", get(get_chunks))
         .route("/api/v1/registry", get(get_registry))
@@ -66,93 +62,6 @@ async fn resume_queue(
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     app.set_paused(false).await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "paused": false })))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PromptBody {
-    session_id: String,
-    text: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PromptAccepted {
-    queued: bool,
-    prompt_turn_id: String,
-}
-
-/// Submit a prompt via REST API. Records the turn, sends to agent through the
-/// proxy connection, and tracks completion asynchronously.
-async fn submit_prompt(
-    Path(_id): Path<String>,
-    State(app): State<Arc<AppState>>,
-    Json(body): Json<PromptBody>,
-) -> Result<Json<PromptAccepted>, axum::http::StatusCode> {
-    let cx = app.proxy_connection.lock().await.clone()
-        .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
-
-    let prompt_turn_id = uuid::Uuid::new_v4().to_string();
-    let request = PromptRequest::new(body.session_id.clone(), vec![ContentBlock::from(body.text)]);
-
-    // Record the prompt turn
-    let turn = PromptTurnRow {
-        prompt_turn_id: prompt_turn_id.clone(),
-        logical_connection_id: app.logical_connection_id.clone(),
-        session_id: body.session_id.clone(),
-        request_id: prompt_turn_id.clone(),
-        text: request.prompt.first().and_then(|b| {
-            if let ContentBlock::Text(t) = b { Some(t.text.clone()) } else { None }
-        }),
-        state: PromptTurnState::Active,
-        position: None,
-        stop_reason: None,
-        started_at: crate::app::now_ms(),
-        completed_at: None,
-    };
-    app.write_state_event("prompt_turn", "insert", &prompt_turn_id, Some(&turn))
-        .await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    app.session_to_prompt_turn.write().await
-        .insert(body.session_id, prompt_turn_id.clone());
-
-    // Send to agent; completion tracked asynchronously
-    let app2 = app.clone();
-    let turn_id = prompt_turn_id.clone();
-    cx.clone().spawn(async move {
-        let result = cx.send_request_to(Agent, request).block_task().await;
-        match &result {
-            Ok(response) => {
-                let _ = app2.record_chunk(&turn_id, ChunkType::Stop, serde_json::json!({ "stopReason": response.stop_reason }).to_string()).await;
-                let _ = app2.finish_prompt_turn(&turn_id, format!("{:?}", response.stop_reason).to_lowercase(), PromptTurnState::Completed).await;
-            }
-            Err(error) => {
-                let _ = app2.record_chunk(&turn_id, ChunkType::Error, error.to_string()).await;
-                let _ = app2.finish_prompt_turn(&turn_id, error.to_string(), PromptTurnState::Broken).await;
-            }
-        }
-        Ok(())
-    }).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(PromptAccepted { queued: true, prompt_turn_id }))
-}
-
-async fn cancel_turn(
-    Path(_id): Path<String>,
-    State(app): State<Arc<AppState>>,
-    Json(body): Json<CancelBody>,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let cx = app.proxy_connection.lock().await.clone()
-        .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
-    cx.send_notification_to(Agent, CancelNotification::new(body.session_id))
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "cancelled": true })))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CancelBody {
-    session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,29 +302,12 @@ struct CreateTerminalBody {
 
 async fn create_terminal(
     Path(_id): Path<String>,
-    State(app): State<Arc<AppState>>,
-    Json(body): Json<CreateTerminalBody>,
+    State(_app): State<Arc<AppState>>,
+    Json(_body): Json<CreateTerminalBody>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let cx = app.proxy_connection.lock().await.clone()
-        .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
-
-    let mut req = CreateTerminalRequest::new(body.session_id, body.command);
-    req.args = body.args;
-
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    cx.clone().spawn(async move {
-        let result = cx.send_request_to(Agent, req).block_task().await;
-        let _ = tx.send(result);
-        Ok(())
-    }).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let response = rx.await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| axum::http::StatusCode::BAD_GATEWAY)?;
-
-    Ok(Json(serde_json::json!({
-        "terminalId": response.terminal_id.0.to_string(),
-    })))
+    // Terminal creation goes through the ACP client connection (not REST).
+    // The DurableStateProxy records terminal state when the agent creates one.
+    Err(axum::http::StatusCode::NOT_IMPLEMENTED)
 }
 
 async fn kill_terminal(
