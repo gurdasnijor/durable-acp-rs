@@ -1,4 +1,4 @@
-//! REST API — queue management + filesystem access + ACP WebSocket endpoint.
+//! REST API — filesystem access + peer discovery + ACP WebSocket endpoint.
 //!
 //! State observation (connections, chunks, prompt turns, terminals, permissions)
 //! is handled by the durable stream at :port/streams/durable-acp-state.
@@ -6,9 +6,9 @@
 //!
 //! This API only exposes:
 //! - /acp (WebSocket) — ACP client transport, spawns conductor per connection
-//! - /api/v1/*/queue/* — queue management (pause, resume, cancel, clear, reorder)
 //! - /api/v1/*/files, /api/v1/*/fs/tree — filesystem access (not in the stream)
 //! - /api/v1/registry — peer discovery
+//! - /api/v1/*/terminals/{tid} — terminal state mutation
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,29 +16,31 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::conductor_state::ConductorState;
 use crate::state::TerminalState;
+use crate::stream_server::StreamServer;
 
-/// Config for the WebSocket ACP endpoint.
+/// Focused API state — only what the HTTP routes need.
+#[derive(Clone)]
+pub struct ApiState {
+    pub stream_server: StreamServer,
+    pub connection_id: String,
+}
+
+/// Config for the WebSocket ACP endpoint (separate from API state).
 #[derive(Clone)]
 pub struct AcpEndpointConfig {
     pub agent_command: Vec<String>,
-    /// Shared state — same connection ID and durable stream across all WS connections.
-    pub app: Arc<ConductorState>,
+    pub stream_server: StreamServer,
+    pub connection_id: String,
 }
 
-pub fn router(app: Arc<ConductorState>, acp_config: Option<AcpEndpointConfig>) -> Router {
+pub fn router(api_state: ApiState, acp_config: Option<AcpEndpointConfig>) -> Router {
     let api = Router::new()
-        // Queue management
-        .route("/api/v1/connections/{id}/queue/pause", post(pause_queue))
-        .route("/api/v1/connections/{id}/queue/resume", post(resume_queue))
-        .route("/api/v1/connections/{id}/queue/{turn_id}", delete(cancel_queued_turn))
-        .route("/api/v1/connections/{id}/queue", delete(clear_queue).put(reorder_queue))
         // Filesystem access (not in the durable stream)
         .route("/api/v1/connections/{id}/files", get(get_file))
         .route("/api/v1/connections/{id}/fs/tree", get(get_tree))
@@ -48,7 +50,7 @@ pub fn router(app: Arc<ConductorState>, acp_config: Option<AcpEndpointConfig>) -
         .route("/api/v1/registry", get(get_registry))
         // Terminal state mutation
         .route("/api/v1/connections/{id}/terminals/{tid}", delete(kill_terminal))
-        .with_state(app);
+        .with_state(api_state);
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -87,71 +89,29 @@ async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
         }
     };
 
-    // Use the shared ConductorState — same connection ID, same durable stream.
-    // No new ConductorState per WebSocket.
-    let conductor = crate::conductor::build_conductor(config.app.clone(), agent);
+    use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
+    use crate::durable_stream_tracer::DurableStreamTracer;
+    use crate::peer_mcp::PeerMcpProxy;
+
+    // Set connection ID on StreamDb so trace event materialization works
+    config.stream_server.stream_db.set_connection_id(config.connection_id.clone()).await;
+
+    let tracer = DurableStreamTracer::start(
+        config.stream_server.clone(),
+        config.stream_server.state_stream.clone(),
+    );
+    let conductor = ConductorImpl::new_agent(
+        "durable-acp".to_string(),
+        ProxiesAndAgent::new(agent)
+            .proxy(PeerMcpProxy),
+        McpBridgeMode::default(),
+    )
+    .trace_to(tracer);
     let transport = crate::transport::AxumWsTransport { socket };
 
     if let Err(e) = conductor.run(transport).await {
         tracing::warn!("ACP WebSocket session ended: {}", e);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Queue management
-// ---------------------------------------------------------------------------
-
-async fn pause_queue(
-    Path(_id): Path<String>,
-    State(app): State<Arc<ConductorState>>,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    app.set_paused(true).await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "paused": true })))
-}
-
-async fn resume_queue(
-    Path(_id): Path<String>,
-    State(app): State<Arc<ConductorState>>,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    app.set_paused(false).await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "paused": false })))
-}
-
-async fn cancel_queued_turn(
-    Path((_id, turn_id)): Path<(String, String)>,
-    State(app): State<Arc<ConductorState>>,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let removed = app.cancel_queued_turn(&turn_id).await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    if removed {
-        Ok(Json(serde_json::json!({ "cancelled": turn_id })))
-    } else {
-        Err(axum::http::StatusCode::NOT_FOUND)
-    }
-}
-
-async fn clear_queue(
-    Path(_id): Path<String>,
-    State(app): State<Arc<ConductorState>>,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let count = app.cancel_all_queued().await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "cancelled": count })))
-}
-
-#[derive(Debug, Deserialize)]
-struct ReorderBody {
-    order: Vec<String>,
-}
-
-async fn reorder_queue(
-    Path(_id): Path<String>,
-    State(app): State<Arc<ConductorState>>,
-    Json(body): Json<ReorderBody>,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    app.reorder_queue(&body.order).await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "reordered": true })))
 }
 
 // ---------------------------------------------------------------------------
@@ -164,13 +124,13 @@ struct FileQuery {
 }
 
 fn resolve_path(
-    app: &ConductorState,
+    api: &ApiState,
     snapshot: &crate::state::Collections,
     id: &str,
     rel: &str,
 ) -> Result<PathBuf, axum::http::StatusCode> {
     let conn = snapshot.connections.get(id)
-        .or_else(|| snapshot.connections.values().find(|c| c.logical_connection_id == app.logical_connection_id))
+        .or_else(|| snapshot.connections.values().find(|c| c.logical_connection_id == api.connection_id))
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
     let cwd = conn.cwd.as_deref().ok_or(axum::http::StatusCode::NOT_FOUND)?;
     let cwd = PathBuf::from(cwd);
@@ -186,11 +146,11 @@ fn resolve_path(
 async fn get_file(
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
-    State(app): State<Arc<ConductorState>>,
+    State(api): State<ApiState>,
 ) -> Result<String, axum::http::StatusCode> {
     let rel = query.path.as_deref().unwrap_or(".");
-    let snapshot = app.stream_server.stream_db.snapshot().await;
-    let path = resolve_path(&app, &snapshot, &id, rel)?;
+    let snapshot = api.stream_server.stream_db.snapshot().await;
+    let path = resolve_path(&api, &snapshot, &id, rel)?;
     std::fs::read_to_string(path).map_err(|_| axum::http::StatusCode::NOT_FOUND)
 }
 
@@ -206,11 +166,11 @@ struct TreeEntry {
 async fn get_tree(
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
-    State(app): State<Arc<ConductorState>>,
+    State(api): State<ApiState>,
 ) -> Result<Json<Vec<TreeEntry>>, axum::http::StatusCode> {
     let rel = query.path.as_deref().unwrap_or(".");
-    let snapshot = app.stream_server.stream_db.snapshot().await;
-    let path = resolve_path(&app, &snapshot, &id, rel)?;
+    let snapshot = api.stream_server.stream_db.snapshot().await;
+    let path = resolve_path(&api, &snapshot, &id, rel)?;
     let entries = std::fs::read_dir(&path).map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
     let mut result = Vec::new();
     for entry in entries.flatten() {
@@ -231,24 +191,32 @@ async fn get_tree(
 // ---------------------------------------------------------------------------
 
 async fn get_registry(
-    State(_app): State<Arc<ConductorState>>,
+    State(_api): State<ApiState>,
 ) -> Result<Json<crate::registry::Registry>, axum::http::StatusCode> {
     crate::registry::read_registry().map(Json).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn kill_terminal(
     Path((_id, tid)): Path<(String, String)>,
-    State(app): State<Arc<ConductorState>>,
+    State(api): State<ApiState>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let mut snapshot = app.stream_server.stream_db.snapshot().await;
+    let mut snapshot = api.stream_server.stream_db.snapshot().await;
     let row = snapshot.terminals.get_mut(&tid)
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
     row.state = TerminalState::Released;
-    row.updated_at = crate::conductor_state::now_ms();
+    row.updated_at = crate::state::now_ms();
     let updated = row.clone();
     drop(snapshot);
-    app.write_state_event("terminal", "update", &tid, Some(&updated))
-        .await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let envelope = crate::state::StateEnvelope {
+        entity_type: "terminal".to_string(),
+        key: tid.clone(),
+        headers: crate::state::StateHeaders { operation: "update".to_string() },
+        value: Some(&updated),
+    };
+    api.stream_server
+        .append_json(&api.stream_server.state_stream, &envelope)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "killed": tid })))
 }
 
@@ -272,7 +240,7 @@ struct AgentsToml {
 }
 
 async fn get_agent_templates(
-    State(_app): State<Arc<ConductorState>>,
+    State(_api): State<ApiState>,
 ) -> Result<Json<Vec<AgentTemplateConfig>>, axum::http::StatusCode> {
     let path = std::path::Path::new("agents.toml");
     if !path.exists() {

@@ -364,7 +364,7 @@ async fn main() -> Result<()> {
                     name: config.name.clone(),
                     api_url: format!("http://127.0.0.1:{}", config.port + 1),
                     logical_connection_id: uuid::Uuid::new_v4().to_string(),
-                    registered_at: durable_acp_rs::conductor_state::now_ms(),
+                    registered_at: durable_acp_rs::state::now_ms(),
                 });
 
                 let handler = Arc::new(TuiHandler { tui: tui_clone.clone() });

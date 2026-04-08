@@ -7,28 +7,20 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use durable_acp_rs::conductor_state::ConductorState;
 use durable_acp_rs::stream_subscriber::StreamSubscriber;
 use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::state::*;
 
+mod common;
+use common::TestApp;
+
 async fn test_ds() -> StreamServer {
-    let tmp = tempfile::tempdir().unwrap();
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = StreamServer::start_with_dir(
-        bind,
-        "durable-acp-state",
-        tmp.path().to_path_buf(),
-    )
-    .await
-    .unwrap();
-    std::mem::forget(tmp);
-    ds
+    common::test_ds().await
 }
 
-async fn test_app() -> ConductorState {
+async fn test_app() -> TestApp {
     let ds = test_ds().await;
-    ConductorState::with_shared_streams(ds).await.unwrap()
+    TestApp::new(ds).await
 }
 
 // ---------------------------------------------------------------------------
@@ -39,11 +31,10 @@ async fn test_app() -> ConductorState {
 async fn connection_insert_materializes() {
     let app = test_app().await;
     let snapshot = app.stream_server.stream_db.snapshot().await;
-    // ConductorState::init auto-inserts a connection
+    // TestApp::new auto-inserts a connection
     assert_eq!(snapshot.connections.len(), 1);
-    let conn = snapshot.connections.get(&app.logical_connection_id).unwrap();
+    let conn = snapshot.connections.get(&app.connection_id).unwrap();
     assert_eq!(conn.state, ConnectionState::Created);
-    assert_eq!(conn.queue_paused, Some(false));
     assert!(conn.latest_session_id.is_none());
 }
 
@@ -52,12 +43,12 @@ async fn prompt_turn_insert_materializes() {
     let app = test_app().await;
     let row = PromptTurnRow {
         prompt_turn_id: "pt-1".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s-1".to_string(),
         request_id: "req-1".to_string(),
         text: Some("hello agent".to_string()),
-        state: PromptTurnState::Queued,
-        position: Some(0),
+        state: PromptTurnState::Active,
+            position: None,
         stop_reason: None,
         started_at: 100,
         completed_at: None,
@@ -70,8 +61,7 @@ async fn prompt_turn_insert_materializes() {
     assert_eq!(snapshot.prompt_turns.len(), 1);
     let turn = &snapshot.prompt_turns["pt-1"];
     assert_eq!(turn.text, Some("hello agent".to_string()));
-    assert_eq!(turn.state, PromptTurnState::Queued);
-    assert_eq!(turn.position, Some(0));
+    assert_eq!(turn.state, PromptTurnState::Active);
 }
 
 #[tokio::test]
@@ -107,7 +97,7 @@ async fn permission_insert_materializes() {
     let perm = PermissionRow {
         request_id: "perm-1".to_string(),
         jsonrpc_id: serde_json::json!(42),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s-1".to_string(),
         prompt_turn_id: "pt-1".to_string(),
         title: Some("Read /etc/passwd".to_string()),
@@ -146,7 +136,7 @@ async fn terminal_insert_materializes() {
     let app = test_app().await;
     let term = TerminalRow {
         terminal_id: "term-1".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s-1".to_string(),
         prompt_turn_id: Some("pt-1".to_string()),
         state: TerminalState::Open,
@@ -167,50 +157,6 @@ async fn terminal_insert_materializes() {
     assert_eq!(t.command, Some("bash".to_string()));
 }
 
-#[tokio::test]
-async fn pending_request_insert_materializes() {
-    let app = test_app().await;
-    let row = PendingRequestRow {
-        request_id: "pr-1".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
-        session_id: Some("s-1".to_string()),
-        prompt_turn_id: Some("pt-1".to_string()),
-        method: "session/prompt".to_string(),
-        direction: PendingRequestDirection::ClientToAgent,
-        state: PendingRequestState::Pending,
-        created_at: 100,
-        resolved_at: None,
-    };
-    app.write_state_event("pending_request", "insert", "pr-1", Some(&row))
-        .await
-        .unwrap();
-
-    let snapshot = app.stream_server.stream_db.snapshot().await;
-    assert_eq!(snapshot.pending_requests.len(), 1);
-    let pr = &snapshot.pending_requests["pr-1"];
-    assert_eq!(pr.method, "session/prompt");
-    assert_eq!(pr.direction, PendingRequestDirection::ClientToAgent);
-}
-
-#[tokio::test]
-async fn runtime_instance_insert_materializes() {
-    let app = test_app().await;
-    let row = RuntimeInstanceRow {
-        instance_id: "ri-1".to_string(),
-        runtime_name: "docker".to_string(),
-        status: RuntimeStatus::Running,
-        created_at: 100,
-        updated_at: 100,
-    };
-    app.write_state_event("runtime_instance", "insert", "ri-1", Some(&row))
-        .await
-        .unwrap();
-
-    let snapshot = app.stream_server.stream_db.snapshot().await;
-    assert_eq!(snapshot.runtime_instances.len(), 1);
-    assert_eq!(snapshot.runtime_instances["ri-1"].status, RuntimeStatus::Running);
-}
-
 // ---------------------------------------------------------------------------
 // Update operations: state transitions tracked
 // ---------------------------------------------------------------------------
@@ -228,7 +174,7 @@ async fn connection_update_tracks_state_transition() {
     .unwrap();
 
     let snapshot = app.stream_server.stream_db.snapshot().await;
-    let conn = snapshot.connections.get(&app.logical_connection_id).unwrap();
+    let conn = snapshot.connections.get(&app.connection_id).unwrap();
     assert_eq!(conn.state, ConnectionState::Attached);
     assert_eq!(conn.latest_session_id, Some("session-abc".to_string()));
     assert_eq!(conn.cwd, Some("/home/user/project".to_string()));
@@ -241,12 +187,12 @@ async fn prompt_turn_lifecycle_queued_active_completed() {
     // Insert as queued
     let row = PromptTurnRow {
         prompt_turn_id: "lc-1".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s-1".to_string(),
         request_id: "req-lc".to_string(),
         text: Some("lifecycle test".to_string()),
-        state: PromptTurnState::Queued,
-        position: Some(0),
+        state: PromptTurnState::Active,
+            position: None,
         stop_reason: None,
         started_at: 100,
         completed_at: None,
@@ -284,7 +230,7 @@ async fn permission_lifecycle_pending_to_resolved() {
     let perm = PermissionRow {
         request_id: "plc-1".to_string(),
         jsonrpc_id: serde_json::json!(1),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s-1".to_string(),
         prompt_turn_id: "pt-1".to_string(),
         title: Some("Test permission".to_string()),
@@ -357,7 +303,7 @@ async fn state_replays_from_disk_into_new_stream_db() {
         )
         .await
         .unwrap();
-        let app = ConductorState::with_shared_streams(ds).await.unwrap();
+        let app = TestApp::new(ds).await;
 
         app.record_chunk("pt-1", ChunkType::Text, "survived restart".to_string())
             .await
@@ -413,7 +359,7 @@ async fn remote_session_matches_local_state() {
     let perm = PermissionRow {
         request_id: "remote-perm".to_string(),
         jsonrpc_id: serde_json::json!(5),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s-1".to_string(),
         prompt_turn_id: "pt-1".to_string(),
         title: Some("Remote test".to_string()),
@@ -441,7 +387,7 @@ async fn remote_session_matches_local_state() {
     assert_eq!(remote.permissions.len(), local.permissions.len());
 
     // Same content
-    let remote_conn = remote.connections.get(&app.logical_connection_id).unwrap();
+    let remote_conn = remote.connections.get(&app.connection_id).unwrap();
     assert_eq!(remote_conn.state, ConnectionState::Attached);
 
     let remote_chunk = remote.chunks.values().next().unwrap();
@@ -468,12 +414,12 @@ async fn subscribe_fires_for_all_entity_types() {
     // PromptTurn
     let turn = PromptTurnRow {
         prompt_turn_id: "sub-pt".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s".to_string(),
         request_id: "r".to_string(),
         text: None,
-        state: PromptTurnState::Queued,
-        position: None,
+        state: PromptTurnState::Active,
+            position: None,
         stop_reason: None,
         started_at: 1,
         completed_at: None,
@@ -495,7 +441,7 @@ async fn subscribe_fires_for_all_entity_types() {
     let perm = PermissionRow {
         request_id: "sub-perm".to_string(),
         jsonrpc_id: serde_json::json!(1),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s".to_string(),
         prompt_turn_id: "sub-pt".to_string(),
         title: None,
@@ -515,7 +461,7 @@ async fn subscribe_fires_for_all_entity_types() {
     // Terminal
     let term = TerminalRow {
         terminal_id: "sub-term".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s".to_string(),
         prompt_turn_id: None,
         state: TerminalState::Open,

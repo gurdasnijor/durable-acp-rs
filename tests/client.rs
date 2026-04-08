@@ -2,7 +2,6 @@
 //!
 //! Uses Testy mock agent + in-process conductor. No subprocess, no LocalSet.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_test::testy::{Testy, TestyCommand};
@@ -10,11 +9,12 @@ use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
 use tokio::io::duplex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use durable_acp_rs::conductor_state::ConductorState;
 use durable_acp_rs::client::{self, AcpClientHandler};
-use durable_acp_rs::durable_state_proxy::DurableStateProxy;
-use durable_acp_rs::stream_server::StreamServer;
+use durable_acp_rs::durable_stream_tracer::DurableStreamTracer;
 use durable_acp_rs::peer_mcp::PeerMcpProxy;
+
+mod common;
+use common::TestApp;
 
 // ---------------------------------------------------------------------------
 // Test handler — collects events
@@ -47,31 +47,25 @@ impl AcpClientHandler for TestHandler {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn test_app() -> Arc<ConductorState> {
-    let tmp = tempfile::tempdir().unwrap();
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = StreamServer::start_with_dir(
-        bind, "durable-acp-state", tmp.path().to_path_buf(),
-    ).await.unwrap();
-    std::mem::forget(tmp);
-    Arc::new(ConductorState::with_shared_streams(ds).await.unwrap())
-}
-
 /// Set up in-process conductor + Testy, return the client-side transport.
 fn setup_conductor(
-    app: Arc<ConductorState>,
+    app: Arc<TestApp>,
 ) -> (sacp::DynConnectTo<sacp::Client>, tokio::task::JoinHandle<Result<(), sacp::Error>>) {
     let (editor_write, conductor_read) = duplex(8192);
     let (conductor_write, editor_read) = duplex(8192);
 
+    let tracer = DurableStreamTracer::start(
+        app.stream_server.clone(),
+        app.stream_server.state_stream.clone(),
+    );
     let handle = tokio::spawn(async move {
         ConductorImpl::new_agent(
             "test-conductor".to_string(),
             ProxiesAndAgent::new(Testy::new())
-                .proxy(DurableStateProxy { app })
                 .proxy(PeerMcpProxy),
             McpBridgeMode::default(),
         )
+        .trace_to(tracer)
         .run(sacp::ByteStreams::new(
             conductor_write.compat_write(),
             conductor_read.compat(),
@@ -93,7 +87,7 @@ fn setup_conductor(
 
 #[tokio::test]
 async fn client_receives_ready_event() {
-    let app = test_app().await;
+    let app = common::test_app().await;
     let (transport, conductor) = setup_conductor(app);
 
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -130,7 +124,7 @@ async fn client_receives_ready_event() {
 
 #[tokio::test]
 async fn client_sends_prompt_receives_text() {
-    let app = test_app().await;
+    let app = common::test_app().await;
     let (transport, conductor) = setup_conductor(app);
 
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -173,7 +167,7 @@ async fn client_sends_prompt_receives_text() {
 
 #[tokio::test]
 async fn client_handles_multiple_prompts() {
-    let app = test_app().await;
+    let app = common::test_app().await;
     let (transport, conductor) = setup_conductor(app);
 
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -222,7 +216,7 @@ async fn client_handles_multiple_prompts() {
 
 #[tokio::test]
 async fn client_shutdown_on_channel_close() {
-    let app = test_app().await;
+    let app = common::test_app().await;
     let (transport, conductor) = setup_conductor(app);
 
     let events = Arc::new(Mutex::new(Vec::new()));

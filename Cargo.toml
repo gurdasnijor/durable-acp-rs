@@ -57,10 +57,6 @@ name = "dashboard"
 path = "src/bin/dashboard.rs"
 
 [[bin]]
-name = "durable-state-proxy"
-path = "src/bin/durable-state-proxy.rs"
-
-[[bin]]
 name = "peer-mcp-proxy"
 path = "src/bin/peer-mcp-proxy.rs"
 

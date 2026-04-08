@@ -9,9 +9,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use durable_acp_rs::api;
-use durable_acp_rs::conductor_state::ConductorState;
-use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::stream_subscriber::StreamSubscriber;
+
+mod common;
+use common::TestApp;
 use durable_acp_rs::state::{
     ChunkType, CollectionChange, ConnectionState, PendingRequestState, PermissionRow,
     PromptTurnRow, PromptTurnState, TerminalRow, TerminalState,
@@ -21,20 +22,16 @@ use durable_acp_rs::state::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn test_app() -> Arc<ConductorState> {
-    let tmp = tempfile::tempdir().unwrap();
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = StreamServer::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
-        .await
-        .unwrap();
-    // Leak the tempdir so it lives for the test duration
-    std::mem::forget(tmp);
-    Arc::new(ConductorState::with_shared_streams(ds).await.unwrap())
+async fn test_app() -> Arc<TestApp> {
+    common::test_app().await
 }
 
 /// Spin up the REST API on an ephemeral port, return the base URL.
-async fn test_server(app: Arc<ConductorState>) -> String {
-    let router = api::router(app, None);
+async fn test_server(app: Arc<TestApp>) -> String {
+    let router = api::router(api::ApiState {
+        stream_server: app.stream_server.clone(),
+        connection_id: app.connection_id.clone(),
+    }, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -50,7 +47,7 @@ async fn stream_db_notifies_on_connection_insert() {
     let app = test_app().await;
     let mut rx = app.stream_server.stream_db.subscribe_changes();
 
-    // ConductorState::init already inserted a connection — drain that notification
+    // TestApp::new already inserted a connection — drain that notification
     // by checking the snapshot directly
     let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.connections.len(), 1);
@@ -91,91 +88,13 @@ async fn stream_db_notifies_on_chunk_insert() {
 }
 
 // ---------------------------------------------------------------------------
-// Queue lifecycle: pause, resume, cancel, clear, reorder via REST
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn queue_pause_resume_via_rest() {
-    let app = test_app().await;
-    let conn_id = app.logical_connection_id.clone();
-    let base = test_server(app.clone()).await;
-    let http = reqwest::Client::new();
-
-    // Pause
-    let resp = http
-        .post(format!("{base}/api/v1/connections/{conn_id}/queue/pause"))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["paused"], true);
-
-    // Verify state
-    let snapshot = app.stream_server.stream_db.snapshot().await;
-    let conn = snapshot.connections.get(&conn_id).unwrap();
-    assert_eq!(conn.queue_paused, Some(true));
-
-    // Resume
-    let resp = http
-        .post(format!("{base}/api/v1/connections/{conn_id}/queue/resume"))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["paused"], false);
-
-    let snapshot = app.stream_server.stream_db.snapshot().await;
-    let conn = snapshot.connections.get(&conn_id).unwrap();
-    assert_eq!(conn.queue_paused, Some(false));
-}
-
-#[tokio::test]
-async fn queue_clear_via_rest() {
-    let app = test_app().await;
-    let conn_id = app.logical_connection_id.clone();
-
-    // Manually insert some queued prompt turns into StreamDB
-    for i in 0..3 {
-        let row = PromptTurnRow {
-            prompt_turn_id: format!("turn-{i}"),
-            logical_connection_id: conn_id.clone(),
-            session_id: "s1".to_string(),
-            request_id: format!("req-{i}"),
-            text: Some(format!("prompt {i}")),
-            state: PromptTurnState::Queued,
-            position: Some(i),
-            stop_reason: None,
-            started_at: 1,
-            completed_at: None,
-        };
-        app.write_state_event("prompt_turn", "insert", &row.prompt_turn_id, Some(&row))
-            .await
-            .unwrap();
-    }
-
-    let base = test_server(app.clone()).await;
-    let http = reqwest::Client::new();
-
-    // Clear queue (this uses app.cancel_all_queued which only clears the in-memory queue,
-    // not StreamDB directly — but it should still respond)
-    let resp = http
-        .delete(format!("{base}/api/v1/connections/{conn_id}/queue"))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-}
-
-// ---------------------------------------------------------------------------
 // Filesystem access: read file + directory tree + path traversal protection
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn filesystem_read_file() {
     let app = test_app().await;
-    let conn_id = app.logical_connection_id.clone();
+    let conn_id = app.connection_id.clone();
 
     // Set cwd on the connection to a temp directory with a test file
     let tmp = tempfile::tempdir().unwrap();
@@ -203,7 +122,7 @@ async fn filesystem_read_file() {
 #[tokio::test]
 async fn filesystem_tree() {
     let app = test_app().await;
-    let conn_id = app.logical_connection_id.clone();
+    let conn_id = app.connection_id.clone();
 
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a.txt"), "").unwrap();
@@ -237,7 +156,7 @@ async fn filesystem_tree() {
 #[tokio::test]
 async fn filesystem_path_traversal_blocked() {
     let app = test_app().await;
-    let conn_id = app.logical_connection_id.clone();
+    let conn_id = app.connection_id.clone();
 
     let tmp = tempfile::tempdir().unwrap();
     app.update_connection(|row| {
@@ -271,7 +190,7 @@ async fn filesystem_path_traversal_blocked() {
 #[tokio::test]
 async fn kill_terminal_updates_stream_db() {
     let app = test_app().await;
-    let conn_id = app.logical_connection_id.clone();
+    let conn_id = app.connection_id.clone();
 
     // Insert a terminal into state
     let terminal = TerminalRow {
@@ -351,12 +270,12 @@ async fn webhook_detects_prompt_turn_completion() {
     // Insert a prompt turn as "active"
     let turn = PromptTurnRow {
         prompt_turn_id: "turn-1".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s1".to_string(),
         request_id: "req-1".to_string(),
         text: Some("hello".to_string()),
         state: PromptTurnState::Active,
-        position: None,
+            position: None,
         stop_reason: None,
         started_at: 1,
         completed_at: None,
@@ -428,7 +347,7 @@ async fn webhook_detects_permission_request() {
     let perm = PermissionRow {
         request_id: "perm-1".to_string(),
         jsonrpc_id: serde_json::json!(1),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s1".to_string(),
         prompt_turn_id: "turn-1".to_string(),
         title: Some("Read file".to_string()),
@@ -480,7 +399,7 @@ async fn state_stream_accessible_via_http() {
 }
 
 // ---------------------------------------------------------------------------
-// ConductorState init: creates connection in StreamDB automatically
+// TestApp init: creates connection in StreamDB automatically
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -488,31 +407,32 @@ async fn app_state_init_creates_connection() {
     let app = test_app().await;
     let snapshot = app.stream_server.stream_db.snapshot().await;
     assert_eq!(snapshot.connections.len(), 1);
-    let conn = snapshot.connections.get(&app.logical_connection_id).unwrap();
+    let conn = snapshot.connections.get(&app.connection_id).unwrap();
     assert_eq!(conn.state, ConnectionState::Created);
-    assert_eq!(conn.queue_paused, Some(false));
 }
 
 // ---------------------------------------------------------------------------
-// Multiple ConductorState instances share one durable stream
+// Multiple TestApp instances share one durable stream
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn shared_durable_streams_see_each_others_state() {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let ds = StreamServer::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
-        .await
-        .unwrap();
+    let ds = durable_acp_rs::stream_server::StreamServer::start_with_dir(
+        bind, "durable-acp-state", tmp.path().to_path_buf(),
+    )
+    .await
+    .unwrap();
 
-    let app_a = ConductorState::with_shared_streams(ds.clone()).await.unwrap();
-    let app_b = ConductorState::with_shared_streams(ds.clone()).await.unwrap();
+    let app_a = TestApp::new(ds.clone()).await;
+    let app_b = TestApp::new(ds.clone()).await;
 
     // Both should see both connections
     let snapshot = ds.stream_db.snapshot().await;
     assert_eq!(snapshot.connections.len(), 2);
-    assert!(snapshot.connections.contains_key(&app_a.logical_connection_id));
-    assert!(snapshot.connections.contains_key(&app_b.logical_connection_id));
+    assert!(snapshot.connections.contains_key(&app_a.connection_id));
+    assert!(snapshot.connections.contains_key(&app_b.connection_id));
 
     // App A writes a chunk, App B should see it via shared StreamDB
     app_a
@@ -574,12 +494,12 @@ async fn webhook_sends_hmac_signature() {
     // Trigger an end_turn event
     let turn = PromptTurnRow {
         prompt_turn_id: "hmac-turn".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s1".to_string(),
         request_id: "req-hmac".to_string(),
         text: Some("test".to_string()),
         state: PromptTurnState::Completed,
-        position: None,
+            position: None,
         stop_reason: Some("end_turn".to_string()),
         started_at: 1,
         completed_at: Some(2),
@@ -646,12 +566,12 @@ async fn webhook_filters_by_event_type() {
     // Trigger an end_turn — should NOT fire webhook
     let turn = PromptTurnRow {
         prompt_turn_id: "filter-turn".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s1".to_string(),
         request_id: "req-filter".to_string(),
         text: Some("test".to_string()),
         state: PromptTurnState::Completed,
-        position: None,
+            position: None,
         stop_reason: Some("end_turn".to_string()),
         started_at: 1,
         completed_at: Some(2),
@@ -668,7 +588,7 @@ async fn webhook_filters_by_event_type() {
     let perm = PermissionRow {
         request_id: "filter-perm".to_string(),
         jsonrpc_id: serde_json::json!(1),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s1".to_string(),
         prompt_turn_id: "filter-turn".to_string(),
         title: Some("filtered test".to_string()),
@@ -731,12 +651,12 @@ async fn webhook_fires_error_on_broken_turn() {
     // Insert a broken prompt turn directly
     let turn = PromptTurnRow {
         prompt_turn_id: "broken-turn".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "s1".to_string(),
         request_id: "req-broken".to_string(),
         text: Some("test".to_string()),
         state: PromptTurnState::Broken,
-        position: None,
+            position: None,
         stop_reason: Some("agent crashed".to_string()),
         started_at: 1,
         completed_at: Some(2),
@@ -753,68 +673,6 @@ async fn webhook_fires_error_on_broken_turn() {
     let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(payload["event"]["type"], "error");
     assert_eq!(payload["event"]["data"]["stopReason"], "agent crashed");
-}
-
-// ---------------------------------------------------------------------------
-// Queue: cancel specific turn via REST
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn queue_cancel_specific_turn_via_rest() {
-    let app = test_app().await;
-    let conn_id = app.logical_connection_id.clone();
-
-    // Insert a queued turn into StreamDB
-    let row = PromptTurnRow {
-        prompt_turn_id: "cancel-me".to_string(),
-        logical_connection_id: conn_id.clone(),
-        session_id: "s1".to_string(),
-        request_id: "req-cancel".to_string(),
-        text: Some("test".to_string()),
-        state: PromptTurnState::Queued,
-        position: Some(0),
-        stop_reason: None,
-        started_at: 1,
-        completed_at: None,
-    };
-    app.write_state_event("prompt_turn", "insert", "cancel-me", Some(&row))
-        .await
-        .unwrap();
-
-    let base = test_server(app.clone()).await;
-    let http = reqwest::Client::new();
-
-    // Try to cancel — note: this goes through app.cancel_queued_turn which
-    // checks the in-memory queue. Since we only wrote to StreamDB (not enqueued
-    // via enqueue_prompt), the in-memory queue is empty → returns 404.
-    let resp = http
-        .delete(format!("{base}/api/v1/connections/{conn_id}/queue/cancel-me"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404, "turn not in in-memory queue → 404");
-}
-
-// ---------------------------------------------------------------------------
-// Queue: reorder via REST
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn queue_reorder_via_rest() {
-    let app = test_app().await;
-    let conn_id = app.logical_connection_id.clone();
-    let base = test_server(app.clone()).await;
-    let http = reqwest::Client::new();
-
-    let resp = http
-        .put(format!("{base}/api/v1/connections/{conn_id}/queue"))
-        .json(&serde_json::json!({ "order": ["a", "b", "c"] }))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["reordered"], true);
 }
 
 // ---------------------------------------------------------------------------

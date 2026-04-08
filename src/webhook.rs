@@ -139,10 +139,9 @@ fn detect_turn_events(
     for (id, turn) in turns {
         let prev_state = prev.get(id);
         let is_new_terminal = match &turn.state {
-            PromptTurnState::Completed | PromptTurnState::Cancelled | PromptTurnState::TimedOut => {
+            PromptTurnState::Completed | PromptTurnState::Cancelled | PromptTurnState::Broken => {
                 prev_state.map_or(true, |s| !is_terminal_state(s))
             }
-            PromptTurnState::Broken => prev_state.map_or(true, |s| !is_terminal_state(s)),
             _ => false,
         };
 
@@ -224,7 +223,6 @@ fn is_terminal_state(state: &PromptTurnState) -> bool {
         PromptTurnState::Completed
             | PromptTurnState::Cancelled
             | PromptTurnState::Broken
-            | PromptTurnState::TimedOut
     )
 }
 

@@ -1,11 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use durable_acp_rs::conductor_state::ConductorState;
 use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::state::{
     ChunkType, ConnectionRow, ConnectionState, PromptTurnRow, PromptTurnState, StateEnvelope,
     StateHeaders,
 };
+
+mod common;
 
 #[tokio::test]
 async fn stream_db_applies_state_events() {
@@ -16,7 +17,7 @@ async fn stream_db_applies_state_events() {
         latest_session_id: None,
         cwd: None,
         last_error: None,
-        queue_paused: Some(false),
+            queue_paused: None,
         created_at: 1,
         updated_at: 1,
     };
@@ -79,22 +80,16 @@ async fn embedded_durable_streams_serves_stream_protocol() {
 
 #[tokio::test]
 async fn app_state_persists_chunks_into_state_stream() {
-    let tmp = tempfile::tempdir().unwrap();
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let stream_server =
-        StreamServer::start_with_dir(bind, "durable-acp-state", tmp.path().to_path_buf())
-            .await
-            .unwrap();
-    let app = ConductorState::with_shared_streams(stream_server).await.unwrap();
+    let app = common::test_app().await;
 
     let prompt_turn = PromptTurnRow {
         prompt_turn_id: "turn-1".to_string(),
-        logical_connection_id: app.logical_connection_id.clone(),
+        logical_connection_id: app.connection_id.clone(),
         session_id: "session-1".to_string(),
         request_id: "req-1".to_string(),
         text: Some("hello".to_string()),
         state: PromptTurnState::Active,
-        position: None,
+            position: None,
         stop_reason: None,
         started_at: 1,
         completed_at: None,
@@ -126,7 +121,7 @@ async fn file_storage_survives_restart() {
         )
         .await
         .unwrap();
-        let app = ConductorState::with_shared_streams(ds).await.unwrap();
+        let app = common::TestApp::new(ds).await;
         app.record_chunk("turn-1", ChunkType::Text, "persisted".to_string())
             .await
             .unwrap();
