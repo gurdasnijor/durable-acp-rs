@@ -21,6 +21,22 @@ pub trait AcpClientHandler: Send + Sync + 'static {
     fn on_text(&self, name: &str, text: &str);
     /// Client encountered an error.
     fn on_error(&self, name: &str, error: &str);
+
+    /// Handle a permission request from the agent. Return the permission outcome.
+    /// Default: auto-approve the first option.
+    fn on_permission(
+        &self,
+        _name: &str,
+        req: &acp::RequestPermissionRequest,
+    ) -> acp::RequestPermissionOutcome {
+        if let Some(opt) = req.options.first() {
+            acp::RequestPermissionOutcome::Selected(
+                acp::SelectedPermissionOutcome::new(opt.option_id.clone()),
+            )
+        } else {
+            acp::RequestPermissionOutcome::Cancelled
+        }
+    }
 }
 
 /// Configuration for connecting to one conductor.
@@ -67,29 +83,30 @@ pub async fn run_acp_client(
     mut prompt_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> Result<(), sacp::Error> {
     let name = config.name.clone();
+    let handler_perm = handler.clone();
     let handler_session = handler.clone();
+    let perm_name = name.clone();
 
     sacp::Client
         .builder()
         .name(&format!("{}-client", name))
         .on_receive_request(
-            async |req: acp::RequestPermissionRequest, responder, _cx| {
-                // Auto-approve first permission option
-                let outcome = if let Some(opt) = req.options.first() {
-                    acp::RequestPermissionOutcome::Selected(
-                        acp::SelectedPermissionOutcome::new(opt.option_id.clone()),
-                    )
-                } else {
-                    acp::RequestPermissionOutcome::Cancelled
-                };
+            async move |req: acp::RequestPermissionRequest, responder, _cx| {
+                let outcome = handler_perm.on_permission(&perm_name, &req);
                 responder.respond(acp::RequestPermissionResponse::new(outcome))
             },
             sacp::on_receive_request!(),
         )
         .connect_with(config.transport, async |cx| {
-            cx.send_request(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
+            let init_response = cx
+                .send_request(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
                 .block_task()
                 .await?;
+
+            tracing::debug!(
+                capabilities = ?init_response.agent_capabilities,
+                "Agent initialized"
+            );
 
             cx.build_session_cwd()?
                 .block_task()

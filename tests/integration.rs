@@ -523,3 +523,295 @@ async fn shared_durable_streams_see_each_others_state() {
     assert_eq!(snapshot.chunks.len(), 1);
     assert_eq!(snapshot.chunks.values().next().unwrap().content, "from A");
 }
+
+// ---------------------------------------------------------------------------
+// Webhook: HMAC signature verification
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_sends_hmac_signature() {
+    use durable_acp_rs::webhook;
+
+    let app = test_app().await;
+
+    let (header_tx, mut header_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+
+    // Mock server that captures headers
+    let mock_router = {
+        axum::Router::new().route(
+            "/webhook",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: String| {
+                    let tx = header_tx.clone();
+                    async move {
+                        let sig = headers.get("x-webhook-signature")
+                            .map(|v| v.to_str().unwrap_or("").to_string())
+                            .unwrap_or_default();
+                        let _ = tx.send((sig, body));
+                        ""
+                    }
+                },
+            ),
+        )
+    };
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock_router).await.unwrap() });
+
+    let secret = "test-hmac-secret";
+    let _handle = webhook::spawn_forwarder(
+        app.durable_streams.stream_db.clone(),
+        vec![webhook::WebhookConfig {
+            url: format!("http://{mock_addr}/webhook"),
+            events: vec!["*".to_string()],
+            secret: Some(secret.to_string()),
+        }],
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Trigger an end_turn event
+    let turn = PromptTurnRow {
+        prompt_turn_id: "hmac-turn".to_string(),
+        logical_connection_id: app.logical_connection_id.clone(),
+        session_id: "s1".to_string(),
+        request_id: "req-hmac".to_string(),
+        text: Some("test".to_string()),
+        state: PromptTurnState::Completed,
+        position: None,
+        stop_reason: Some("end_turn".to_string()),
+        started_at: 1,
+        completed_at: Some(2),
+    };
+    app.write_state_event("prompt_turn", "insert", "hmac-turn", Some(&turn))
+        .await
+        .unwrap();
+
+    let (sig, body) = tokio::time::timeout(std::time::Duration::from_secs(2), header_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // Verify signature format
+    assert!(sig.starts_with("sha256="), "signature should start with sha256=, got: {sig}");
+
+    // Verify HMAC is correct
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body.as_bytes());
+    let expected = mac.finalize().into_bytes();
+    let expected_hex: String = expected.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(sig, format!("sha256={expected_hex}"));
+}
+
+// ---------------------------------------------------------------------------
+// Webhook: event filtering — only subscribed events are delivered
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_filters_by_event_type() {
+    use durable_acp_rs::webhook;
+
+    let app = test_app().await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mock_router = {
+        let tx = tx.clone();
+        axum::Router::new().route(
+            "/webhook",
+            axum::routing::post(move |body: String| {
+                let tx = tx.clone();
+                async move { let _ = tx.send(body); "" }
+            }),
+        )
+    };
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock_router).await.unwrap() });
+
+    // Only subscribe to permission_request — not end_turn
+    let _handle = webhook::spawn_forwarder(
+        app.durable_streams.stream_db.clone(),
+        vec![webhook::WebhookConfig {
+            url: format!("http://{mock_addr}/webhook"),
+            events: vec!["permission_request".to_string()],
+            secret: None,
+        }],
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Trigger an end_turn — should NOT fire webhook
+    let turn = PromptTurnRow {
+        prompt_turn_id: "filter-turn".to_string(),
+        logical_connection_id: app.logical_connection_id.clone(),
+        session_id: "s1".to_string(),
+        request_id: "req-filter".to_string(),
+        text: Some("test".to_string()),
+        state: PromptTurnState::Completed,
+        position: None,
+        stop_reason: Some("end_turn".to_string()),
+        started_at: 1,
+        completed_at: Some(2),
+    };
+    app.write_state_event("prompt_turn", "insert", "filter-turn", Some(&turn))
+        .await
+        .unwrap();
+
+    // Should timeout — end_turn filtered out
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+    assert!(result.is_err(), "end_turn should be filtered out when only permission_request subscribed");
+
+    // Now trigger a permission_request — should fire
+    let perm = PermissionRow {
+        request_id: "filter-perm".to_string(),
+        jsonrpc_id: serde_json::json!(1),
+        logical_connection_id: app.logical_connection_id.clone(),
+        session_id: "s1".to_string(),
+        prompt_turn_id: "filter-turn".to_string(),
+        title: Some("filtered test".to_string()),
+        tool_call_id: None,
+        options: None,
+        state: PendingRequestState::Pending,
+        outcome: None,
+        created_at: 1,
+        resolved_at: None,
+    };
+    app.write_state_event("permission", "insert", "filter-perm", Some(&perm))
+        .await
+        .unwrap();
+
+    let body = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout — permission_request should not be filtered")
+        .expect("channel closed");
+
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["event"]["type"], "permission_request");
+}
+
+// ---------------------------------------------------------------------------
+// Webhook: error event fires on broken prompt turn
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_fires_error_on_broken_turn() {
+    use durable_acp_rs::webhook;
+
+    let app = test_app().await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mock_router = {
+        let tx = tx.clone();
+        axum::Router::new().route(
+            "/webhook",
+            axum::routing::post(move |body: String| {
+                let tx = tx.clone();
+                async move { let _ = tx.send(body); "" }
+            }),
+        )
+    };
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock_router).await.unwrap() });
+
+    let _handle = webhook::spawn_forwarder(
+        app.durable_streams.stream_db.clone(),
+        vec![webhook::WebhookConfig {
+            url: format!("http://{mock_addr}/webhook"),
+            events: vec!["*".to_string()],
+            secret: None,
+        }],
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Insert a broken prompt turn directly
+    let turn = PromptTurnRow {
+        prompt_turn_id: "broken-turn".to_string(),
+        logical_connection_id: app.logical_connection_id.clone(),
+        session_id: "s1".to_string(),
+        request_id: "req-broken".to_string(),
+        text: Some("test".to_string()),
+        state: PromptTurnState::Broken,
+        position: None,
+        stop_reason: Some("agent crashed".to_string()),
+        started_at: 1,
+        completed_at: Some(2),
+    };
+    app.write_state_event("prompt_turn", "insert", "broken-turn", Some(&turn))
+        .await
+        .unwrap();
+
+    let body = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["event"]["type"], "error");
+    assert_eq!(payload["event"]["data"]["stopReason"], "agent crashed");
+}
+
+// ---------------------------------------------------------------------------
+// Queue: cancel specific turn via REST
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn queue_cancel_specific_turn_via_rest() {
+    let app = test_app().await;
+    let conn_id = app.logical_connection_id.clone();
+
+    // Insert a queued turn into StreamDB
+    let row = PromptTurnRow {
+        prompt_turn_id: "cancel-me".to_string(),
+        logical_connection_id: conn_id.clone(),
+        session_id: "s1".to_string(),
+        request_id: "req-cancel".to_string(),
+        text: Some("test".to_string()),
+        state: PromptTurnState::Queued,
+        position: Some(0),
+        stop_reason: None,
+        started_at: 1,
+        completed_at: None,
+    };
+    app.write_state_event("prompt_turn", "insert", "cancel-me", Some(&row))
+        .await
+        .unwrap();
+
+    let base = test_server(app.clone()).await;
+    let http = reqwest::Client::new();
+
+    // Try to cancel — note: this goes through app.cancel_queued_turn which
+    // checks the in-memory queue. Since we only wrote to StreamDB (not enqueued
+    // via enqueue_prompt), the in-memory queue is empty → returns 404.
+    let resp = http
+        .delete(format!("{base}/api/v1/connections/{conn_id}/queue/cancel-me"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "turn not in in-memory queue → 404");
+}
+
+// ---------------------------------------------------------------------------
+// Queue: reorder via REST
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn queue_reorder_via_rest() {
+    let app = test_app().await;
+    let conn_id = app.logical_connection_id.clone();
+    let base = test_server(app.clone()).await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .put(format!("{base}/api/v1/connections/{conn_id}/queue"))
+        .json(&serde_json::json!({ "order": ["a", "b", "c"] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["reordered"], true);
+}
