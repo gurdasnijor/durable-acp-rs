@@ -70,6 +70,7 @@ function resolveEndpoints(basePath?: string): ResolvedEndpoints {
 interface DurableAcpContextValue {
   endpoints: ResolvedEndpoints;
   db: DurableACPDB;
+  session: SessionState;
 }
 
 const DurableAcpContext = createContext<DurableAcpContextValue | null>(null);
@@ -84,10 +85,12 @@ export interface DurableAcpProviderProps {
    * If omitted, uses relative paths (works with Vite proxy or reverse proxy).
    */
   basePath?: string;
+  /** ACP session options (permission handler, session update handler, cwd). */
+  sessionOptions?: UseSessionOptions;
   children: React.ReactNode;
 }
 
-export function DurableAcpProvider({ basePath, children }: DurableAcpProviderProps) {
+export function DurableAcpProvider({ basePath, sessionOptions, children }: DurableAcpProviderProps) {
   const endpoints = useMemo(() => resolveEndpoints(basePath), [basePath]);
 
   const db = useMemo(
@@ -100,77 +103,13 @@ export function DurableAcpProvider({ basePath, children }: DurableAcpProviderPro
     return () => db.close();
   }, [db]);
 
-  const value = useMemo(() => ({ endpoints, db }), [endpoints, db]);
-
-  return (
-    <DurableAcpContext.Provider value={value}>
-      {children}
-    </DurableAcpContext.Provider>
-  );
-}
-
-// ============================================================================
-// Hooks
-// ============================================================================
-
-function useDurableAcp(): DurableAcpContextValue {
-  const ctx = useContext(DurableAcpContext);
-  if (!ctx) throw new Error("useDurableAcp must be used within <DurableAcpProvider>");
-  return ctx;
-}
-
-/** Reactive state collections from the durable stream (out-of-band observer). */
-export function useCollections(): DurableACPCollections {
-  return useDurableAcp().db.collections;
-}
-
-/** Raw DurableACPDB instance. */
-export function useDb(): DurableACPDB {
-  return useDurableAcp().db;
-}
-
-/** Resolved conductor endpoint URLs. */
-export function useEndpoints(): ResolvedEndpoints {
-  return useDurableAcp().endpoints;
-}
-
-// ============================================================================
-// ACP Session Hook
-// ============================================================================
-
-export interface UseSessionOptions {
-  onSessionUpdate?: (notification: SessionNotification) => void;
-  onPermissionRequest?: (
-    request: RequestPermissionRequest,
-  ) => Promise<RequestPermissionResponse>;
-  cwd?: string;
-}
-
-export interface SessionState {
-  connection: ClientSideConnection | null;
-  sessionId: string | null;
-  isReady: boolean;
-  error: Error | null;
-  prompt: (text: string) => Promise<void>;
-  cancel: () => Promise<void>;
-  disconnect: () => void;
-}
-
-/**
- * Connect to the conductor as a standard ACP client.
- *
- * Creates a ClientSideConnection over WebSocket, initializes the
- * protocol, and creates a session. Prompts, cancel, permissions go
- * through ACP. State observation comes from useCollections().
- */
-export function useSession(options?: UseSessionOptions): SessionState {
-  const { endpoints } = useDurableAcp();
+  // -- Singleton ACP connection, created once in the provider --
   const [connection, setConnection] = useState<ClientSideConnection | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const streamRef = useRef<ReturnType<typeof fromWebSocket> | null>(null);
-  const optionsRef = useRef(options);
-  optionsRef.current = options;
+  const optionsRef = useRef(sessionOptions);
+  optionsRef.current = sessionOptions;
 
   useEffect(() => {
     let disposed = false;
@@ -235,25 +174,93 @@ export function useSession(options?: UseSessionOptions): SessionState {
     };
   }, [endpoints.acpUrl]);
 
-  const prompt = async (text: string) => {
+  const prompt = useMemo(() => async (text: string) => {
     if (!connection || !sessionId) throw new Error("Session not ready");
     await connection.prompt({
       sessionId,
       messages: [{ role: "user", content: { type: "text", text } }],
     } as any);
-  };
+  }, [connection, sessionId]);
 
-  const cancel = async () => {
+  const cancel = useMemo(() => async () => {
     if (!connection || !sessionId) throw new Error("Session not ready");
     await connection.cancel({ sessionId } as any);
-  };
+  }, [connection, sessionId]);
 
-  const disconnect = () => {
+  const disconnect = useMemo(() => () => {
     streamRef.current?.close();
     streamRef.current = null;
     setConnection(null);
     setSessionId(null);
-  };
+  }, []);
 
-  return { connection, sessionId, isReady: !!connection && !!sessionId, error, prompt, cancel, disconnect };
+  const session: SessionState = useMemo(() => ({
+    connection, sessionId, isReady: !!connection && !!sessionId, error, prompt, cancel, disconnect,
+  }), [connection, sessionId, error, prompt, cancel, disconnect]);
+
+  const value = useMemo(() => ({ endpoints, db, session }), [endpoints, db, session]);
+
+  return (
+    <DurableAcpContext.Provider value={value}>
+      {children}
+    </DurableAcpContext.Provider>
+  );
+}
+
+// ============================================================================
+// Hooks
+// ============================================================================
+
+function useDurableAcp(): DurableAcpContextValue {
+  const ctx = useContext(DurableAcpContext);
+  if (!ctx) throw new Error("useDurableAcp must be used within <DurableAcpProvider>");
+  return ctx;
+}
+
+/** Reactive state collections from the durable stream (out-of-band observer). */
+export function useCollections(): DurableACPCollections {
+  return useDurableAcp().db.collections;
+}
+
+/** Raw DurableACPDB instance. */
+export function useDb(): DurableACPDB {
+  return useDurableAcp().db;
+}
+
+/** Resolved conductor endpoint URLs. */
+export function useEndpoints(): ResolvedEndpoints {
+  return useDurableAcp().endpoints;
+}
+
+// ============================================================================
+// ACP Session Hook
+// ============================================================================
+
+export interface UseSessionOptions {
+  onSessionUpdate?: (notification: SessionNotification) => void;
+  onPermissionRequest?: (
+    request: RequestPermissionRequest,
+  ) => Promise<RequestPermissionResponse>;
+  cwd?: string;
+}
+
+export interface SessionState {
+  connection: ClientSideConnection | null;
+  sessionId: string | null;
+  isReady: boolean;
+  error: Error | null;
+  prompt: (text: string) => Promise<void>;
+  cancel: () => Promise<void>;
+  disconnect: () => void;
+}
+
+/**
+ * Get the singleton ACP session created by the provider.
+ *
+ * The connection is managed in DurableAcpProvider — this hook
+ * is a simple context consumer. Safe to call from any component
+ * without creating duplicate WebSocket connections.
+ */
+export function useSession(_options?: UseSessionOptions): SessionState {
+  return useDurableAcp().session;
 }
