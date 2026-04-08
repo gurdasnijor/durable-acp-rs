@@ -211,8 +211,8 @@ function useDurableACPSession(sessionId: string) {
 }
 ```
 
-**Status: ✅ Client packages exist.** 🔜 Needs file system API (W11) and
-schema compatibility verification (W8).
+**Status: ✅ Ready.** Schema verified (W8), file system API done (W11),
+client packages exist.
 
 ---
 
@@ -223,10 +223,9 @@ schema compatibility verification (W8).
 | Local agents | `agents.toml` + conductor + dashboard | ✅ Working |
 | Build your own agent | Any ACP agent works unmodified | ✅ Working |
 | Subagents (MCP approach) | `PeerMcpProxy` list/prompt tools | ✅ Working |
-| Custom UI | `@durable-acp/client` + StreamDB | ✅ Client exists, needs schema verify |
-| Subagents (API approach) | Session CRUD API | 🔜 W8 |
+| Custom UI | `@durable-acp/client` + StreamDB | ✅ Ready (schema verified, client exists) |
+| Slackbot (stateless) | Webhook forwarder (RFC-aligned) | ✅ Ready (W7b done) |
 | Cloud agents | Pluggable transports + runtime providers | 🔜 W9 + W10 |
-| Slackbot (stateless) | Webhook worker + REST API | 🔜 W7b + W8 |
 
 **The key unlock that durable-acp-rs provides over Flamecast today:**
 

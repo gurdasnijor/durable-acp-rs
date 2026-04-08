@@ -1,11 +1,20 @@
 # SDD: Flamecast Integration — What to Cut, What to Share
 
-> **Status: 🔜 READY FOR EXECUTION**
-> - Phase 1 (Session CRUD): ~1-2 days — add 6 endpoints to `api.rs`
-> - Phase 2 (Permissions + Queue): ~1 day — wire permission channels to API
-> - Phase 3 (WebSocket): ~2-3 days — see `event-subscribers-sdd.md`
-> - Phase 4 (Agent Templates): ~0.5 day — thin wrapper over `agents.toml` + registry
-> - Pluggable Transports: ~1 day — `Transport` enum + TCP/WS `ByteStreams`
+> **Status: ✅ READY TO INTEGRATE**
+>
+> No new API endpoints needed. The integration is architectural, not code:
+> 1. Swap Flamecast's agent command to `durable-acp-rs <agent>` (1 line)
+> 2. Point `DurableACPClient` at the conductor's stream URL (1 line)
+> 3. Replace `FlamecastStorage` with `DurableStreamStorage` adapter (~1 day)
+> 4. Rewire React hooks to `DurableACPClient` collections (~1-2 days)
+> 5. Delete `@flamecast/psql`, event bus, session metadata tables (~0.5 day)
+>
+> **Why the old phases are unnecessary:**
+> - Session CRUD API → the conductor IS the session. Flamecast spawns it.
+> - Permissions API → `DurableStateProxy` intercepts, `DurableACPClient` subscribes
+> - WebSocket → StreamDB subscribes via SSE (no custom WS needed)
+> - Agent Templates → `agents.toml` + ACP registry (already works)
+> - Prompts → go through ACP (not REST). See `api-architecture-sdd.md`.
 
 ## The Opportunity
 
@@ -119,9 +128,9 @@ interface FlamecastStorage {
 | Agent-to-agent messaging | HTTP peering via PeerMcpProxy | ✅ Working |
 | File system access | `GET /agents/:id/files`, `GET /agents/:id/fs/tree` | ✅ Working |
 | Terminal management | Full CRUD + SSE output streaming | ✅ Working |
-| WebSocket multiplexing | N/A (SSE only) | ❌ Missing |
-| Runtime providers (Docker, E2B) | N/A (local subprocess only) | ❌ Missing |
-| Webhooks | N/A | ❌ Missing |
+| Webhooks | RFC-aligned forwarder (coalesced events, HMAC, retries) | ✅ Working |
+| WebSocket multiplexing | StreamDB subscribes via SSE (no custom WS needed) | ✅ Via StreamDB |
+| Runtime providers (Docker, E2B) | N/A (local subprocess only) | 🔜 W9 + W10 |
 
 ## What Flamecast Could Cut
 
