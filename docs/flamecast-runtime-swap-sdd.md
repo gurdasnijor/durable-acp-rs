@@ -233,39 +233,32 @@ Nothing code-wise — durable-acp-rs is already complete for this integration.
 W10 (Docker/E2B runtime providers) accelerates Phase 1 but isn't blocking:
 the Dockerfile from `deployment-sdd.md` works today.
 
-## Prompt/Control: ACP Transport for DurableACPClient
+## Prompt/Control: ACP Client over `/acp` WebSocket
 
 Per architecture principle: **all prompt submission goes through ACP**.
 No REST bypass of the conductor's proxy chain.
 
-`@durable-acp/client` currently sends `prompt()`, `cancel()`, and
-`resolvePermission()` as REST POSTs. These need to be replaced with an
-**ACP WebSocket transport** that speaks JSON-RPC over the `/acp` endpoint:
+`DurableACPClient` connects to `ws://host:port+1/acp` as a standard ACP
+client — same protocol the Rust dashboard uses via `Client.builder().connect_with()`.
+One WebSocket, one protocol. The conductor handles sessions, proxy chain,
+streaming, permissions — all through standard ACP JSON-RPC:
 
 ```typescript
-// New: AcpTransport for @durable-acp/client
-// Connects to ws://host:port+1/acp, speaks ACP JSON-RPC
-class AcpTransport {
-  private ws: WebSocket;
-  private session: AcpSession;
+// DurableACPClient connects as an ACP client
+const client = new DurableACPClient({
+  acpUrl: "ws://host:4438/acp",           // ACP client connection
+  stateStreamUrl: "http://host:4437/...",  // state observation (SSE)
+});
 
-  async connect(url: string): Promise<void>;       // → initialize + newSession
-  async prompt(text: string): Promise<void>;        // → ACP PromptRequest
-  async cancel(): Promise<void>;                    // → ACP cancellation
-  async resolvePermission(reqId, optionId): Promise<void>; // → ACP response
-}
+// All operations go through ACP protocol over the single connection:
+await client.prompt("hello");              // → ACP PromptRequest
+await client.cancel();                     // → ACP cancellation
+await client.resolvePermission(id, opt);   // → ACP RequestPermissionResponse
+// Streaming updates arrive as ACP SessionNotifications
+
+// Queue management stays REST (no proxy chain needed):
+await client.pause();                      // → POST /queue/pause
+await client.resume();                     // → POST /queue/resume
 ```
-
-This replaces the existing `WsTransport` (which speaks Flamecast's old
-channel-based protocol, not ACP).
-
-**What stays as REST** (queue management — no proxy chain needed):
-- `client.pause()` / `client.resume()` → `POST /queue/pause`, `/queue/resume`
-- `client.reorder(turnIds)` → `PUT /queue`
-
-**What moves to ACP WS:**
-- `client.prompt(text)` → ACP `PromptRequest` over `/acp` WS
-- `client.cancel()` → ACP cancellation over `/acp` WS
-- `client.resolvePermission()` → ACP `RequestPermissionResponse` over `/acp` WS
 
 **State observation** stays as durable stream SSE (unchanged).
