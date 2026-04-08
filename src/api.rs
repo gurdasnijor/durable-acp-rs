@@ -19,6 +19,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::conductor_state::ConductorState;
 use crate::state::TerminalState;
@@ -48,13 +49,18 @@ pub fn router(app: Arc<ConductorState>, acp_config: Option<AcpEndpointConfig>) -
         .route("/api/v1/connections/{id}/terminals/{tid}", delete(kill_terminal))
         .with_state(app);
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     if let Some(config) = acp_config {
         let acp: Router = Router::new()
             .route("/acp", get(ws_acp_handler))
             .with_state(Arc::new(config));
-        Router::new().merge(api).merge(acp)
+        Router::new().merge(api).merge(acp).layer(cors)
     } else {
-        api
+        api.layer(cors)
     }
 }
 

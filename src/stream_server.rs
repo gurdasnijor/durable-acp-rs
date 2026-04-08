@@ -122,9 +122,14 @@ impl StreamServer {
 }
 
 fn build_app_router(storage: Arc<FileStorage>) -> Router {
+    use tower_http::cors::{Any, CorsLayer};
     let config = Config::default();
     let ds_router = build_router(storage.clone(), &config);
-    Router::new().merge(streams_alias(storage)).merge(ds_router)
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+    Router::new().merge(streams_alias(storage)).merge(ds_router).layer(cors)
 }
 
 fn streams_alias(storage: Arc<FileStorage>) -> Router {
