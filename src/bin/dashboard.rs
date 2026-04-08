@@ -402,21 +402,28 @@ async fn main() -> Result<()> {
                 let api_url = format!("http://127.0.0.1:{}", config.port + 1);
                 let tui2 = tui_clone.clone();
 
-                // Resolve transport: stdio subprocess (default), WebSocket, or TCP
-                let transport: sacp_tokio::AcpAgent = {
-                    // For now, all transports go through the conductor binary
-                    // TODO: add WebSocket/TCP ConnectTo impls for remote agents
-                    let mut conductor_args = vec![
-                        "--name".to_string(), config.name.clone(),
-                        "--port".to_string(), config.port.to_string(),
-                        "--state-stream".to_string(), config.state_stream.clone(),
-                    ];
-                    conductor_args.extend(command.iter().cloned());
-
-                    let mut full_command = vec![conductor_bin.to_string_lossy().to_string()];
-                    full_command.extend(conductor_args);
-                    sacp_tokio::AcpAgent::from_args(full_command)
-                        .with_context(|| format!("parse conductor command for '{}'", name))?
+                // Resolve transport from agents.toml config using SDK's DynConnectTo
+                use durable_acp_rs::transport::{TransportConfig, WebSocketTransport, TcpTransport};
+                let transport: sacp::DynConnectTo<sacp::Client> = match &config.transport {
+                    Some(TransportConfig::Ws { url }) => {
+                        sacp::DynConnectTo::new(WebSocketTransport { url: url.clone() })
+                    }
+                    Some(TransportConfig::Tcp { host, port }) => {
+                        sacp::DynConnectTo::new(TcpTransport { host: host.clone(), port: *port })
+                    }
+                    None | Some(TransportConfig::Stdio) => {
+                        // Default: spawn conductor subprocess
+                        let mut conductor_args = vec![
+                            "--name".to_string(), config.name.clone(),
+                            "--port".to_string(), config.port.to_string(),
+                            "--state-stream".to_string(), config.state_stream.clone(),
+                        ];
+                        conductor_args.extend(command.iter().cloned());
+                        let mut full_command = vec![conductor_bin.to_string_lossy().to_string()];
+                        full_command.extend(conductor_args);
+                        sacp::DynConnectTo::new(sacp_tokio::AcpAgent::from_args(full_command)
+                            .with_context(|| format!("parse conductor command for '{}'", name))?)
+                    }
                 };
 
                 // Register in peer registry
