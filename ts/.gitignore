@@ -1,3 +1,8 @@
 node_modules/
 dist/
 *.tsbuildinfo
+# Compiled test artifacts from tsc --build
+packages/*/test/**/*.js
+packages/*/test/**/*.d.ts
+packages/*/vitest.config.js
+packages/*/vitest.config.d.ts
