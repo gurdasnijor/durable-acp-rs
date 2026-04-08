@@ -1,21 +1,19 @@
-//! REST API — filesystem access + peer discovery + ACP WebSocket endpoint.
+//! Product HTTP API — filesystem access, peer discovery, terminal management.
 //!
 //! State observation (connections, chunks, prompt turns, terminals, permissions)
 //! is handled by the durable stream at :port/streams/durable-acp-state.
-//! Clients subscribe via SSE using @durable-acp/state StreamDB.
 //!
-//! This API only exposes:
-//! - /acp (WebSocket) — ACP client transport, spawns conductor per connection
+//! ACP transport hosting lives in `acp_server.rs`, not here.
+//!
+//! This API exposes:
 //! - /api/v1/*/files, /api/v1/*/fs/tree — filesystem access (not in the stream)
 //! - /api/v1/registry — peer discovery
 //! - /api/v1/*/terminals/{tid} — terminal state mutation
+//! - /api/v1/agent-templates — agent config from agents.toml
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::response::IntoResponse;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -31,16 +29,8 @@ pub struct ApiState {
     pub connection_id: String,
 }
 
-/// Config for the WebSocket ACP endpoint (separate from API state).
-#[derive(Clone)]
-pub struct AcpEndpointConfig {
-    pub agent_command: Vec<String>,
-    pub stream_server: StreamServer,
-    pub connection_id: String,
-}
-
-pub fn router(api_state: ApiState, acp_config: Option<AcpEndpointConfig>) -> Router {
-    let api = Router::new()
+pub fn router(api_state: ApiState) -> Router {
+    Router::new()
         // Filesystem access (not in the durable stream)
         .route("/api/v1/connections/{id}/files", get(get_file))
         .route("/api/v1/connections/{id}/fs/tree", get(get_tree))
@@ -50,68 +40,11 @@ pub fn router(api_state: ApiState, acp_config: Option<AcpEndpointConfig>) -> Rou
         .route("/api/v1/registry", get(get_registry))
         // Terminal state mutation
         .route("/api/v1/connections/{id}/terminals/{tid}", delete(kill_terminal))
-        .with_state(api_state);
-
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    if let Some(config) = acp_config {
-        let acp: Router = Router::new()
-            .route("/acp", get(ws_acp_handler))
-            .with_state(Arc::new(config));
-        Router::new().merge(api).merge(acp).layer(cors)
-    } else {
-        api.layer(cors)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WebSocket ACP transport — spawns a conductor per connection
-// ---------------------------------------------------------------------------
-
-async fn ws_acp_handler(
-    ws: WebSocketUpgrade,
-    State(config): State<Arc<AcpEndpointConfig>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_acp_session(socket, config))
-}
-
-async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
-    use sacp_tokio::AcpAgent;
-
-    let agent = match AcpAgent::from_args(config.agent_command.clone()) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("Failed to parse agent command: {}", e);
-            return;
-        }
-    };
-
-    use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
-    use crate::durable_stream_tracer::DurableStreamTracer;
-    use crate::peer_mcp::PeerMcpProxy;
-
-    // Set connection ID on StreamDb so trace event materialization works
-    config.stream_server.stream_db.set_connection_id(config.connection_id.clone()).await;
-
-    let tracer = DurableStreamTracer::start(
-        config.stream_server.clone(),
-        config.stream_server.state_stream.clone(),
-    );
-    let conductor = ConductorImpl::new_agent(
-        "durable-acp".to_string(),
-        ProxiesAndAgent::new(agent)
-            .proxy(PeerMcpProxy),
-        McpBridgeMode::default(),
-    )
-    .trace_to(tracer);
-    let transport = crate::transport::AxumWsTransport { socket };
-
-    if let Err(e) = conductor.run(transport).await {
-        tracing::warn!("ACP WebSocket session ended: {}", e);
-    }
+        .with_state(api_state)
+        .layer(CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any))
 }
 
 // ---------------------------------------------------------------------------

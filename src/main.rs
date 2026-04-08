@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
 
+use durable_acp_rs::acp_server;
 use durable_acp_rs::api;
 use durable_acp_rs::durable_stream_tracer::DurableStreamTracer;
 use durable_acp_rs::peer_mcp::PeerMcpProxy;
@@ -85,18 +86,18 @@ async fn main() -> Result<()> {
 
     tracing::info!(name = %agent_name, api_port, streams_port = cli.port, "Conductor started");
 
-    // 4. API routes
-    let api_state = api::ApiState {
+    // 4. Product API + ACP hosting (separate concerns, composed into one server)
+    let product_api = api::router(api::ApiState {
         stream_server: stream_server.clone(),
         connection_id: connection_id.clone(),
-    };
-    let acp_config = api::AcpEndpointConfig {
+    });
+    let acp_transport = acp_server::router(acp_server::AcpEndpointConfig {
         agent_command: cli.agent_command.clone(),
         stream_server: stream_server.clone(),
         connection_id: connection_id.clone(),
-    };
-    let api_router = api::router(api_state, Some(acp_config));
-    spawn_api_server(api_port, api_router).await?;
+    });
+    let combined = Router::new().merge(product_api).merge(acp_transport);
+    spawn_api_server(api_port, combined).await?;
 
     // 5. Conductor — run over stdio unless explicitly in WS-only mode.
     // When spawned as a subprocess (e.g., by the dashboard), stdin is a pipe (not a TTY)

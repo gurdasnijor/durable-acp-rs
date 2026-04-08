@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use durable_acp_rs::api::{self, AcpEndpointConfig};
+use durable_acp_rs::acp_server::{self, AcpEndpointConfig};
+use durable_acp_rs::api;
 use durable_acp_rs::stream_server::StreamServer;
 use durable_acp_rs::transport::WebSocketTransport;
 
@@ -38,10 +39,12 @@ async fn start_acp_server(ds: StreamServer) -> (String, Arc<TestApp>) {
         connection_id: app.connection_id.clone(),
     };
 
-    let router = api::router(api::ApiState {
+    let product_api = api::router(api::ApiState {
         stream_server: app.stream_server.clone(),
         connection_id: app.connection_id.clone(),
-    }, Some(acp_config));
+    });
+    let acp_transport = acp_server::router(acp_config);
+    let router = axum::Router::new().merge(product_api).merge(acp_transport);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

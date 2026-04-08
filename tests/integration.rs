@@ -31,7 +31,7 @@ async fn test_server(app: Arc<TestApp>) -> String {
     let router = api::router(api::ApiState {
         stream_server: app.stream_server.clone(),
         connection_id: app.connection_id.clone(),
-    }, None);
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

@@ -1,4 +1,5 @@
 pub mod acp_registry;
+pub mod acp_server;
 pub mod api;
 pub mod client;
 pub mod durable_stream_tracer;
