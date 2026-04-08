@@ -10,7 +10,7 @@
  */
 
 import { execFileSync } from "child_process";
-import { findBinary } from "./binary.js";
+import { findBinary } from "./binary.ts";
 
 const binary = findBinary();
 const args = process.argv.slice(2);

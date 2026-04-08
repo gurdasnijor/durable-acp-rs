@@ -1,5 +1,5 @@
-export { startServer, type ServerConfig, type ServerHandle } from "./spawn.js";
-export { findBinary } from "./binary.js";
+export { startServer, type ServerConfig, type ServerHandle } from "./spawn.ts";
+export { findBinary } from "./binary.ts";
 
 // Re-export transport and state for convenience
 export { connectWs, connectStream, fromWebSocket, type AcpConnection, type AcpClientHandlers } from "@durable-acp/transport";

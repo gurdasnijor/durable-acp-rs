@@ -8,7 +8,7 @@
  */
 
 import { spawn, type ChildProcess } from "child_process";
-import { findBinary } from "./binary.js";
+import { findBinary } from "./binary.ts";
 
 export interface ServerConfig {
   /** Agent ID from ACP registry, or { command: string[] } for custom. */
