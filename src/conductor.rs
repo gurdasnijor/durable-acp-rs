@@ -30,7 +30,6 @@ impl ConnectTo<Conductor> for DurableStateProxy {
                 {
                     let app = app.clone();
                     async move |req: PromptRequest, responder, cx| {
-                        app.capture_proxy_connection(cx.clone()).await;
                         app.enqueue_prompt(req, responder)
                             .await
                             .map_err(|e| sacp::util::internal_error(e.to_string()))?;
@@ -45,7 +44,6 @@ impl ConnectTo<Conductor> for DurableStateProxy {
                 {
                     let app = app.clone();
                     async move |req: sacp::schema::NewSessionRequest, responder, cx| {
-                        app.capture_proxy_connection(cx.clone()).await;
                         let cwd = req.cwd.to_string_lossy().to_string();
                         cx.send_request_to(Agent, req).on_receiving_result({
                             let app = app.clone();
