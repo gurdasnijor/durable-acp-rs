@@ -83,7 +83,7 @@ conductor framework + [durable streams](https://github.com/durable-streams/durab
 | W6 | File-backed storage | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §1 |
 | W7 | ~~EventSubscriber trait~~ | ⏭ ELIMINATED | StreamDB IS the subscriber — see [electric-sync-sdd.md](electric-sync-sdd.md) |
 | W7a | ~~WebSocket subscriber~~ | ⏭ ELIMINATED | StreamDB subscribes via SSE directly |
-| W7b | Webhook forwarder | 🔜 Ready | Tiny SSE→HTTP script (~50 lines) |
+| W7b | Webhook forwarder | ✅ Done | RFC-aligned: coalesced events, HMAC signing, retries. See `src/webhook.rs` |
 | W7c | ~~Generalized SSE~~ | ⏭ ELIMINATED | DS server SSE already works |
 | W8 | Schema compatibility verified | ✅ Done | Rust ↔ TypeScript match. See [schema-compatibility.md](schema-compatibility.md) |
 | W9 | Pluggable transports (TCP/WS) | 🔜 Ready | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) |
@@ -96,8 +96,7 @@ conductor framework + [durable streams](https://github.com/durable-streams/durab
 ### Remaining Work
 
 - **W5** — conductor config support (`sacp-conductor --config`)
-- **W7b** — webhook forwarder (SSE→HTTP, ~50 lines)
-- **W9** — pluggable transports (TCP/WS for remote agents)
+- **W9** — pluggable transports (TCP/WS for remote agents). See [transport-sdd.md](transport-sdd.md)
 - **W10** — runtime providers (Docker/E2B)
 
 ### Architecture Principle
@@ -150,6 +149,7 @@ Flamecast reads from durable stream (replaces FlamecastStorage):
 | [flamecast-capabilities.md](flamecast-capabilities.md) | ✅ Done | Maps each Flamecast guide to our infrastructure |
 | [auth-sdd.md](auth-sdd.md) | 🔜 Ready | JWT auth proxy (Envoy/CF Access) |
 | [deployment-sdd.md](deployment-sdd.md) | 🔜 Ready | Control plane / data plane split |
+| [transport-sdd.md](transport-sdd.md) | 🔜 Ready | Pluggable transports — unified ConnectTo model |
 | [event-subscribers-sdd.md](event-subscribers-sdd.md) | ⏭ Superseded | Replaced by StreamDB in `electric-sync-sdd.md` |
 
 ## Key References

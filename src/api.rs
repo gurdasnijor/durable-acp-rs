@@ -20,6 +20,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/api/v1/connections/{id}/queue/{turn_id}", delete(cancel_queued_turn))
         .route("/api/v1/connections/{id}/queue/pause", post(pause_queue))
         .route("/api/v1/connections/{id}/queue/resume", post(resume_queue))
+        .route("/api/v1/connections/{id}/prompt-turns", get(list_prompt_turns))
         .route("/api/v1/prompt-turns/{id}/stream", get(stream_prompt_turn))
         .route("/api/v1/prompt-turns/{id}/chunks", get(get_chunks))
         .route("/api/v1/registry", get(get_registry))
@@ -46,6 +47,18 @@ async fn get_queue(
             .filter(|row| row.logical_connection_id == id && row.state == PromptTurnState::Queued)
             .collect(),
     )
+}
+
+async fn list_prompt_turns(
+    Path(id): Path<String>,
+    State(app): State<Arc<AppState>>,
+) -> Json<Vec<PromptTurnRow>> {
+    let snapshot = app.durable_streams.stream_db.snapshot().await;
+    let mut turns: Vec<PromptTurnRow> = snapshot.prompt_turns.into_values()
+        .filter(|row| row.logical_connection_id == id)
+        .collect();
+    turns.sort_by_key(|t| t.started_at);
+    Json(turns)
 }
 
 async fn pause_queue(
@@ -291,19 +304,9 @@ async fn get_terminal(
         .ok_or(axum::http::StatusCode::NOT_FOUND)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateTerminalBody {
-    session_id: String,
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-}
-
 async fn create_terminal(
     Path(_id): Path<String>,
     State(_app): State<Arc<AppState>>,
-    Json(_body): Json<CreateTerminalBody>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     // Terminal creation goes through the ACP client connection (not REST).
     // The DurableStateProxy records terminal state when the agent creates one.
