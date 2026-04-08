@@ -35,7 +35,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.port);
-    let app = Arc::new(ConductorState::new(bind, cli.state_stream).await?);
+    let app = Arc::new(if let Ok(dir) = std::env::var("DATA_DIR") {
+        let stream_server = durable_acp_rs::stream_server::StreamServer::start_with_dir(
+            bind, &cli.state_stream, std::path::PathBuf::from(dir),
+        ).await?;
+        ConductorState::with_shared_streams(stream_server).await?
+    } else {
+        ConductorState::new(bind, cli.state_stream.clone()).await?
+    });
     let api_port = cli.port + 1;
 
     let agent_name = cli.name.clone();
