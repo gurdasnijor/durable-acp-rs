@@ -34,7 +34,7 @@ export function durableAcpProxy(options?: DurableAcpProxyOptions): Plugin {
           proxy: {
             // ACP WebSocket — prompt, cancel, permissions
             "/acp": {
-              target: `ws://${host}:${apiPort}`,
+              target: `http://${host}:${apiPort}`,
               ws: true,
             },
             // Durable streams — SSE state observation
