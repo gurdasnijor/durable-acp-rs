@@ -117,9 +117,9 @@ interface FlamecastStorage {
 |---|---|---|
 | Session creation | `ConductorImpl::new_agent()` + `SessionBuilder` | ✅ Working |
 | Session termination | Drop conductor task | ✅ Working |
-| List sessions | `GET /connections` (StreamDB) | ✅ Working |
-| Send prompt | `POST /connections/{id}/prompt` + in-process channels | ✅ Working |
-| Stream response | `GET /prompt-turns/{id}/stream` (SSE) | ✅ Working |
+| List sessions | Durable stream SSE → StreamDB `connections` collection | ✅ Working |
+| Send prompt | ACP client via stdio or `/acp` WebSocket | ✅ Working |
+| Stream response | Durable stream SSE → StreamDB `chunks` collection | ✅ Working |
 | Permission brokering | `on_receive_request(RequestPermissionRequest, ...)` | ✅ Working |
 | Queue management | Drain loop, pause/resume | ✅ Working |
 | Agent templates | `agents.toml` + ACP registry | ✅ Working |
@@ -143,8 +143,8 @@ If durable-acp-rs becomes the conductor/backend layer:
 - **Event bus** — replaced by `StreamDb::subscribe_changes()` + durable stream SSE
 
 ### Keep but rewire
-- **React UI** — point at durable-acp-rs REST API + add WebSocket endpoint
-- **Agent templates** — read from `agents.toml` or ACP registry CDN via new API
+- **React UI** — point `DurableACPClient` at durable stream SSE for state; connect via `/acp` WebSocket for prompts
+- **Agent templates** — read from `agents.toml` or ACP registry CDN
 - **Runtime providers** — keep Docker/E2B providers but have them spawn `durable-acp-rs <agent>` instead of raw agent commands
 
 ### Gains from integration
@@ -153,46 +153,30 @@ If durable-acp-rs becomes the conductor/backend layer:
 - **In-process multi-agent** — N agents in one process vs N separate host processes
 - **Stream-based observability** — any client subscribes via HTTP SSE, not just WebSocket
 
-## Implementation Plan: Flamecast-Compatible API
+## How Flamecast Connects
 
-Add these endpoints to `api.rs` to match Flamecast's API shape:
+No custom API needed. Flamecast uses two channels:
 
-### Phase 1: Session CRUD (enables React UI)
-
-```rust
-// Map Flamecast's /agents/* to our /api/v1/* namespace
-POST   /api/v1/agents              → create session (spawn conductor, init, new_session)
-GET    /api/v1/agents              → list sessions (from StreamDB connections)
-GET    /api/v1/agents/:id          → session snapshot (connection + recent chunks + queue)
-DELETE /api/v1/agents/:id          → terminate session (drop conductor task)
-POST   /api/v1/agents/:id/prompts  → send prompt (same as existing /connections/:id/prompt)
-GET    /api/v1/agents/:id/stream   → SSE event stream (same as /prompt-turns/:id/stream but session-scoped)
+**State observation** — durable stream SSE:
+```
+GET /streams/durable-acp-state?live=sse → all state (connections, chunks, permissions, etc.)
+DurableACPClient subscribes, materializes into TanStack DB collections.
 ```
 
-### Phase 2: Permission + Queue (full control)
-
-```rust
-POST   /api/v1/agents/:id/permissions/:reqId  → resolve permission (route to permission channel)
-GET    /api/v1/agents/:id/queue               → list queued prompts
-POST   /api/v1/agents/:id/queue/pause         → pause (already exists)
-POST   /api/v1/agents/:id/queue/resume        → resume (already exists)
-DELETE /api/v1/agents/:id/queue/:queueId      → remove queued item
-PUT    /api/v1/agents/:id/queue               → reorder queue
+**Prompt submission + control** — ACP over WebSocket:
+```
+WS /acp → full ACP client transport (prompt, cancel, permissions)
+Each connection spawns a conductor with the full proxy chain.
 ```
 
-### Phase 3: WebSocket (real-time bidirectional)
-
-```rust
-// Single multiplexed WebSocket matching Flamecast's channel protocol
-WS /ws
-  → subscribe/unsubscribe to channels (session events, queue updates)
-  → prompt submission
-  → permission resolution
-  → queue management
-  → terminal I/O
+**Queue management** — REST (the only REST endpoints):
 ```
-
-This is the biggest lift but unlocks the React UI's real-time features.
+POST   /api/v1/connections/{id}/queue/pause
+POST   /api/v1/connections/{id}/queue/resume
+DELETE /api/v1/connections/{id}/queue/{turnId}
+DELETE /api/v1/connections/{id}/queue
+PUT    /api/v1/connections/{id}/queue
+```
 
 ### Phase 4: Agent Templates API
 

@@ -30,24 +30,23 @@ sacp::Lines::new(outgoing_sink, incoming_stream)
 
 `ConductorImpl::run(transport: impl ConnectTo<Host>)` accepts any of them.
 
-## Server Side: Always Available
+## Server Side — ✅ DONE
 
-The conductor already runs a REST API server on `:port+1`. The WebSocket
-ACP endpoint is just another route — no flag, no mode:
+The `/acp` WebSocket endpoint is implemented in `api.rs`. It uses
+`sacp::Channel::duplex()` (zero serialization, message passing) to bridge
+the WebSocket connection to the conductor:
 
 ```rust
-// In api.rs router — add alongside existing routes:
-.route("/acp", get(ws_acp_handler))
+// api.rs — WebSocket ↔ sacp::Channel bridge
+let (channel_conductor, channel_ws) = sacp::Channel::duplex();
+// WebSocket frames ↔ JSON-RPC messages ↔ Channel ↔ ConductorImpl
+conductor.run(channel_conductor).await
 ```
 
+Each WebSocket connection spawns a new conductor with its own proxy chain.
 The conductor accepts clients on **both** transports simultaneously:
 - **stdio** — editors spawn it as a subprocess, connect via stdin/stdout
 - **WebSocket at `/acp`** — remote clients connect via `ws://host:port+1/acp`
-
-This works because the conductor's internal `ConductorMessage` queue
-serializes all messages regardless of source — the same mechanism that
-handles multiple MCP bridge connections (see `run_tcp_listener` in
-`sacp-conductor`). No single-client constraint.
 
 ```bash
 # All connections always available:
@@ -120,25 +119,26 @@ fn resolve_transport(config: &AgentConfig) -> Box<dyn ConnectTo<Client>> {
 }
 ```
 
-### WebSocket transport (new, ~30 lines)
+### WebSocket transport — ✅ DONE (`src/transport.rs`)
+
+Uses `sacp::Lines` (text-frame-level transport) not `ByteStreams`:
 
 ```rust
-struct WebSocketTransport { url: String }
-
 impl ConnectTo<Client> for WebSocketTransport {
     async fn connect_to(self, client: impl ConnectTo<Agent>) -> Result<(), sacp::Error> {
         let (ws, _) = tokio_tungstenite::connect_async(&self.url).await?;
         let (write, read) = ws.split();
-        ByteStreams::new(write, read).connect_to(client).await
+        // Adapt WS Sink<Message>/Stream<Message> → Sink<String>/Stream<String>
+        sacp::Lines::new(outgoing, incoming).connect_to(client).await
     }
 }
 ```
 
-### TCP transport (new, ~15 lines)
+### TCP transport — ✅ DONE (`src/transport.rs`)
+
+Uses `sacp::ByteStreams` (byte-level transport):
 
 ```rust
-struct TcpTransport { host: String, port: u16 }
-
 impl ConnectTo<Client> for TcpTransport {
     async fn connect_to(self, client: impl ConnectTo<Agent>) -> Result<(), sacp::Error> {
         let stream = TcpStream::connect((self.host, self.port)).await?;
@@ -205,15 +205,15 @@ let (channel_client, channel_conductor) = sacp::Channel::duplex();
 // Client: Client.builder().connect_with(channel_client, |cx| { ... })
 ```
 
-## What Changes
+## What Changed (all ✅ done)
 
 | File | Change |
 |---|---|
-| `src/main.rs` | No changes — stdio always works, WebSocket is on API server |
-| `src/api.rs` | Add `GET /acp` WebSocket upgrade route |
-| `src/bin/dashboard.rs` | Replace custom subprocess glue with `resolve_transport()` + `ConnectTo` |
-| `agents.toml` | Add optional `transport` field |
-| New: `src/transport.rs` | `WebSocketTransport`, `TcpTransport`, `resolve_transport()` (~60 lines) |
+| `src/main.rs` | Unchanged — stdio always works, WebSocket is on API server |
+| `src/api.rs` | `/acp` WebSocket route + `Channel::duplex()` bridge (281 lines) |
+| `src/transport.rs` | `WebSocketTransport` (Lines), `TcpTransport` (ByteStreams), `TransportConfig` (82 lines) |
+| `src/bin/dashboard.rs` | Uses `Client.builder().connect_with()` — SDK paved road (522 lines) |
+| `agents.toml` | Optional `transport` field per agent |
 
 ## What Stays The Same
 
