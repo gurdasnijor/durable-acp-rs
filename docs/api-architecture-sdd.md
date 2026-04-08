@@ -154,13 +154,13 @@ app.capture_proxy_connection(cx.clone()).await;  // line 48
 
 ### Keep in `api.rs`
 
-Everything else stays — it's all read-only or queue management:
-- `list_connections`, `get_queue`, `pause_queue`, `resume_queue`
-- `stream_prompt_turn`, `get_chunks`
+What remains (281 lines — queue management + filesystem + ACP WebSocket):
+- `/acp` (WebSocket) — ACP client transport, spawns conductor per connection
+- `pause_queue`, `resume_queue`, `cancel_queued_turn`, `clear_queue`, `reorder_queue`
+- `get_file`, `get_tree`
 - `get_registry`
-- `get_file`, `get_fs_tree`
-- `create_terminal`, `terminal_input`, `terminal_output`, `kill_terminal`
-- Queue CRUD: `cancel_queued_turn`, `clear_queue`, `reorder_queue`
+- `kill_terminal`
+- State observation endpoints (`list_connections`, `stream_prompt_turn`, etc.) removed — durable stream handles it
 
 ### Cancel via queue management
 
@@ -211,8 +211,6 @@ async fn submit_prompt(...) { ... }
 
 ## Relationship to Other SDDs
 
-- **`sdk-alignment.md`** — W4 (API bypass fix) is superseded by this SDD.
-  Instead of fixing the bypass, we remove it.
 - **`known-limitations-sdd.md` §2** — resolved by deletion, not by fixing.
 - **`flamecast-integration-sdd.md`** — Flamecast's `AcpBridge` already
   connects as an ACP client. No REST prompt endpoint needed.

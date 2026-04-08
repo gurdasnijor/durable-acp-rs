@@ -20,8 +20,7 @@ Flamecast SessionService.startSession()
 Flamecast reads state from durable stream (replaces FlamecastStorage):
   GET /streams/durable-acp-state          → full state replay
   GET /streams/durable-acp-state?live=sse → real-time subscription
-  REST API /api/v1/connections            → session list
-  REST API /api/v1/prompt-turns/{id}/*    → chunks, SSE streaming
+  DurableACPClient subscribes, materializes into TanStack DB collections
 
 What Flamecast cuts:
   FlamecastStorage (PGLite/Postgres) → durable stream + StreamDB
@@ -40,21 +39,11 @@ State survives process restart.
 
 ---
 
-## 2. API Bypasses Proxy Chain — 🔄 IN PROGRESS
+## 2. API Bypasses Proxy Chain — ✅ RESOLVED
 
-**Problem:** `POST /connections/{id}/prompt` bypasses the proxy chain,
-sending directly to the agent instead of through `DurableStateProxy`.
-
-**Fix:** Use `session.connection()` to route prompts through the client
-side of the ACP connection, so the proxy chain fires automatically.
-
-**Challenge:** `ClientSideConnection` is `!Send`. The REST API runs on a
-multi-threaded tokio runtime. Solution: channel bridge from API → dashboard
-LocalSet thread → `session.connection()`.
-
-See [sdk-alignment.md](sdk-alignment.md) §1.5 for implementation details.
-
-**Files:** `src/api.rs`, `src/app.rs`, `src/conductor.rs`
+Resolved by removing REST prompt/cancel endpoints entirely. All prompt
+submission goes through ACP (stdio or `/acp` WebSocket). The REST API
+is now queue management + filesystem only. See [api-architecture-sdd.md](api-architecture-sdd.md).
 
 ---
 
@@ -143,24 +132,16 @@ durable state flows back to the shared durable stream server.
 
 ---
 
-## 7. WebSocket Multiplexing + Webhooks — Missing
+## 7. WebSocket + Webhooks — ✅ RESOLVED
 
-These are fully designed in `event-subscribers-sdd.md`. Summary:
+**WebSocket:** The `/acp` endpoint provides full ACP client transport
+over WebSocket using `sacp::Channel::duplex()`. No custom multiplexing
+protocol needed — clients connect as standard ACP clients.
 
-**WebSocket:** Single multiplexed endpoint at `WS /ws` matching
-[Flamecast's channel protocol](https://flamecast.mintlify.app/rfcs/multi-session-websocket).
-Implemented as a `WsSubscriber` that dispatches events from
-`StreamDb::subscribe_changes()` and accepts commands (prompt, permission
-resolve, queue management, terminal I/O).
-
-**Webhooks:** `WebhookSubscriber` that POSTs events to HTTP endpoints
-with HMAC signing. Registered via `POST /api/v1/webhooks` or
-`[[webhook]]` in `agents.toml`.
-
-Both are the same `EventSubscriber` trait — subscribe to changes, filter,
-dispatch via different transport.
-
-**Effort:** ~3 days total (see `event-subscribers-sdd.md` for breakdown).
+**Webhooks:** RFC-aligned forwarder in `src/webhook.rs`. Coalesced
+events (`end_turn`, `error`, `permission_request`), HMAC-SHA256 signing,
+5 retries with exponential backoff. Configured via `[[webhook]]` in
+`agents.toml`.
 
 ---
 
@@ -170,11 +151,11 @@ dispatch via different transport.
 |---|---|---|
 | File-backed storage | ✅ FIXED | `FileStorage` impl |
 | File system access | ✅ FIXED | Read-only fs endpoints |
-| Terminal management | ✅ FIXED | Full CRUD + SSE output |
+| Terminal management | ✅ FIXED | State in stream, kill via REST |
 | Queue CRUD | ✅ FIXED | Cancel, clear, reorder endpoints |
-| API proxy bypass | 🔄 IN PROGRESS | `session.connection()` approach — see [sdk-alignment.md](sdk-alignment.md) §1.5 |
-| WebSocket multiplexing | ⏭ ELIMINATED | StreamDB subscribes via SSE — see [electric-sync-sdd.md](electric-sync-sdd.md) |
-| Webhooks | 🔜 Ready | Tiny SSE→HTTP forwarder |
-| Runtime providers | 🔜 Ready | Depends on pluggable transports (W9) |
+| API proxy bypass | ✅ RESOLVED | REST prompt endpoints removed; all prompts go through ACP |
+| WebSocket transport | ✅ FIXED | `/acp` endpoint with `Channel::duplex()` |
+| Webhooks | ✅ FIXED | RFC-aligned forwarder with HMAC + retries |
+| Runtime providers | 🔜 Ready | Depends on client-side transport resolution (W9) |
 | Single-instance drain | Deferred | Needs upstream conditional appends |
 
