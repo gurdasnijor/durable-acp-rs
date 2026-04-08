@@ -1,0 +1,28 @@
+{
+  "name": "@durable-acp/state",
+  "version": "0.1.0",
+  "description": "Shared durable state protocol for Durable ACP — schema, StreamDB, collections, types.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@durable-streams/state": "^0.2.3",
+    "@tanstack/db": "^0.6.2",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.8"
+  }
+}

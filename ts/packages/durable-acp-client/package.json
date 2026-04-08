@@ -1,0 +1,28 @@
+{
+  "name": "@durable-acp/client",
+  "version": "0.1.0",
+  "description": "Enhanced ACP client with durable state stream subscription — queue visibility, history, multi-session.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.18.1",
+    "@durable-acp/state": "workspace:*",
+    "@tanstack/db": "^0.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.8"
+  }
+}
