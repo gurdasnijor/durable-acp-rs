@@ -81,7 +81,7 @@ come from one git repo at one commit — guaranteed compatible.
 | W7b | Webhook forwarder | ✅ Done | RFC-aligned: coalesced events, HMAC signing, retries. See `src/webhook.rs` |
 | W7c | ~~Generalized SSE~~ | ⏭ ELIMINATED | DS server SSE already works |
 | W8 | Schema compatibility verified | ✅ Done | Rust ↔ TypeScript match. See [schema-compatibility.md](schema-compatibility.md) |
-| W9 | Pluggable transports | ✅ Done | Server: `/acp` WS (Channel::duplex). Client: WebSocketTransport (Lines), TcpTransport (ByteStreams). See [transport-sdd.md](transport-sdd.md) |
+| W9 | Pluggable transports | ✅ Done | Server: `/acp` WS (AxumWsTransport→Lines). Client: WebSocketTransport (Lines), TcpTransport (ByteStreams). All use `conductor.run(transport)`. See [transport-sdd.md](transport-sdd.md) |
 | W10 | Runtime providers (Docker/E2B) | 🔜 Ready | Depends on W9 |
 | W11 | File system access API | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §4 |
 | W12 | Terminal management API | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §5 |
@@ -164,11 +164,11 @@ src/
   app.rs               AppState, queue, chunk recording (318 lines)
   state.rs             StreamDB, collections, STATE-PROTOCOL (356 lines)
   durable_streams.rs   Embedded durable streams server
-  api.rs               Queue mgmt + filesystem + /acp WebSocket (281 lines)
+  api.rs               Queue mgmt + filesystem + /acp WebSocket (250 lines)
   webhook.rs           RFC-aligned webhook forwarder (336 lines)
-  transport.rs         WebSocketTransport + TcpTransport + TransportConfig (82 lines)
+  transport.rs         WebSocketTransport + TcpTransport + AxumWsTransport + TransportConfig (113 lines)
   bin/
-    dashboard.rs       TUI dashboard — Client.builder().connect_with() (522 lines)
+    dashboard.rs       TUI dashboard — Client.builder().connect_with() (435 lines)
     agents.rs          Config manager + registry picker
 agents.toml            Agent configuration
 ```
