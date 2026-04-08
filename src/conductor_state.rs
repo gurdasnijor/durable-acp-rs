@@ -91,11 +91,11 @@ impl ConductorState {
         value: Option<&T>,
     ) -> Result<()> {
         let envelope = StateEnvelope {
+            entity_type: entity_type.to_string(),
+            key: key.into(),
             headers: StateHeaders {
                 operation: operation.to_string(),
-                entity_type: entity_type.to_string(),
             },
-            key: key.into(),
             value,
         };
         self.stream_server

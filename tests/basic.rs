@@ -21,11 +21,11 @@ async fn stream_db_applies_state_events() {
         updated_at: 1,
     };
     let event = StateEnvelope {
+        entity_type: "connection".to_string(),
+        key: "conn-1".to_string(),
         headers: StateHeaders {
             operation: "insert".to_string(),
-            entity_type: "connection".to_string(),
         },
-        key: "conn-1".to_string(),
         value: Some(row),
     };
 

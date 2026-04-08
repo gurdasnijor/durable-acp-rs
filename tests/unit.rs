@@ -316,8 +316,9 @@ fn all_chunk_types_serialize() {
 async fn stream_db_unknown_entity_type_errors() {
     let db = StreamDb::new();
     let event = serde_json::json!({
-        "headers": { "operation": "insert", "type": "alien_entity" },
+        "type": "alien_entity",
         "key": "x",
+        "headers": { "operation": "insert" },
         "value": { "foo": "bar" }
     });
     let result = db.apply_json_message(&serde_json::to_vec(&event).unwrap()).await;
@@ -329,8 +330,9 @@ async fn stream_db_unknown_entity_type_errors() {
 async fn stream_db_delete_nonexistent_is_noop() {
     let db = StreamDb::new();
     let event = serde_json::json!({
-        "headers": { "operation": "delete", "type": "connection" },
-        "key": "does-not-exist"
+        "type": "connection",
+        "key": "does-not-exist",
+        "headers": { "operation": "delete" }
     });
     // Should not error — delete on nonexistent is a no-op
     db.apply_json_message(&serde_json::to_vec(&event).unwrap())
@@ -354,11 +356,11 @@ async fn stream_db_update_creates_if_missing() {
         updated_at: 1,
     };
     let event = StateEnvelope {
+        entity_type: "connection".to_string(),
+        key: "upsert-1".to_string(),
         headers: StateHeaders {
             operation: "update".to_string(),
-            entity_type: "connection".to_string(),
         },
-        key: "upsert-1".to_string(),
         value: Some(row),
     };
     db.apply_json_message(&serde_json::to_vec(&event).unwrap())

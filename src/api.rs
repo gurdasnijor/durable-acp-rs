@@ -24,11 +24,12 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::conductor_state::ConductorState;
 use crate::state::TerminalState;
 
-/// Config for the WebSocket ACP endpoint — spawns a new conductor per connection.
+/// Config for the WebSocket ACP endpoint.
 #[derive(Clone)]
 pub struct AcpEndpointConfig {
     pub agent_command: Vec<String>,
-    pub stream_server: crate::stream_server::StreamServer,
+    /// Shared state — same connection ID and durable stream across all WS connections.
+    pub app: Arc<ConductorState>,
 }
 
 pub fn router(app: Arc<ConductorState>, acp_config: Option<AcpEndpointConfig>) -> Router {
@@ -86,15 +87,9 @@ async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
         }
     };
 
-    let app = match ConductorState::with_shared_streams(config.stream_server.clone()).await {
-        Ok(a) => Arc::new(a),
-        Err(e) => {
-            tracing::error!("Failed to create app state: {}", e);
-            return;
-        }
-    };
-
-    let conductor = crate::conductor::build_conductor(app, agent);
+    // Use the shared ConductorState — same connection ID, same durable stream.
+    // No new ConductorState per WebSocket.
+    let conductor = crate::conductor::build_conductor(config.app.clone(), agent);
     let transport = crate::transport::AxumWsTransport { socket };
 
     if let Err(e) = conductor.run(transport).await {

@@ -79,6 +79,10 @@ impl sacp::ConnectTo<sacp::Agent> for AxumWsTransport {
         let incoming = futures::StreamExt::filter_map(read, |msg| async move {
             match msg {
                 Ok(axum::extract::ws::Message::Text(t)) => Some(Ok(t.to_string())),
+                Ok(axum::extract::ws::Message::Binary(b)) => {
+                    // use-acp sends binary frames (ndJsonStream encodes as Uint8Array)
+                    String::from_utf8(b.to_vec()).ok().map(Ok)
+                }
                 Err(e) => Some(Err(std::io::Error::other(e))),
                 _ => None,
             }

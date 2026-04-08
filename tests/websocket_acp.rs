@@ -39,7 +39,7 @@ async fn start_acp_server(ds: StreamServer) -> (String, Arc<ConductorState>) {
 
     let acp_config = AcpEndpointConfig {
         agent_command: vec![testy.to_string_lossy().to_string()],
-        stream_server: ds,
+        app: app.clone(),
     };
 
     let router = api::router(app.clone(), Some(acp_config));

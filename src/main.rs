@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
 
     let acp_config = api::AcpEndpointConfig {
         agent_command: cli.agent_command.clone(),
-        stream_server: app.stream_server.clone(),
+        app: app.clone(),
     };
     let api_router = api::router(app.clone(), Some(acp_config));
     spawn_api_server(api_port, api_router).await?;

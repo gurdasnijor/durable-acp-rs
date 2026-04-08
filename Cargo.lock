@@ -811,6 +811,7 @@ dependencies = [
  "bytes",
  "clap",
  "dirs",
+ "durable-streams",
  "durable-streams-server",
  "futures",
  "hmac",
@@ -831,6 +832,21 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "durable-streams"
+version = "0.1.0"
+source = "git+https://github.com/durable-streams/durable-streams#ef708da0231bc15b35b86bf425f281a9900b84b6"
+dependencies = [
+ "base64",
+ "bytes",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -272,9 +272,9 @@ async fn handle_session_notification(app: &ConductorState, notif: &SessionNotifi
         SessionUpdate::ToolCallUpdate(update) => {
             app.record_chunk(&prompt_turn_id, ChunkType::ToolResult, serde_json::to_string(update)?).await?;
         }
-        other => {
-            app.record_chunk(&prompt_turn_id, ChunkType::Text, serde_json::to_string(other)?).await?;
-        }
+        // Non-content updates (UsageUpdate, AvailableCommandsUpdate, ConfigOptionUpdate,
+        // CurrentModeUpdate, Plan, SessionInfoUpdate) — don't record as text chunks.
+        _ => {}
     }
     Ok(())
 }

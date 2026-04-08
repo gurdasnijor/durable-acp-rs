@@ -198,14 +198,16 @@ pub struct ChunkRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateHeaders {
     pub operation: String,
-    #[serde(rename = "type")]
-    pub entity_type: String,
 }
 
+/// STATE-PROTOCOL envelope: `type` is top-level (entity type discriminator),
+/// `headers` contains only `operation`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateEnvelope<T> {
-    pub headers: StateHeaders,
+    #[serde(rename = "type")]
+    pub entity_type: String,
     pub key: String,
+    pub headers: StateHeaders,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<T>,
 }
@@ -259,10 +261,9 @@ impl StreamDb {
     pub async fn apply_json_message(&self, message: &[u8]) -> Result<()> {
         let value: Value = serde_json::from_slice(message).context("decode state event")?;
         let entity_type = value
-            .get("headers")
-            .and_then(|v| v.get("type"))
+            .get("type")
             .and_then(Value::as_str)
-            .context("missing headers.type")?;
+            .context("missing type")?;
         let operation = value
             .get("headers")
             .and_then(|v| v.get("operation"))
