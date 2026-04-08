@@ -20,7 +20,6 @@ use anyhow::{Context, Result, bail};
 use clap::Parser as ClapParser;
 use iocraft::prelude::*;
 use serde::Deserialize;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use durable_acp_rs::state::{ChunkRow, ChunkType};
 
@@ -47,6 +46,7 @@ struct AgentConfig {
     port: u16,
     agent: Option<String>,
     command: Option<Vec<String>>,
+    transport: Option<durable_acp_rs::transport::TransportConfig>,
     #[serde(default = "default_ss")]
     state_stream: String,
 }
@@ -60,46 +60,8 @@ fn default_ss() -> String {
     "durable-acp-state".to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Minimal ACP client — auto-approves permissions
-// ---------------------------------------------------------------------------
-
-struct DashboardClient {
-    #[allow(dead_code)]
-    name: String,
-}
-
-#[async_trait::async_trait(?Send)]
-impl acp::Client for DashboardClient {
-    async fn request_permission(
-        &self,
-        args: acp::RequestPermissionRequest,
-    ) -> acp::Result<acp::RequestPermissionResponse> {
-        let outcome = if let Some(opt) = args.options.first() {
-            acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
-                opt.option_id.clone(),
-            ))
-        } else {
-            acp::RequestPermissionOutcome::Cancelled
-        };
-        Ok(acp::RequestPermissionResponse::new(outcome))
-    }
-
-    async fn session_notification(
-        &self,
-        _args: acp::SessionNotification,
-    ) -> acp::Result<(), acp::Error> {
-        Ok(())
-    }
-
-    async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn ext_notification(&self, _args: acp::ExtNotification) -> acp::Result<()> {
-        Ok(())
-    }
-}
+// No custom Client impl needed — sacp::Client.builder().on_receive_request()
+// handles permission requests inline.
 
 // ---------------------------------------------------------------------------
 // Shared TUI state
@@ -372,6 +334,7 @@ async fn main() -> Result<()> {
             port: cli.port,
             agent: Some(agent_id.clone()),
             command: None,
+            transport: None,
             state_stream: default_ss(),
         }]
     } else {
@@ -433,29 +396,28 @@ async fn main() -> Result<()> {
 
     local
         .run_until(async move {
-            // Spawn each conductor subprocess and bootstrap via ACP client
+            // Connect to each agent — transport resolved from config
             for ((config, command), mut prompt_rx) in resolved.iter().zip(prompt_receivers) {
-                let mut conductor_args = vec![
-                    "--name".to_string(), config.name.clone(),
-                    "--port".to_string(), config.port.to_string(),
-                    "--state-stream".to_string(), config.state_stream.clone(),
-                ];
-                conductor_args.extend(command.iter().cloned());
-
-                let mut child = tokio::process::Command::new(&conductor_bin)
-                    .args(&conductor_args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
-                    .kill_on_drop(true)
-                    .spawn()
-                    .with_context(|| format!("spawn conductor for '{}'", config.name))?;
-
-                let outgoing = child.stdin.take().unwrap().compat_write();
-                let incoming = child.stdout.take().unwrap().compat();
                 let name = config.name.clone();
                 let api_url = format!("http://127.0.0.1:{}", config.port + 1);
                 let tui2 = tui_clone.clone();
+
+                // Resolve transport: stdio subprocess (default), WebSocket, or TCP
+                let transport: sacp_tokio::AcpAgent = {
+                    // For now, all transports go through the conductor binary
+                    // TODO: add WebSocket/TCP ConnectTo impls for remote agents
+                    let mut conductor_args = vec![
+                        "--name".to_string(), config.name.clone(),
+                        "--port".to_string(), config.port.to_string(),
+                        "--state-stream".to_string(), config.state_stream.clone(),
+                    ];
+                    conductor_args.extend(command.iter().cloned());
+
+                    let mut full_command = vec![conductor_bin.to_string_lossy().to_string()];
+                    full_command.extend(conductor_args);
+                    sacp_tokio::AcpAgent::from_args(full_command)
+                        .with_context(|| format!("parse conductor command for '{}'", name))?
+                };
 
                 // Register in peer registry
                 let _ = durable_acp_rs::registry::register(durable_acp_rs::registry::AgentEntry {
@@ -465,57 +427,58 @@ async fn main() -> Result<()> {
                     registered_at: durable_acp_rs::app::now_ms(),
                 });
 
-                // Connect as ACP client — the minimal glue
-                let (conn, handle_io) = acp::ClientSideConnection::new(
-                    DashboardClient { name: name.clone() },
-                    outgoing,
-                    incoming,
-                    |fut| { tokio::task::spawn_local(fut); },
-                );
-                tokio::task::spawn_local(handle_io);
+                // Connect as ACP client using SDK primitives
+                tokio::task::spawn_local({
+                    let name = name.clone();
+                    let tui2 = tui2.clone();
+                    async move {
+                        let result = sacp::Client
+                            .builder()
+                            .name(&format!("{}-client", name))
+                            .on_receive_request(
+                                async |req: acp::RequestPermissionRequest, responder, _cx| {
+                                    // Auto-approve permissions
+                                    let outcome = if let Some(opt) = req.options.first() {
+                                        acp::RequestPermissionOutcome::Selected(
+                                            acp::SelectedPermissionOutcome::new(opt.option_id.clone()),
+                                        )
+                                    } else {
+                                        acp::RequestPermissionOutcome::Cancelled
+                                    };
+                                    responder.respond(acp::RequestPermissionResponse::new(outcome))
+                                },
+                                sacp::on_receive_request!(),
+                            )
+                            .connect_with(transport, async |cx| {
+                                // Initialize
+                                cx.send_request(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
+                                    .block_task()
+                                    .await?;
 
-                // Initialize + create session, then listen for prompts via ACP
-                tokio::task::spawn_local(async move {
-                    let session_id = match async {
-                        conn.initialize(
-                            acp::InitializeRequest::new(acp::ProtocolVersion::V1)
-                                .client_info(acp::Implementation::new("durable-acp-dashboard", "0.1.0")
-                                    .title("Dashboard")),
-                        ).await?;
-                        let session = conn.new_session(
-                            acp::NewSessionRequest::new(std::env::current_dir()?),
-                        ).await?;
-                        Ok::<_, anyhow::Error>(session.session_id.clone())
-                    }.await {
-                        Ok(sid) => {
-                            tui2.set_state(&name, "ready");
-                            tui2.push_text(&name, &format!("[{}] Ready ({})\n", name, api_url));
-                            sid
-                        }
-                        Err(e) => {
+                                // Create session and run prompt loop
+                                cx.build_session_cwd()?
+                                    .block_task()
+                                    .run_until(async |mut session| {
+                                        tui2.set_state(&name, "ready");
+                                        tui2.push_text(&name, &format!("[{}] Ready ({})\n", name, api_url));
+
+                                        while let Some(text) = prompt_rx.recv().await {
+                                            session.send_prompt(&text)?;
+                                            let response = session.read_to_string().await?;
+                                            tui2.push_text(&name, &response);
+                                            tui2.push_text(&name, "\n");
+                                        }
+                                        Ok(())
+                                    })
+                                    .await
+                            })
+                            .await;
+
+                        if let Err(e) = result {
                             tui2.set_state(&name, "error");
-                            tui2.push_text(&name, &format!("[error] {}\n", e));
-                            // Keep alive so child doesn't die
-                            let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
-                            let _ = rx.await;
-                            drop(child);
-                            return Ok::<_, anyhow::Error>(());
-                        }
-                    };
-
-                    // Listen for prompts and send through ACP connection
-                    while let Some(text) = prompt_rx.recv().await {
-                        let prompt = acp::PromptRequest::new(
-                            session_id.clone(),
-                            vec![acp::ContentBlock::from(text)],
-                        );
-                        if let Err(e) = conn.prompt(prompt).await {
                             tui2.push_text(&name, &format!("[error] {}\n", e));
                         }
                     }
-
-                    drop(child);
-                    Ok::<_, anyhow::Error>(())
                 });
             }
 
