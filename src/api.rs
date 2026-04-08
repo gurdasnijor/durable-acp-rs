@@ -14,11 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
@@ -69,7 +68,6 @@ async fn ws_acp_handler(
 }
 
 async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
-    use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
     use sacp_tokio::AcpAgent;
 
     let agent = match AcpAgent::from_args(config.agent_command.clone()) {
@@ -88,39 +86,10 @@ async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
         }
     };
 
-    // Bridge WebSocket ↔ sacp::Channel (SDK message-level transport)
-    let (channel_conductor, channel_ws) = sacp::Channel::duplex();
-    let sacp::Channel { tx: to_conductor_tx, rx: mut from_conductor_rx } = channel_ws;
-    let (mut ws_write, mut ws_read) = socket.split();
+    let conductor = crate::conductor::build_conductor(app, agent);
+    let transport = crate::transport::AxumWsTransport { socket };
 
-    tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_read.next().await {
-            if let Message::Text(text) = msg {
-                if let Ok(parsed) = serde_json::from_str::<sacp::jsonrpcmsg::Message>(&text) {
-                    if to_conductor_tx.unbounded_send(Ok(parsed)).is_err() { break; }
-                }
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        use futures::SinkExt;
-        while let Some(Ok(message)) = from_conductor_rx.next().await {
-            if let Ok(json) = serde_json::to_string(&message) {
-                if ws_write.send(Message::Text(json.into())).await.is_err() { break; }
-            }
-        }
-    });
-
-    let conductor = ConductorImpl::new_agent(
-        "durable-acp".to_string(),
-        ProxiesAndAgent::new(agent)
-            .proxy(crate::durable_state_proxy::DurableStateProxy { app })
-            .proxy(crate::peer_mcp::PeerMcpProxy),
-        McpBridgeMode::default(),
-    );
-
-    if let Err(e) = conductor.run(channel_conductor).await {
+    if let Err(e) = conductor.run(transport).await {
         tracing::warn!("ACP WebSocket session ended: {}", e);
     }
 }

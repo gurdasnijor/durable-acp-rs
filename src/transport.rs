@@ -60,6 +60,37 @@ impl sacp::ConnectTo<sacp::Client> for WebSocketTransport {
     }
 }
 
+/// Server-side WebSocket transport — wraps an already-accepted axum WebSocket.
+pub struct AxumWsTransport {
+    pub socket: axum::extract::ws::WebSocket,
+}
+
+impl sacp::ConnectTo<sacp::Agent> for AxumWsTransport {
+    async fn connect_to(self, agent: impl sacp::ConnectTo<sacp::Client>) -> Result<(), sacp::Error> {
+        let (write, read) = futures::StreamExt::split(self.socket);
+
+        let outgoing = futures::SinkExt::with(
+            futures::SinkExt::sink_map_err(write, |e| std::io::Error::other(e)),
+            |s: String| async move {
+                Ok::<_, std::io::Error>(axum::extract::ws::Message::Text(s.into()))
+            },
+        );
+
+        let incoming = futures::StreamExt::filter_map(read, |msg| async move {
+            match msg {
+                Ok(axum::extract::ws::Message::Text(t)) => Some(Ok(t.to_string())),
+                Err(e) => Some(Err(std::io::Error::other(e))),
+                _ => None,
+            }
+        });
+
+        sacp::ConnectTo::<sacp::Agent>::connect_to(
+            sacp::Lines::new(outgoing, incoming),
+            agent,
+        ).await
+    }
+}
+
 /// TCP transport — wraps TCP stream as sacp::ByteStreams.
 pub struct TcpTransport {
     pub host: String,

@@ -100,23 +100,22 @@ transport = { type = "tcp", host = "10.0.0.5", port = 9000 }
 ```
 
 ```rust
-fn resolve_transport(config: &AgentConfig) -> Box<dyn ConnectTo<Client>> {
-    match &config.transport {
-        None | Some(Transport::Stdio) => {
-            // Default: spawn conductor subprocess, stdio
-            let command = resolve_command(&config);
-            Box::new(AcpAgent::from_args(command))
-        }
-        Some(Transport::Ws { url }) => {
-            // WebSocket: connect to remote conductor
-            Box::new(WebSocketTransport::new(url))
-        }
-        Some(Transport::Tcp { host, port }) => {
-            // TCP: connect to remote conductor
-            Box::new(TcpTransport::new(host, *port))
-        }
+// DynConnectTo wraps ConnectTo (which isn't dyn-compatible due to impl Trait return)
+let transport: sacp::DynConnectTo<sacp::Client> = match &config.transport {
+    None | Some(Transport::Stdio) => {
+        // Default: spawn conductor subprocess, stdio
+        let command = resolve_command(&config);
+        sacp::DynConnectTo::new(AcpAgent::from_args(command))
     }
-}
+    Some(Transport::Ws { url }) => {
+        // WebSocket: connect to remote conductor
+        sacp::DynConnectTo::new(WebSocketTransport::new(url))
+    }
+    Some(Transport::Tcp { host, port }) => {
+        // TCP: connect to remote conductor
+        sacp::DynConnectTo::new(TcpTransport::new(host, *port))
+    }
+};
 ```
 
 ### WebSocket transport — ✅ DONE (`src/transport.rs`)

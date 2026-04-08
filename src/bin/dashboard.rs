@@ -1,27 +1,20 @@
-//! Multi-agent TUI dashboard — subprocess per agent.
+//! Multi-agent TUI dashboard — ACP client per agent.
 //!
 //! Spawns each agent as a conductor subprocess, bootstraps via ACP client
-//! (Initialize + NewSession), sends prompts through ACP connection, and
-//! streams responses via SSE (read-only REST API).
-//!
-//! Doubles as a minimal integration test harness: proves a thin ACP client
-//! can wire up conductors with no in-process glue.
+//! (Initialize + NewSession), sends prompts and reads responses through ACP.
 //!
 //! Usage:
 //!   cargo run --bin dashboard
 //!   cargo run --bin dashboard -- --agent claude-acp
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::{self as acp, Agent as _};
+use agent_client_protocol::{self as acp};
 use anyhow::{Context, Result, bail};
 use clap::Parser as ClapParser;
 use iocraft::prelude::*;
 use serde::Deserialize;
-
-use durable_acp_rs::state::{ChunkRow, ChunkType};
 
 // ---------------------------------------------------------------------------
 // CLI + Config
@@ -79,7 +72,6 @@ struct TuiStateInner {
 
 struct AgentUiState {
     name: String,
-    api_url: String,
     state: String,
     output: Vec<String>,
     prompt_tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -119,84 +111,12 @@ impl TuiState {
         (agents, output)
     }
 
-    fn api_url(&self, agent_idx: usize) -> Option<String> {
-        self.inner.lock().unwrap().agents.get(agent_idx).map(|a| a.api_url.clone())
-    }
-
     fn send_prompt(&self, agent_idx: usize, text: String) {
         let inner = self.inner.lock().unwrap();
         if let Some(a) = inner.agents.get(agent_idx) {
             let _ = a.prompt_tx.send(text);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// SSE streaming helper (reads from REST, which is read-only)
-// ---------------------------------------------------------------------------
-
-async fn stream_response(http: &reqwest::Client, api_url: &str, turn_id: &str, tui: &TuiState, name: &str) {
-    let Ok(response) = http
-        .get(format!("{api_url}/api/v1/prompt-turns/{turn_id}/stream"))
-        .timeout(std::time::Duration::from_secs(120))
-        .send().await
-    else { return };
-
-    use futures::StreamExt;
-    let mut buf = String::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else { break };
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(end) = buf.find("\n\n") {
-            let event = buf[..end].to_string();
-            buf = buf[end + 2..].to_string();
-            for line in event.lines() {
-                if let Some(data) = line.strip_prefix("data:").map(str::trim) {
-                    if let Ok(ev) = serde_json::from_str::<ChunkRow>(data) {
-                        match ev.chunk_type {
-                            ChunkType::Text => tui.push_text(name, &ev.content),
-                            ChunkType::ToolCall => tui.push_text(name, &format!("\n[tool] {}\n", ev.content)),
-                            ChunkType::Thinking => tui.push_text(name, "."),
-                            ChunkType::Stop => return,
-                            ChunkType::Error => {
-                                tui.push_text(name, &format!("[error] {}\n", ev.content));
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Find the latest active/queued prompt turn for a connection via read-only API.
-async fn find_latest_turn(http: &reqwest::Client, api_url: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct TurnInfo {
-        prompt_turn_id: String,
-        state: String,
-    }
-
-    // Get connection ID first
-    let conns: Vec<serde_json::Value> = http
-        .get(format!("{api_url}/api/v1/connections"))
-        .send().await.ok()?.json().await.ok()?;
-    let conn_id = conns.first()
-        .and_then(|c| c.get("logicalConnectionId"))
-        .and_then(|v| v.as_str())?;
-
-    let turns: Vec<TurnInfo> = http
-        .get(format!("{api_url}/api/v1/connections/{conn_id}/prompt-turns"))
-        .send().await.ok()?.json().await.ok()?;
-
-    // Return the latest active or queued turn
-    turns.iter().rev()
-        .find(|t| t.state == "active" || t.state == "queued")
-        .map(|t| t.prompt_turn_id.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +300,6 @@ async fn main() -> Result<()> {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             inner.agents.push(AgentUiState {
                 name: config.name.clone(),
-                api_url: format!("http://127.0.0.1:{}", config.port + 1),
                 state: "starting".to_string(),
                 output: vec![],
                 prompt_tx: tx,
@@ -489,27 +408,14 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // Prompt callback — submits via ACP channel, streams via REST SSE
-            let http = reqwest::Client::new();
+            // Prompt callback — sends via ACP channel, response streamed by connect_with closure
             let tui_prompt = tui_clone.clone();
             let prompt_fn: Arc<dyn Fn(usize, String) + Send + Sync> = Arc::new(move |idx, text| {
                 let tui = tui_prompt.clone();
-                let http = http.clone();
                 let name = tui.inner.lock().unwrap().agents.get(idx)
                     .map(|a| a.name.clone()).unwrap_or_default();
                 tui.push_text(&name, &format!("> {}\n", text));
-                // Send prompt through ACP channel
                 tui.send_prompt(idx, text);
-                // Stream response via SSE (read-only REST endpoint)
-                let Some(api_url) = tui.api_url(idx) else { return };
-                tokio::task::spawn_local(async move {
-                    // Poll for the latest prompt turn to stream
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Some(turn_id) = find_latest_turn(&http, &api_url).await {
-                        stream_response(&http, &api_url, &turn_id, &tui, &name).await;
-                    }
-                    tui.push_text(&name, "\n");
-                });
             });
 
             let agent_count = resolved.len();
