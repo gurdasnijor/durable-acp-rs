@@ -83,43 +83,44 @@ async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
         }
     };
 
-    // Bridge WebSocket frames ↔ newline-delimited JSON lines.
-    // Each WS text message = one JSON-RPC message.
-    let (ws_write, ws_read) = socket.split();
+    // Bridge WebSocket ↔ sacp::Channel — SDK's message-level transport.
+    // Each WS text frame = one JSON-RPC message (no byte-level pipes).
+    let (channel_conductor, channel_ws) = sacp::Channel::duplex();
+    let sacp::Channel { tx: to_conductor_tx, rx: mut from_conductor_rx } = channel_ws;
+    let (mut ws_write, mut ws_read) = socket.split();
 
-    // Convert axum WebSocket to AsyncRead + AsyncWrite via a pipe
-    let (client_read, mut pipe_write) = tokio::io::duplex(64 * 1024);
-    let (mut pipe_read, client_write) = tokio::io::duplex(64 * 1024);
-
-    // WS read → pipe_write (incoming from client)
+    // WS → conductor (incoming: parse JSON-RPC from text frames)
     tokio::spawn(async move {
-        let mut ws_read = ws_read;
         while let Some(Ok(msg)) = ws_read.next().await {
             if let Message::Text(text) = msg {
-                use tokio::io::AsyncWriteExt;
-                let mut line = text.as_bytes().to_vec();
-                line.push(b'\n');
-                if pipe_write.write_all(&line).await.is_err() {
-                    break;
+                match serde_json::from_str::<sacp::jsonrpcmsg::Message>(&text) {
+                    Ok(parsed) => {
+                        if to_conductor_tx.unbounded_send(Ok(parsed)).is_err() { break; }
+                    }
+                    Err(e) => {
+                        tracing::warn!("WS parse error: {}", e);
+                    }
                 }
             }
         }
     });
 
-    // pipe_read → WS write (outgoing to client)
+    // Conductor → WS (outgoing: serialize JSON-RPC to text frames)
     tokio::spawn(async move {
         use futures::SinkExt;
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = tokio::io::BufReader::new(&mut pipe_read).lines();
-        let mut ws_write = ws_write;
-        while let Ok(Some(line)) = lines.next_line().await {
-            if ws_write.send(Message::Text(line.into())).await.is_err() {
-                break;
+        while let Some(msg) = from_conductor_rx.next().await {
+            match msg {
+                Ok(message) => {
+                    if let Ok(json) = serde_json::to_string(&message) {
+                        if ws_write.send(Message::Text(json.into())).await.is_err() { break; }
+                    }
+                }
+                Err(_) => break,
             }
         }
     });
 
-    // Build conductor using pure SDK — no wrappers
+    // Run conductor on the Channel — SDK's zero-copy message transport
     let conductor = ConductorImpl::new_agent(
         "durable-acp".to_string(),
         ProxiesAndAgent::new(agent)
@@ -128,15 +129,7 @@ async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
         McpBridgeMode::default(),
     );
 
-    // Run conductor on the piped byte streams
-    let result = conductor
-        .run(sacp::ByteStreams::new(
-            tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(client_write),
-            tokio_util::compat::TokioAsyncReadCompatExt::compat(client_read),
-        ))
-        .await;
-
-    if let Err(e) = result {
+    if let Err(e) = conductor.run(channel_conductor).await {
         tracing::warn!("ACP WebSocket session ended: {}", e);
     }
 }
