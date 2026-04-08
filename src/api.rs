@@ -40,6 +40,8 @@ pub fn router(app: Arc<ConductorState>, acp_config: Option<AcpEndpointConfig>) -
         // Filesystem access (not in the durable stream)
         .route("/api/v1/connections/{id}/files", get(get_file))
         .route("/api/v1/connections/{id}/fs/tree", get(get_tree))
+        // Agent templates (from agents.toml)
+        .route("/api/v1/agent-templates", get(get_agent_templates))
         // Peer discovery
         .route("/api/v1/registry", get(get_registry))
         // Terminal state mutation
@@ -247,4 +249,37 @@ async fn kill_terminal(
     app.write_state_event("terminal", "update", &tid, Some(&updated))
         .await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "killed": tid })))
+}
+
+// ---------------------------------------------------------------------------
+// Agent templates (from agents.toml)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentTemplateConfig {
+    name: String,
+    #[serde(default)]
+    port: u16,
+    agent: Option<String>,
+    command: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentsToml {
+    #[serde(default)]
+    agent: Vec<AgentTemplateConfig>,
+}
+
+async fn get_agent_templates(
+    State(_app): State<Arc<ConductorState>>,
+) -> Result<Json<Vec<AgentTemplateConfig>>, axum::http::StatusCode> {
+    let path = std::path::Path::new("agents.toml");
+    if !path.exists() {
+        return Ok(Json(vec![]));
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let config: AgentsToml = toml::from_str(&content)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(config.agent))
 }
