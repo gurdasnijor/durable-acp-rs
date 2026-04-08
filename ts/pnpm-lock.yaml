@@ -8,6 +8,22 @@ importers:
 
   .: {}
 
+  packages/acp-transport:
+    dependencies:
+      '@agentclientprotocol/sdk':
+        specifier: ^0.18.1
+        version: 0.18.1(zod@4.3.6)
+    devDependencies:
+      '@types/node':
+        specifier: ^24.10.0
+        version: 24.12.2
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@24.12.2)
+
   packages/durable-session:
     dependencies:
       '@durable-streams/state':
@@ -31,6 +47,11 @@ importers:
         version: 2.1.9(@types/node@24.12.2)
 
 packages:
+
+  '@agentclientprotocol/sdk@0.18.1':
+    resolution: {integrity: sha512-5TS5Jb1PuNUjadzLxV8hh2tgSsBuNXWc4XRrW3/pNe01bFH82mY/xuVQKr+vmI9swTxxPaEsm1idVIudedoCaA==}
+    peerDependencies:
+      zod: ^3.25.0 || ^4.0.0
 
   '@durable-streams/client@0.2.3':
     resolution: {integrity: sha512-609hWTqe8/OXzIFnv+oDdlT57QsCAc3F2c/nAQBcYhSLmmbXk5rHx7rnQSmk9MeGGQ8dsg9UCZf47dTJG3q3ig==}
@@ -570,6 +591,10 @@ packages:
     resolution: {integrity: sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==}
 
 snapshots:
+
+  '@agentclientprotocol/sdk@0.18.1(zod@4.3.6)':
+    dependencies:
+      zod: 4.3.6
 
   '@durable-streams/client@0.2.3':
     dependencies:

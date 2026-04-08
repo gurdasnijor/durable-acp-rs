@@ -4,12 +4,12 @@
     "module": "esnext",
     "moduleResolution": "bundler",
     "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src",
     "strict": true,
     "esModuleInterop": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "composite": true
   },
-  "references": [
-    { "path": "packages/durable-session" },
-    { "path": "packages/acp-transport" }
-  ]
+  "include": ["src"]
 }
