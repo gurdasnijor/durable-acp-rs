@@ -1,8 +1,19 @@
-# SDD: Pluggable Transports
+# SDD: Pluggable Transports — Unified ConnectTo Model
 
-> Uses sacp v11's built-in transport abstractions. No custom transport code needed.
+> All participants — dashboard, editors, Flamecast, remote clients — are
+> ACP Clients using the same `ConnectTo` abstraction. The conductor is
+> an ACP Agent. Transport is just plumbing.
 
-## What sacp v11 Already Provides
+## Principle
+
+From `index.md`: "All prompt submission goes through ACP. The REST API
+is read-only state observation + queue management."
+
+This means **every client** — dashboard TUI, Flamecast React UI, CLI,
+remote automation — connects as an ACP Client via `ConnectTo`. The
+conductor doesn't know or care which transport the client uses.
+
+## What sacp Provides
 
 Three transport types, all implementing `ConnectTo<R>`:
 
@@ -18,132 +29,200 @@ sacp::Lines::new(outgoing_sink, incoming_stream)
 ```
 
 `ConductorImpl::run(transport: impl ConnectTo<Host>)` accepts any of them.
-No conductor code changes needed for any transport.
 
-## Implementation
+## Server Side: `--listen` Flag
 
-### CLI
+The conductor (`main.rs`) currently only accepts stdio. Add `--listen`
+to also accept WebSocket connections on the REST API server:
 
 ```rust
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(long, default_value_t = 4437)]
-    port: u16,
-    /// Listen for ACP client connections instead of using stdio.
-    /// Accepts WebSocket connections on the REST API server.
     #[arg(long)]
-    listen: bool,
-    #[arg(long, default_value = "default")]
-    name: String,
-    #[arg(trailing_var_arg = true, required = true)]
-    agent_command: Vec<String>,
+    listen: bool,  // Accept WebSocket ACP clients on the API server
+    // ... existing args
 }
 ```
 
-### main.rs — two modes
+When `--listen` is set:
+- The REST API server at `:port+1` adds a `GET /acp` WebSocket route
+- A WebSocket client connects → frames bridge to `ByteStreams`
+- `conductor.run(ByteStreams::new(ws_write, ws_read))` — same conductor
 
-```rust
-let conductor = build_conductor(app, agent);
-
-if cli.listen {
-    // Network mode: accept WebSocket on the REST API server
-    // Add ws://host:{api_port}/acp endpoint
-    // When client connects, bridge WebSocket → ByteStreams → conductor
-    let (channel_client, channel_conductor) = sacp::Channel::duplex();
-
-    // Spawn WebSocket acceptor on the API server
-    tokio::spawn(accept_ws_client(api_port, channel_client));
-
-    // Run conductor on the channel
-    conductor.run(channel_conductor).await
-} else {
-    // Local mode: stdio (default, editors spawn us)
-    conductor.run(ByteStreams::new(stdout, stdin)).await
-}
-```
-
-### WebSocket endpoint (on existing API server)
-
-Add to the REST API router (already axum):
-
-```rust
-use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-
-// In api.rs router:
-.route("/acp", get(ws_acp_handler))
-
-async fn ws_acp_handler(
-    ws: WebSocketUpgrade,
-    State(channel_tx): State<mpsc::Sender<WebSocket>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(|socket| async {
-        channel_tx.send(socket).await.ok();
-    })
-}
-```
-
-The WebSocket is bridged to a `sacp::Channel` which the conductor
-consumes. ACP JSON-RPC messages flow over the WebSocket frames.
-
-### Dashboard — use Channel::duplex() instead of tokio::io::duplex
-
-```rust
-// Current (byte-level duplex, serialization overhead):
-let (client_out, conductor_in) = tokio::io::duplex(64 * 1024);
-let transport = ByteStreams::new(client_out.compat_write(), client_in.compat());
-
-// Target (message-level duplex, zero serialization):
-let (channel_client, channel_conductor) = sacp::Channel::duplex();
-// conductor uses channel_conductor
-// ClientSideConnection uses channel_client
-```
-
-## Usage
+When `--listen` is NOT set (default):
+- Stdio mode — editors spawn us, connect via stdin/stdout
+- `conductor.run(ByteStreams::new(stdout, stdin))` — same conductor
 
 ```bash
-# Local (default) — editor spawns, connects via stdio
+# Local (editor spawns, stdio)
 durable-acp-rs npx @agentclientprotocol/claude-agent-acp
 
-# Network — accepts WebSocket client on API server
+# Remote (WebSocket on API server)
 durable-acp-rs --listen --port 4437 npx @agentclientprotocol/claude-agent-acp
-# → REST API at http://host:4438/api/v1/*
-# → ACP WebSocket at ws://host:4438/acp
-# → Durable streams at http://host:4437/streams/*
+# → REST API:   http://host:4438/api/v1/*
+# → ACP WebSocket: ws://host:4438/acp
+# → Durable streams: http://host:4437/streams/*
 ```
+
+## Client Side: Dashboard as ACP Client
+
+The dashboard is an ACP Client. It should use the same `ConnectTo`
+abstraction, not custom subprocess management:
+
+```rust
+// Current (custom glue, ~30 lines per agent):
+let mut child = Command::new(&conductor_bin).stdin(piped).stdout(piped).spawn()?;
+let outgoing = child.stdin.take().unwrap().compat_write();
+let incoming = child.stdout.take().unwrap().compat();
+let (conn, handle_io) = acp::ClientSideConnection::new(client, outgoing, incoming, spawn_fn);
+
+// Target (ConnectTo, ~5 lines per agent):
+let transport = resolve_transport(&config);
+Client.builder()
+    .name(&config.name)
+    .connect_with(transport, |connection| {
+        // Initialize, create session, prompt loop — same code for all transports
+    })
+    .await
+```
+
+### Transport resolution from agents.toml
+
+```toml
+# Local agent — spawns subprocess, connects via stdio
+[[agent]]
+name = "claude-local"
+agent = "claude-acp"
+# transport = "stdio"  (default, implicit)
+
+# Remote agent — connects via WebSocket
+[[agent]]
+name = "claude-gpu"
+transport = { type = "ws", url = "ws://gpu-server:4438/acp" }
+
+# Remote agent — connects via TCP
+[[agent]]
+name = "claude-tcp"
+transport = { type = "tcp", host = "10.0.0.5", port = 9000 }
+```
+
+```rust
+fn resolve_transport(config: &AgentConfig) -> Box<dyn ConnectTo<Client>> {
+    match &config.transport {
+        None | Some(Transport::Stdio) => {
+            // Default: spawn conductor subprocess, stdio
+            let command = resolve_command(&config);
+            Box::new(AcpAgent::from_args(command))
+        }
+        Some(Transport::Ws { url }) => {
+            // WebSocket: connect to remote conductor
+            Box::new(WebSocketTransport::new(url))
+        }
+        Some(Transport::Tcp { host, port }) => {
+            // TCP: connect to remote conductor
+            Box::new(TcpTransport::new(host, *port))
+        }
+    }
+}
+```
+
+### WebSocket transport (new, ~30 lines)
+
+```rust
+struct WebSocketTransport { url: String }
+
+impl ConnectTo<Client> for WebSocketTransport {
+    async fn connect_to(self, client: impl ConnectTo<Agent>) -> Result<(), sacp::Error> {
+        let (ws, _) = tokio_tungstenite::connect_async(&self.url).await?;
+        let (write, read) = ws.split();
+        ByteStreams::new(write, read).connect_to(client).await
+    }
+}
+```
+
+### TCP transport (new, ~15 lines)
+
+```rust
+struct TcpTransport { host: String, port: u16 }
+
+impl ConnectTo<Client> for TcpTransport {
+    async fn connect_to(self, client: impl ConnectTo<Agent>) -> Result<(), sacp::Error> {
+        let stream = TcpStream::connect((self.host, self.port)).await?;
+        let (read, write) = stream.into_split();
+        ByteStreams::new(write.compat_write(), read.compat()).connect_to(client).await
+    }
+}
+```
+
+## The Full Picture
+
+```
+                    ┌─────────────────────────────────────┐
+                    │         ACP Clients                  │
+                    │  (all use ConnectTo abstraction)      │
+                    │                                     │
+                    │  Dashboard TUI    → stdio/Channel    │
+                    │  Flamecast UI     → WebSocket        │
+                    │  Editor (Zed)     → stdio            │
+                    │  Remote script    → TCP/WebSocket    │
+                    └──────────┬──────────────────────────┘
+                               │
+                    ConnectTo<Client> (any transport)
+                               │
+                    ┌──────────▼──────────────────────────┐
+                    │     ConductorImpl                    │
+                    │     (transport-agnostic)             │
+                    │                                     │
+                    │  DurableStateProxy → PeerMcpProxy   │
+                    │            → Agent subprocess        │
+                    └─────────────────────────────────────┘
+```
+
+Every client connects the same way. The conductor doesn't know if it's
+stdio, WebSocket, TCP, or in-process channels. Transport is config.
 
 ## Flamecast Integration
 
-Flamecast's runtime provider returns `websocketUrl`. With `--listen`:
+Flamecast's runtime returns `websocketUrl`. With `--listen`:
 
 ```typescript
-// Flamecast runtime provider
-const session = await runtime.startSession({
-  command: "durable-acp-rs",
-  args: ["--listen", "--port", port, "npx", "@agentclientprotocol/claude-agent-acp"],
-});
-// Returns: { websocketUrl: `ws://host:${port+1}/acp` }
+// Flamecast runtime provider spawns:
+//   durable-acp-rs --listen --port 4437 npx claude-agent-acp
+// Returns: { websocketUrl: "ws://host:4438/acp" }
 // Flamecast connects via existing WebSocket mechanism
 ```
 
 For Docker/E2B:
 ```dockerfile
-CMD ["durable-acp-rs", "--listen", "--port", "4437", "npx", "@agentclientprotocol/claude-agent-acp"]
+CMD ["durable-acp-rs", "--listen", "--port", "4437", "npx", "claude-agent-acp"]
 EXPOSE 4437 4438
+```
+
+## Dashboard Optimization: Channel::duplex()
+
+For in-process connections (dashboard spawning conductors), use
+`sacp::Channel::duplex()` instead of `tokio::io::duplex` — zero
+serialization, messages passed by value:
+
+```rust
+let (channel_client, channel_conductor) = sacp::Channel::duplex();
+// Conductor: conductor.run(channel_conductor)
+// Client: Client.builder().connect_with(channel_client, |cx| { ... })
 ```
 
 ## What Changes
 
 | File | Change |
 |---|---|
-| `src/main.rs` | Add `--listen` flag, branch on stdio vs WebSocket |
-| `src/api.rs` | Add `GET /acp` WebSocket route |
-| `Cargo.toml` | Add `axum-extra` for WebSocket support (or use axum's built-in) |
-| `src/bin/dashboard.rs` | Optional: switch from `tokio::io::duplex` to `Channel::duplex()` |
+| `src/main.rs` | Add `--listen` flag, branch on stdio vs accept-WebSocket |
+| `src/api.rs` | Add `GET /acp` WebSocket upgrade route |
+| `src/bin/dashboard.rs` | Replace custom subprocess glue with `resolve_transport()` + `ConnectTo` |
+| `agents.toml` | Add optional `transport` field |
+| New: `src/transport.rs` | `WebSocketTransport`, `TcpTransport`, `resolve_transport()` (~60 lines) |
 
 ## What Stays The Same
 
 - `ConductorImpl` — unchanged, `run(transport)` is already generic
-- `DurableStateProxy` — unchanged, doesn't know about transport
+- `DurableStateProxy` — unchanged, transport-agnostic
 - `PeerMcpProxy` — unchanged, HTTP peering is transport-independent
-- `AppState`, `StreamDB` — unchanged
-- REST API read endpoints — unchanged
+- `AppState`, `StreamDB`, REST API — unchanged
