@@ -33,65 +33,26 @@ What Flamecast cuts:
 
 The gaps below are what's needed to make this integration complete.
 
-## 1. In-Memory Storage
+## 1. In-Memory Storage — ✅ FIXED
 
-**Problem:** `EmbeddedDurableStreams` uses `InMemoryStorage`. All state
-is lost on process exit.
-
-**Fix:** Implement `Storage` trait with file-backed storage. The trait
-is already pluggable:
-
-```rust
-struct FileStorage {
-    base_dir: PathBuf,  // ~/.local/share/durable-acp/streams/
-}
-// Each stream = {base_dir}/{name}.jsonl (append-only)
-// Each record = u32 length prefix + JSON bytes
-// On startup: read + replay into StreamDB
-```
-
-**Effort:** ~0.5 day. No new deps (`std::fs`).
-
-**Files:** `src/durable_streams.rs` (add `FileStorage`), `src/app.rs` (pick backend from config)
+`FileStorage` implements the `Storage` trait with file-backed persistence.
+State survives process restart.
 
 ---
 
-## 2. API Bypasses Proxy Chain
+## 2. API Bypasses Proxy Chain — 🔄 IN PROGRESS
 
-**Problem:** `POST /connections/{id}/prompt` calls `cx.send_request_to(Agent, ...)`
-which sends directly to the agent, skipping the `DurableStateProxy` handler
-and the conductor's central `ConductorMessage` queue.
+**Problem:** `POST /connections/{id}/prompt` bypasses the proxy chain,
+sending directly to the agent instead of through `DurableStateProxy`.
 
-```
-Client (transport) → ConductorMessage queue → proxy chain → Agent  ✅
-API → cx.send_to(Agent) → Agent directly                           ❌
-```
+**Fix:** Use `session.connection()` to route prompts through the client
+side of the ACP connection, so the proxy chain fires automatically.
 
-**Fix:** Use `ActiveSession::connection()` — the SDK's paved road.
+**Challenge:** `ClientSideConnection` is `!Send`. The REST API runs on a
+multi-threaded tokio runtime. Solution: channel bridge from API → dashboard
+LocalSet thread → `session.connection()`.
 
-The dashboard bootstraps each conductor with `ClientSideConnection` and
-gets an `ActiveSession`. `session.connection()` returns the client-side
-`ConnectionTo` handle. Sending a `PromptRequest` through it enters the
-conductor from the Client side → proxy chain fires → `DurableStateProxy`
-records state automatically.
-
-```rust
-// Share the session's connection with the REST API
-let client_conn = session.connection();
-api_state.set_client_connection(Arc::new(client_conn));
-
-// api.rs submit_prompt — one call, zero manual state recording:
-conn.send_request(PromptRequest::new(session_id, text))
-    .block_task().await?;
-```
-
-No duplex transport, no AgentRouter, no manual state recording.
-
-**Delete:** `proxy_connection` from `AppState`, `capture_proxy_connection`
-from `conductor.rs`, all manual `write_state_event`/`record_chunk`/
-`finish_prompt_turn`/`session_to_prompt_turn` from `api.rs`.
-
-**Effort:** ~0.5 day.
+See [sdk-alignment.md](sdk-alignment.md) §1.5 for implementation details.
 
 **Files:** `src/api.rs`, `src/app.rs`, `src/conductor.rs`
 
@@ -117,90 +78,15 @@ conductor's `ConductorMessage` queue already serializes within a process.
 
 ---
 
-## 4. File System Access — Missing
+## 4. File System Access — ✅ FIXED
 
-**Problem:** Flamecast exposes `GET /agents/:id/files` (file preview) and
-`GET /agents/:id/fs/snapshot` (filesystem tree). We have nothing — agents
-can read/write files via their own tools, but the control plane can't
-browse the workspace.
-
-**Design:** The agent's workspace is the `cwd` passed to `NewSessionRequest`.
-We already know it. Expose read-only filesystem endpoints:
-
-```rust
-// New endpoints in api.rs
-GET /api/v1/agents/:id/files?path=src/main.rs    → file contents
-GET /api/v1/agents/:id/fs/tree                     → directory listing
-GET /api/v1/agents/:id/fs/tree?path=src            → subtree
-```
-
-Implementation is pure `std::fs` — no ACP involvement:
-
-```rust
-async fn get_file(
-    Path((agent_id, file_path)): Path<(String, String)>,
-    State(app): State<Arc<AppState>>,
-) -> Result<String, StatusCode> {
-    let cwd = get_agent_cwd(&app, &agent_id)?;
-    let full_path = cwd.join(&file_path);
-    // Validate path doesn't escape cwd
-    if !full_path.starts_with(&cwd) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    std::fs::read_to_string(full_path)
-        .map_err(|_| StatusCode::NOT_FOUND)
-}
-```
-
-**Note:** The `cwd` is available from the `NewSessionRequest` that was
-sent during session creation. Store it in `ConnectionRow` or a new
-`SessionMetadata` collection.
-
-**Effort:** ~0.5 day.
-
-**Files:** `src/api.rs` (add endpoints), `src/state.rs` (store cwd)
+File system endpoints implemented: `GET /agents/:id/files`, `GET /agents/:id/fs/tree`.
 
 ---
 
-## 5. Terminal Management — Partial
+## 5. Terminal Management — ✅ FIXED
 
-**Problem:** The `DurableStateProxy` already intercepts
-`CreateTerminalRequest`, `TerminalOutputRequest`, and records terminal
-state in the `terminals` collection. But there's no API to:
-- Create terminals from the control plane
-- Send input to terminals
-- Stream terminal output
-
-**Design:** Terminals are agent-side resources. The control plane needs to
-forward terminal operations through the ACP connection:
-
-```rust
-// New endpoints
-POST   /api/v1/agents/:id/terminals           → create terminal
-POST   /api/v1/agents/:id/terminals/:tid/input → send input
-GET    /api/v1/agents/:id/terminals/:tid/output → SSE stream output
-DELETE /api/v1/agents/:id/terminals/:tid       → kill terminal
-```
-
-For creation and input, route through the agent's ACP connection:
-
-```rust
-// Create terminal: send CreateTerminalRequest through session
-cx.send_request_to(Agent, CreateTerminalRequest::new(command, session_id))
-
-// Send input: send TerminalInputRequest through session
-cx.send_request_to(Agent, TerminalInputRequest { terminal_id, data })
-```
-
-For output streaming, the `DurableStateProxy` already records
-`TerminalOutputRequest` events. Subscribe to `CollectionChange::Terminals`
-from the `StreamDB` and dispatch via SSE (or WebSocket channel once the
-subscriber model lands).
-
-**Effort:** ~1 day. Terminal creation/input is straightforward forwarding.
-Output streaming reuses the existing SSE infrastructure.
-
-**Files:** `src/api.rs` (add endpoints), `src/conductor.rs` (expose terminal forwarding)
+Terminal CRUD endpoints implemented: create, input, output (SSE), kill.
 
 ---
 
@@ -280,16 +166,15 @@ dispatch via different transport.
 
 ## Gap Summary
 
-| Gap | Design | Effort | Depends On |
-|---|---|---|---|
-| File system access | Read-only fs endpoints + cwd tracking | ~0.5 day | — |
-| Terminal management | Forward terminal ops via ACP, stream via SSE | ~1 day | — |
-| WebSocket multiplexing | `WsSubscriber` + Flamecast channel protocol | ~1.5 days | — |
-| Webhooks | `WebhookSubscriber` + HMAC | ~0.5 day | — |
-| Runtime providers | `RuntimeProvider` trait + Docker/E2B impls | ~2-3 days/provider | Pluggable transports |
-| File-backed storage | `FileStorage` impl for durable streams | ~0.5 day | — |
-| API proxy bypass fix | Route through `AgentRouter` channel | ~0.5 day | — |
-| Single-instance drain | CAS on durable stream | ~1 day | Upstream protocol ext |
-
-**Total to close all gaps except runtime providers:** ~4.5 days
+| Gap | Status | Notes |
+|---|---|---|
+| File-backed storage | ✅ FIXED | `FileStorage` impl |
+| File system access | ✅ FIXED | Read-only fs endpoints |
+| Terminal management | ✅ FIXED | Full CRUD + SSE output |
+| Queue CRUD | ✅ FIXED | Cancel, clear, reorder endpoints |
+| API proxy bypass | 🔄 IN PROGRESS | `session.connection()` approach — see [sdk-alignment.md](sdk-alignment.md) §1.5 |
+| WebSocket multiplexing | ⏭ ELIMINATED | StreamDB subscribes via SSE — see [electric-sync-sdd.md](electric-sync-sdd.md) |
+| Webhooks | 🔜 Ready | Tiny SSE→HTTP forwarder |
+| Runtime providers | 🔜 Ready | Depends on pluggable transports (W9) |
+| Single-instance drain | Deferred | Needs upstream conditional appends |
 

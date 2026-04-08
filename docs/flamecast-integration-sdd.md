@@ -116,9 +116,9 @@ interface FlamecastStorage {
 | Agent templates | `agents.toml` + ACP registry | ✅ Working |
 | Durable state | STATE-PROTOCOL events → StreamDB | ✅ Working |
 | MCP tool injection | PeerMcpProxy via MCP-over-ACP | ✅ Working |
-| Agent-to-agent messaging | AgentRouter (in-process) + HTTP fallback | ✅ Working |
-| File system access | N/A | ❌ Missing |
-| Terminal management | Tracked in state but not exposed | ⚠️ Partial |
+| Agent-to-agent messaging | HTTP peering via PeerMcpProxy | ✅ Working |
+| File system access | `GET /agents/:id/files`, `GET /agents/:id/fs/tree` | ✅ Working |
+| Terminal management | Full CRUD + SSE output streaming | ✅ Working |
 | WebSocket multiplexing | N/A (SSE only) | ❌ Missing |
 | Runtime providers (Docker, E2B) | N/A (local subprocess only) | ❌ Missing |
 | Webhooks | N/A | ❌ Missing |
@@ -208,8 +208,8 @@ The MCP tools are injected by the `PeerMcpProxy` in the conductor's proxy
 chain. Flamecast doesn't need to know about them — they appear as native
 tools in the agent's session.
 
-For in-process routing, the `AgentRouter` handles it with zero HTTP.
-For cross-process (different Flamecast instances), the HTTP fallback works.
+Peering uses HTTP between conductor processes. For cross-instance
+(different Flamecast instances), the same HTTP mechanism works.
 
 ## TypeScript Client: `@durable-acp/client`
 
@@ -465,19 +465,15 @@ port = 9000
 |---|---|
 | `agents.toml` schema | Add `transport`, `host`, `port`, `url` fields |
 | `dashboard.rs` | Match on `Transport` enum, create appropriate `ByteStreams` |
-| `AgentRouter` | Add HTTP fallback for remote peers (already exists) |
+| `PeerMcpProxy` routing | HTTP peering already works for local and remote |
 | `PeerMcpProxy` | Already falls back to HTTP for cross-process — works for remote too |
 | Durable streams | Already HTTP — remote agents can write to shared server |
 | `ConductorImpl` | No changes — already takes generic `ByteStreams` |
 
 ### Peering across network boundaries
 
-The `prompt_agent` MCP tool already has two paths:
-
-1. **In-process** — `AgentRouter` channels (zero overhead)
-2. **HTTP fallback** — REST API + SSE (works cross-process)
-
-Path 2 works across machines with no changes — the peer registry just
+The `prompt_agent` MCP tool uses HTTP peering between conductors.
+This works across machines with no changes — the peer registry just
 needs the remote agent's API URL:
 
 ```json

@@ -1,7 +1,8 @@
-# SDD: Client Integration — StreamDB + Durable Sessions
+# SDD: Client Integration — Native StreamDB
 
 > Replaces W6/W7 with the native durable streams client stack that
-> already exists in `distributed-acp`.
+> already exists in `distributed-acp`. (Not Electric SQL — uses DS
+> server SSE + TanStack DB directly.)
 
 ## The Realization
 

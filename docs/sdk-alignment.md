@@ -1,7 +1,7 @@
 # SDD: SDK Alignment — Paved Roads First
 
-> **Status: 🔜 READY FOR EXECUTION — Phase 1 priority**
-> Total effort: ~2-3 days
+> **Status: 🔄 IN PROGRESS**
+> W2 ✅ Done, W3 ✅ Done, W4 🔄 In progress (session.connection() approach)
 
 ## Problem
 
@@ -53,7 +53,7 @@ JrHandlerChain::new()
 - `src/conductor.rs` — rewrite `DurableStateProxy` using `JrHandlerChain`
 - `Cargo.toml` — add `sacp-proxy = "3.0.0"`
 
-### 1.2 Package proxies as standalone binaries (~0.5 day)
+### 1.2 Package proxies as standalone binaries — ✅ DONE
 
 Create two new binaries that run as conductor subprocesses:
 
@@ -96,134 +96,54 @@ sacp-conductor agent \
 - `src/bin/peer-mcp-proxy.rs` — new
 - `Cargo.toml` — add `[[bin]]` entries
 
-### 1.3 Move dashboard to subprocess-per-agent (~1 day)
+### 1.3 Move dashboard to subprocess-per-agent — ✅ DONE
 
-**Current:** Dashboard spawns N `ConductorImpl` instances in-process
-on one `LocalSet` with `Arc<Mutex<TuiState>>`, `AgentRouter`, bridge
-tasks, tick timer (~794 lines).
+Dashboard spawns conductor subprocesses and communicates via
+REST API + SSE (531 lines). Removed in-process `ConductorImpl`,
+`AgentRouter`, `LocalSet` wiring. Deleted `src/agent_router.rs`.
 
-**Target:** Dashboard spawns N conductor subprocesses and talks to their
-REST APIs (~200 lines):
+### 1.4 Clean up stale code — ✅ DONE
 
-```rust
-// Spawn conductor subprocess per agent
-for config in agents {
-    let child = Command::new("sacp-conductor")
-        .args(["agent",
-            &format!("durable-state-proxy --stream-url {}", stream_url),
-            "peer-mcp-proxy",
-            &config.command.join(" "),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+These have been deleted:
+- `src/agent_router.rs` — replaced by HTTP peering
+- `src/bin/chat.rs` — removed
+- `src/bin/run.rs` — removed
+- `src/bin/peer.rs` — removed
+- `AgentRouter`, `TuiState`, `HeadlessClient` — removed from dashboard
 
-    // Register in peer registry
-    registry::register(AgentEntry { name, api_url, ... });
-}
+### 1.5 API Bypass Fix — 🔄 IN PROGRESS (session.connection() approach)
 
-// TUI polls REST API for state, submits prompts via HTTP
-element!(Dashboard(agents: agent_configs)).fullscreen().await
-```
+**Problem:** `POST /connections/{id}/prompt` bypasses the proxy chain.
 
-The TUI component becomes a pure REST client:
-- `GET /connections` → agent status
-- `POST /connections/{id}/prompt` → send prompt
-- `GET /prompt-turns/{id}/stream` → SSE stream response
-- `GET /registry` → peer list
-
-No `LocalSet`, no `Arc<Mutex>`, no channels, no `AgentRouter`.
-
-**Files:**
-- `src/bin/dashboard.rs` — rewrite (~200 lines)
-- Delete `src/agent_router.rs`
-- `src/lib.rs` — remove `pub mod agent_router`
-
-### 1.4 Clean up stale code
-
-After 1.1-1.3, these are deletable:
-
-| File/Code | Reason |
-|---|---|
-| `src/agent_router.rs` | Replaced by HTTP peering |
-| `AgentRouter` global `OnceLock` | No in-process routing |
-| `HeadlessClient` in dashboard | No in-process ACP client |
-| `TuiState` with `Arc<Mutex>` | TUI reads REST API directly |
-| `run_agent()` function | Replaced by subprocess spawn |
-| `Output` enum, `AgentHandle` struct | Dead code |
-| `run.rs` v0 `ClientSideConnection` usage | Use subprocess model |
-
-### 1.5 Remove manual JSON deserialization workaround
-
-Both `chat.rs` and `dashboard.rs` manually deserialize `SessionNotification`
-via `serde_json::from_value` to skip unknown variants. With
-`unstable_session_usage` enabled, test whether `MatchDispatch::if_notification`
-works directly. If yes, remove the workaround (~30 lines per file).
-
-### Impact on other files
-
-**`src/app.rs` (~284 lines → ~240)**
-- Delete `proxy_connection: Arc<Mutex<Option<ConnectionTo<Conductor>>>>` — no API bypass
-- Delete `set_proxy_connection()` — no longer called
-- Delete `set_next_prompt_turn_id()` — no pre-generation needed
-- Core stays: `enqueue_prompt`, `record_chunk`, `finish_prompt_turn`, `write_state_event`, queue management
-
-**`src/api.rs` (~315 lines → ~150)**
-- `submit_prompt` drops from 63 to ~10 lines — no manual state recording
-- `cancel_turn` simplifies — no `proxy_connection`
-- Delete all `proxy_connection` usage and manual state recording
-- Simple read endpoints stay unchanged
-
-**How the API bypass is fixed:**
-
-The conductor presents as a normal ACP Agent. The REST API should send
-prompts through the ACP Client's connection — not bypass the chain.
-
-`ActiveSession::connection()` returns `ConnectionTo<Link>` — the client's
-handle to the conductor. Sending a `PromptRequest` through it enters from
-the Client side → conductor routes through the proxy chain → `DurableStateProxy`
+**Fix:** Use `session.connection()` — the SDK's paved road. The
+`ClientSideConnection` owns the session. `session.connection()` returns
+the client-side `ConnectionTo` handle. Sending a `PromptRequest` through
+it enters from the Client side → proxy chain fires → `DurableStateProxy`
 records state automatically.
 
-The dashboard already has this session (via `ClientSideConnection` bootstrap).
-Share the connection with the REST API:
+**Challenge:** `ClientSideConnection` is `!Send`, so it can't be shared
+directly with the REST API (which runs on a multi-threaded tokio runtime).
+The fix uses a channel bridge: the dashboard spawns a task on the
+`LocalSet` that holds the connection and receives prompt requests from
+the API via an `mpsc` channel.
 
 ```rust
-// In dashboard.rs, after bootstrapping:
-let session = conn.new_session(...).await?;
-let client_conn = session.connection();  // ConnectionTo — client-side handle
+// Channel bridge: API → dashboard LocalSet → session.connection()
+let (prompt_tx, prompt_rx) = mpsc::channel(32);
+api_state.set_prompt_sender(prompt_tx);
 
-// Share with REST API via Arc
-api_state.set_client_connection(Arc::new(client_conn));
-
-// In api.rs submit_prompt:
-async fn submit_prompt(...) {
-    let conn = app.client_connection();
-    conn.send_request(PromptRequest::new(session_id, text))
+// On LocalSet thread:
+while let Some(req) = prompt_rx.recv().await {
+    session.connection()
+        .send_request(PromptRequest::new(req.session_id, req.text))
         .block_task().await?;
-    // That's it. Enters from Client side → proxy chain → agent
-    // DurableStateProxy records PromptTurnRow, chunks, stop — automatically
 }
 ```
-
-No duplex, no second conductor, no manual state recording. One line:
-`session.connection()` — the paved road from the SDK.
 
 **Delete after this fix:**
 - `proxy_connection` from `AppState`
 - `capture_proxy_connection` from `conductor.rs`
-- All manual state recording from `api.rs` (`write_state_event`,
-  `record_chunk`, `finish_prompt_turn`, `session_to_prompt_turn`)
-
-**Standalone `main.rs` case:** The external client (editor) owns the
-session. The REST API shouldn't submit prompts — the editor does. The
-REST API remains read-only (connections, chunks, queue, registry) in
-standalone mode. Prompt submission is only available when a client
-(dashboard) provides the session connection.
-
-**`src/peer_mcp.rs` (~230 lines → merged into proxy config)**
-- `McpServiceRegistry` + `McpTool` impls replace manual `ConnectTo<Conductor>` + `McpServer::builder()`
-- `call_peer` HTTP helper stays (used for cross-process peering)
+- All manual state recording from `api.rs`
 
 ## Verification
 

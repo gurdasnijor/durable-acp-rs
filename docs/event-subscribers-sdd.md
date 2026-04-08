@@ -1,6 +1,8 @@
 # SDD: Unified Event Subscribers — WebSocket + Webhooks
 
-> **Status: 🔜 READY FOR EXECUTION**
+> **Status: ⏭ SUPERSEDED by [electric-sync-sdd.md](electric-sync-sdd.md).**
+> The `@durable-acp/state` StreamDB package already provides reactive
+> TypeScript collections. Custom Rust subscribers (W7/W7a/W7c) are eliminated.
 > - Implements [multi-session WebSocket RFC](https://flamecast.mintlify.app/rfcs/multi-session-websocket)
 > - Implements [webhooks RFC](https://flamecast.mintlify.app/rfcs/webhooks)
 > - Estimated: ~2-3 days total
