@@ -211,7 +211,7 @@ export function useSession(options?: UseSessionOptions): SessionState {
         if (disposed) { stream.close(); return; }
 
         const cwd = optionsRef.current?.cwd ?? "/";
-        const sessionResponse = await conn.newSession({ cwd } as any);
+        const sessionResponse = await conn.newSession({ cwd, mcpServers: [] } as any);
 
         if (disposed) { stream.close(); return; }
 
