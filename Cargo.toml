@@ -62,3 +62,7 @@ path = "src/bin/durable-state-proxy.rs"
 name = "peer-mcp-proxy"
 path = "src/bin/peer-mcp-proxy.rs"
 
+[[bin]]
+name = "testy"
+path = "src/bin/testy.rs"
+
