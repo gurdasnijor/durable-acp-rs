@@ -233,34 +233,84 @@ Nothing code-wise — durable-acp-rs is already complete for this integration.
 W10 (Docker/E2B runtime providers) accelerates Phase 1 but isn't blocking:
 the Dockerfile from `deployment-sdd.md` works today.
 
-## Prompt/Control: ACP Client over `/acp` WebSocket
+## TypeScript Client Architecture: Two Independent Primitives
 
-Per architecture principle: **all prompt submission goes through ACP**.
-No REST bypass of the conductor's proxy chain.
+The TypeScript integration is built from two completely decoupled concerns:
 
-`DurableACPClient` connects to `ws://host:port+1/acp` as a standard ACP
-client using the official TypeScript SDK
-([`@agentclientprotocol/sdk`](https://www.npmjs.com/package/@agentclientprotocol/sdk)).
-Same protocol the Rust dashboard uses via `Client.builder().connect_with()`.
-One WebSocket, one protocol. The conductor handles sessions, proxy chain,
-streaming, permissions — all through standard ACP:
+### Primitive 1: ACP Client (`@agentclientprotocol/sdk`)
+
+Standard ACP protocol client, transport-agnostic. Knows nothing about durability.
+
+- Connect, initialize, sessions, prompt, cancel, permissions
+- Transport: WebSocket (`/acp`), stdio, TCP — any `ConnectTo` equivalent
+- Same protocol the Rust dashboard uses via `Client.builder().connect_with()`
+- All prompt submission goes through ACP (architecture principle — no REST bypass)
 
 ```typescript
-// DurableACPClient connects as an ACP client
-const client = new DurableACPClient({
-  acpUrl: "ws://host:4438/acp",           // ACP client connection
-  stateStreamUrl: "http://host:4437/...",  // state observation (SSE)
-});
+import { Client } from "@agentclientprotocol/sdk";
 
-// All operations go through ACP protocol over the single connection:
-await client.prompt("hello");              // → ACP PromptRequest
-await client.cancel();                     // → ACP cancellation
-await client.resolvePermission(id, opt);   // → ACP RequestPermissionResponse
-// Streaming updates arrive as ACP SessionNotifications
-
-// Queue management stays REST (no proxy chain needed):
-await client.pause();                      // → POST /queue/pause
-await client.resume();                     // → POST /queue/resume
+const client = new Client({ transport: new WebSocketTransport("ws://host:4438/acp") });
+await client.initialize();
+const session = await client.newSession({ cwd: "/workspace" });
+await session.prompt("hello");
+await session.cancel();
 ```
 
-**State observation** stays as durable stream SSE (unchanged).
+### Primitive 2: Durable State Client (`@durable-acp/state`)
+
+Subscribes to the durable stream via SSE. Materializes state into reactive
+TanStack DB collections. Read-only — no commands, no protocol awareness.
+Pattern follows [`durable-session`](https://github.com/electric-sql/transport/blob/main/packages/durable-session/src/client.ts).
+
+- Declarative queries over materialized durable state
+- Listeners on collections (chunks, turns, permissions, terminals)
+- Derived collections: `queuedTurns`, `activeTurns`, `pendingPermissions`
+
+```typescript
+import { createDurableACPDB } from "@durable-acp/state";
+
+const db = createDurableACPDB({ stateStreamUrl: "http://host:4437/streams/durable-acp-state" });
+await db.preload();
+
+db.collections.chunks          // Collection<ChunkRow> — reactive
+db.collections.promptTurns     // Collection<PromptTurnRow> — reactive
+db.collections.permissions     // Collection<PermissionRow> — reactive
+// Derived:
+queuedTurns, activeTurns, pendingPermissions
+```
+
+### These never reference each other
+
+| Use case | Primitive 1 (ACP) | Primitive 2 (State) |
+|---|---|---|
+| Monitoring dashboard | — | ✅ |
+| Headless script | ✅ | — |
+| Flamecast React UI | ✅ | ✅ |
+| Slackbot | ✅ | — (uses webhooks) |
+
+### `DurableACPClient` — convenience composition
+
+`DurableACPClient` (`@durable-acp/client`) is not a third primitive. It
+composes one ACP client + one durable state client into a single interface
+for consumers that need both (e.g., Flamecast UI):
+
+```typescript
+const client = new DurableACPClient({
+  acpUrl: "ws://host:4438/acp",
+  stateStreamUrl: "http://host:4437/streams/durable-acp-state",
+});
+
+// Commands (through ACP client — goes through conductor proxy chain):
+await client.prompt("hello");
+await client.cancel();
+await client.resolvePermission(id, opt);
+
+// Queue management (REST — no proxy chain needed):
+await client.pause();
+await client.resume();
+
+// Reactive state (from durable stream SSE — materialized collections):
+client.collections.chunks
+client.collections.promptTurns
+client.onChunkChanges((changes) => { ... });
+```
