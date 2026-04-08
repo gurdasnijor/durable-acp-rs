@@ -78,7 +78,7 @@ conductor framework + [durable streams](https://github.com/durable-streams/durab
 | W1 | sacp-proxy migration | ⛔ BLOCKED | `sacp-proxy` 3.0.0 depends on `sacp` 2.0.0; we're on 11.0.0. Wait for upstream. |
 | W2 | Standalone proxy binaries | ✅ Done | [sdk-alignment.md](sdk-alignment.md) §1.2 |
 | W3 | Dashboard → subprocess model | ✅ Done | [sdk-alignment.md](sdk-alignment.md) §1.3 |
-| W4 | API → read-only (remove prompt bypass) | 🔄 In progress | Remove `submit_prompt`/`cancel_turn` — prompts go through ACP only. See [api-architecture-sdd.md](api-architecture-sdd.md) |
+| W4 | API → read-only (remove prompt bypass) | ✅ Done | REST is read-only; `submit_prompt`/`cancel_turn` removed. See [api-architecture-sdd.md](api-architecture-sdd.md) |
 | W5 | Conductor config support | 🔜 Ready | Depends on W2 (done) |
 | W6 | File-backed storage | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §1 |
 | W7 | ~~EventSubscriber trait~~ | ⏭ ELIMINATED | StreamDB IS the subscriber — see [electric-sync-sdd.md](electric-sync-sdd.md) |
@@ -91,10 +91,10 @@ conductor framework + [durable streams](https://github.com/durable-streams/durab
 | W11 | File system access API | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §4 |
 | W12 | Terminal management API | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §5 |
 | — | Queue CRUD (cancel, clear, reorder) | ✅ Done | REST endpoints for queue management |
+| — | Proxy extraction | ✅ Done | conductor.rs 278→27 lines; proxy logic → durable_state_proxy.rs (287 lines) |
 
 ### Remaining Work
 
-- **W4** (in progress) — remove REST prompt/cancel endpoints, make API read-only. See [api-architecture-sdd.md](api-architecture-sdd.md).
 - **W5** — conductor config support (`sacp-conductor --config`)
 - **W7b** — webhook forwarder (SSE→HTTP, ~50 lines)
 - **W9** — pluggable transports (TCP/WS for remote agents)
@@ -141,8 +141,8 @@ Flamecast reads from durable stream (replaces FlamecastStorage):
 
 | Doc | Status | What It Covers |
 |---|---|---|
-| [api-architecture-sdd.md](api-architecture-sdd.md) | 🔄 In progress | REST API is read-only. Prompt submission through ACP only. |
-| [sdk-alignment.md](sdk-alignment.md) | 🔄 W4 in progress | Standalone binaries ✅, subprocess model ✅, API fix 🔄 |
+| [api-architecture-sdd.md](api-architecture-sdd.md) | ✅ Done | REST API is read-only. Prompt submission through ACP only. |
+| [sdk-alignment.md](sdk-alignment.md) | ✅ Done | Standalone binaries ✅, subprocess model ✅, API read-only ✅ |
 | [schema-compatibility.md](schema-compatibility.md) | ✅ Done | Rust ↔ TypeScript schema verified compatible |
 | [known-limitations-sdd.md](known-limitations-sdd.md) | 🔄 Mostly done | Storage ✅, filesystem ✅, terminals ✅, runtime providers 🔜 |
 | [electric-sync-sdd.md](electric-sync-sdd.md) | ✅ Design done | Native StreamDB — TS client already exists |
@@ -163,14 +163,15 @@ Flamecast reads from durable stream (replaces FlamecastStorage):
 ```
 src/
   main.rs              Conductor CLI (editor integration)
-  conductor.rs         DurableStateProxy + wiring (278 lines)
+  conductor.rs         Pure composition — wires proxies + agent (27 lines)
+  durable_state_proxy.rs  DurableStateProxy — intercepts ACP → persists to stream (287 lines)
   peer_mcp.rs          PeerMcpProxy — list_agents, prompt_agent (172 lines)
   acp_registry.rs      ACP registry CDN client
   registry.rs          Local peer registry
-  app.rs               AppState, queue, chunk recording (328 lines)
+  app.rs               AppState, queue, chunk recording (318 lines)
   state.rs             StreamDB, collections, STATE-PROTOCOL
   durable_streams.rs   Embedded durable streams server
-  api.rs               REST API — axum (508 lines)
+  api.rs               REST API — axum, read-only (400 lines)
   bin/
     dashboard.rs       Fullscreen TUI dashboard (531 lines)
     agents.rs          Config manager + registry picker
