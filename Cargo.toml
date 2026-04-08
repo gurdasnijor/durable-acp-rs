@@ -39,6 +39,8 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+agent-client-protocol-test = { git = "https://github.com/agentclientprotocol/rust-sdk" }
+yopo = { git = "https://github.com/agentclientprotocol/rust-sdk", package = "agent-client-protocol-yopo" }
 
 [[bin]]
 name = "durable-acp-rs"

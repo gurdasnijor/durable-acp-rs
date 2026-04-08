@@ -1,7 +1,7 @@
-//! Multi-agent TUI dashboard — ACP client per agent.
+//! Multi-agent TUI dashboard — thin TUI over `DurableAcpClient`.
 //!
-//! Spawns each agent as a conductor subprocess, bootstraps via ACP client
-//! (Initialize + NewSession), sends prompts and reads responses through ACP.
+//! The ACP client lifecycle (connect, init, session, prompt loop) lives
+//! in `src/client.rs`. This binary is just the TUI + orchestration.
 //!
 //! Usage:
 //!   cargo run --bin dashboard
@@ -10,11 +10,12 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::{self as acp};
 use anyhow::{Context, Result, bail};
 use clap::Parser as ClapParser;
 use iocraft::prelude::*;
 use serde::Deserialize;
+
+use durable_acp_rs::client::{self, AcpClientHandler};
 
 // ---------------------------------------------------------------------------
 // CLI + Config
@@ -74,7 +75,6 @@ struct AgentUiState {
     name: String,
     state: String,
     output: Vec<String>,
-    prompt_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 impl TuiState {
@@ -111,11 +111,30 @@ impl TuiState {
         (agents, output)
     }
 
-    fn send_prompt(&self, agent_idx: usize, text: String) {
-        let inner = self.inner.lock().unwrap();
-        if let Some(a) = inner.agents.get(agent_idx) {
-            let _ = a.prompt_tx.send(text);
-        }
+}
+
+// ---------------------------------------------------------------------------
+// AcpClientHandler impl — bridges ACP events to TuiState
+// ---------------------------------------------------------------------------
+
+struct TuiHandler {
+    tui: TuiState,
+}
+
+impl AcpClientHandler for TuiHandler {
+    fn on_ready(&self, name: &str) {
+        self.tui.set_state(name, "ready");
+        self.tui.push_text(name, &format!("[{name}] Ready\n"));
+    }
+
+    fn on_text(&self, name: &str, text: &str) {
+        self.tui.push_text(name, text);
+        self.tui.push_text(name, "\n");
+    }
+
+    fn on_error(&self, name: &str, error: &str) {
+        self.tui.set_state(name, "error");
+        self.tui.push_text(name, &format!("[error] {error}\n"));
     }
 }
 
@@ -291,37 +310,33 @@ async fn main() -> Result<()> {
         bail!("Conductor binary not found at {}. Run `cargo build` first.", conductor_bin.display());
     }
 
-    // TUI state — create a prompt channel per agent
+    // TUI state
     let tui = TuiState::default();
-    let mut prompt_receivers: Vec<tokio::sync::mpsc::UnboundedReceiver<String>> = Vec::new();
     {
         let mut inner = tui.inner.lock().unwrap();
         for (config, _) in &resolved {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             inner.agents.push(AgentUiState {
                 name: config.name.clone(),
                 state: "starting".to_string(),
                 output: vec![],
-                prompt_tx: tx,
             });
-            prompt_receivers.push(rx);
         }
     }
 
-    // LocalSet needed for ClientSideConnection (!Send futures)
+    // LocalSet needed — ACP client futures are !Send with stdio transport
     let local = tokio::task::LocalSet::new();
     let tui_clone = tui.clone();
     let agents_ref = agents.clone();
 
     local
         .run_until(async move {
-            // Connect to each agent — transport resolved from config
-            for ((config, command), mut prompt_rx) in resolved.iter().zip(prompt_receivers) {
-                let name = config.name.clone();
-                let api_url = format!("http://127.0.0.1:{}", config.port + 1);
-                let tui2 = tui_clone.clone();
+            // Spawn an ACP client per agent — collect handles for prompt submission
+            let mut handles: Vec<client::AcpClientHandle> = Vec::new();
 
-                // Resolve transport from agents.toml config using SDK's DynConnectTo
+            for (config, command) in &resolved {
+                let name = config.name.clone();
+
+                // Resolve transport from agents.toml config
                 use durable_acp_rs::transport::{TransportConfig, WebSocketTransport, TcpTransport};
                 let transport: sacp::DynConnectTo<sacp::Client> = match &config.transport {
                     Some(TransportConfig::Ws { url }) => {
@@ -331,7 +346,6 @@ async fn main() -> Result<()> {
                         sacp::DynConnectTo::new(TcpTransport { host: host.clone(), port: *port })
                     }
                     None | Some(TransportConfig::Stdio) => {
-                        // Default: spawn conductor subprocess
                         let mut conductor_args = vec![
                             "--name".to_string(), config.name.clone(),
                             "--port".to_string(), config.port.to_string(),
@@ -348,75 +362,33 @@ async fn main() -> Result<()> {
                 // Register in peer registry
                 let _ = durable_acp_rs::registry::register(durable_acp_rs::registry::AgentEntry {
                     name: config.name.clone(),
-                    api_url: api_url.clone(),
+                    api_url: format!("http://127.0.0.1:{}", config.port + 1),
                     logical_connection_id: uuid::Uuid::new_v4().to_string(),
                     registered_at: durable_acp_rs::app::now_ms(),
                 });
 
-                // Connect as ACP client using SDK primitives
-                tokio::task::spawn_local({
-                    let name = name.clone();
-                    let tui2 = tui2.clone();
-                    async move {
-                        let result = sacp::Client
-                            .builder()
-                            .name(&format!("{}-client", name))
-                            .on_receive_request(
-                                async |req: acp::RequestPermissionRequest, responder, _cx| {
-                                    // Auto-approve permissions
-                                    let outcome = if let Some(opt) = req.options.first() {
-                                        acp::RequestPermissionOutcome::Selected(
-                                            acp::SelectedPermissionOutcome::new(opt.option_id.clone()),
-                                        )
-                                    } else {
-                                        acp::RequestPermissionOutcome::Cancelled
-                                    };
-                                    responder.respond(acp::RequestPermissionResponse::new(outcome))
-                                },
-                                sacp::on_receive_request!(),
-                            )
-                            .connect_with(transport, async |cx| {
-                                // Initialize
-                                cx.send_request(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
-                                    .block_task()
-                                    .await?;
-
-                                // Create session and run prompt loop
-                                cx.build_session_cwd()?
-                                    .block_task()
-                                    .run_until(async |mut session| {
-                                        tui2.set_state(&name, "ready");
-                                        tui2.push_text(&name, &format!("[{}] Ready ({})\n", name, api_url));
-
-                                        while let Some(text) = prompt_rx.recv().await {
-                                            session.send_prompt(&text)?;
-                                            let response = session.read_to_string().await?;
-                                            tui2.push_text(&name, &response);
-                                            tui2.push_text(&name, "\n");
-                                        }
-                                        Ok(())
-                                    })
-                                    .await
-                            })
-                            .await;
-
-                        if let Err(e) = result {
-                            tui2.set_state(&name, "error");
-                            tui2.push_text(&name, &format!("[error] {}\n", e));
-                        }
-                    }
-                });
+                let handler = Arc::new(TuiHandler { tui: tui_clone.clone() });
+                let handle = client::spawn_acp_client(
+                    client::AcpClientConfig { name, transport },
+                    handler,
+                );
+                handles.push(handle);
             }
 
-            // Prompt callback — sends via ACP channel, response streamed by connect_with closure
-            let tui_prompt = tui_clone.clone();
-            let prompt_fn: Arc<dyn Fn(usize, String) + Send + Sync> = Arc::new(move |idx, text| {
-                let tui = tui_prompt.clone();
-                let name = tui.inner.lock().unwrap().agents.get(idx)
-                    .map(|a| a.name.clone()).unwrap_or_default();
-                tui.push_text(&name, &format!("> {}\n", text));
-                tui.send_prompt(idx, text);
-            });
+            // Prompt callback — sends to the ACP client via its handle
+            let prompt_fn: Arc<dyn Fn(usize, String) + Send + Sync> = {
+                let tui = tui_clone.clone();
+                // Move handles into a shared ref for the callback
+                let handles = Arc::new(handles);
+                Arc::new(move |idx, text| {
+                    let name = tui.inner.lock().unwrap().agents.get(idx)
+                        .map(|a| a.name.clone()).unwrap_or_default();
+                    tui.push_text(&name, &format!("> {}\n", text));
+                    if let Some(h) = handles.get(idx) {
+                        let _ = h.prompt_tx.send(text);
+                    }
+                })
+            };
 
             let agent_count = resolved.len();
             element!(Dashboard(tui: tui_clone, agent_count: agent_count, prompt_fn: prompt_fn))

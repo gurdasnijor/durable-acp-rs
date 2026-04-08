@@ -288,6 +288,14 @@ queuedTurns, activeTurns, pendingPermissions
 | Flamecast React UI | ✅ | ✅ |
 | Slackbot | ✅ | — (uses webhooks) |
 
+### Rust reference: `src/client.rs`
+
+The same decoupling exists on the Rust side. `src/client.rs` is a reusable
+ACP client decoupled from any UI — transport-agnostic (`DynConnectTo`),
+events via `AcpClientHandler` trait, prompts via channel. The TUI dashboard
+imports it instead of inlining ACP lifecycle code. This is the Rust analog
+of the TypeScript ACP client primitive.
+
 ### `DurableACPClient` — convenience composition
 
 `DurableACPClient` (`@durable-acp/client`) is not a third primitive. It

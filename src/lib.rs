@@ -1,6 +1,7 @@
 pub mod acp_registry;
 pub mod api;
 pub mod app;
+pub mod client;
 pub mod conductor;
 pub mod durable_state_proxy;
 pub mod durable_streams;
