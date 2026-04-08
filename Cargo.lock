@@ -5,8 +5,7 @@ version = 4
 [[package]]
 name = "agent-client-protocol"
 version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10eeef5e80864f9c3c148a3f395c3e35a66d37ec7561c7845b2bffae8e841759"
+source = "git+https://github.com/agentclientprotocol/rust-sdk#ec9ceae869b240643ce73bca1b9daf7c266c116b"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -17,6 +16,72 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "agent-client-protocol-conductor"
+version = "0.1.0"
+source = "git+https://github.com/agentclientprotocol/rust-sdk#ec9ceae869b240643ce73bca1b9daf7c266c116b"
+dependencies = [
+ "agent-client-protocol-core",
+ "agent-client-protocol-schema",
+ "agent-client-protocol-tokio",
+ "agent-client-protocol-trace-viewer",
+ "anyhow",
+ "async-stream",
+ "axum",
+ "chrono",
+ "clap",
+ "futures",
+ "futures-concurrency",
+ "hyper",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "strip-ansi-escapes",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "agent-client-protocol-core"
+version = "0.1.0"
+source = "git+https://github.com/agentclientprotocol/rust-sdk#ec9ceae869b240643ce73bca1b9daf7c266c116b"
+dependencies = [
+ "agent-client-protocol-derive",
+ "agent-client-protocol-schema",
+ "anyhow",
+ "boxfnonce",
+ "futures",
+ "futures-concurrency",
+ "jsonrpcmsg",
+ "rmcp",
+ "rustc-hash",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agent-client-protocol-derive"
+version = "0.1.0"
+source = "git+https://github.com/agentclientprotocol/rust-sdk#ec9ceae869b240643ce73bca1b9daf7c266c116b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -31,6 +96,36 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
+]
+
+[[package]]
+name = "agent-client-protocol-tokio"
+version = "0.1.0"
+source = "git+https://github.com/agentclientprotocol/rust-sdk#ec9ceae869b240643ce73bca1b9daf7c266c116b"
+dependencies = [
+ "agent-client-protocol-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "agent-client-protocol-trace-viewer"
+version = "0.1.0"
+source = "git+https://github.com/agentclientprotocol/rust-sdk#ec9ceae869b240643ce73bca1b9daf7c266c116b"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "open",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http",
 ]
 
 [[package]]
@@ -212,45 +307,11 @@ dependencies = [
 
 [[package]]
 name = "axum"
-version = "0.7.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
-dependencies = [
- "async-trait",
- "axum-core 0.4.5",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "itoa",
- "matchit 0.7.3",
- "memchr",
- "mime",
- "percent-encoding",
- "pin-project-lite",
- "rustversion",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tower",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
-name = "axum"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
 dependencies = [
- "axum-core 0.5.6",
+ "axum-core",
  "axum-macros",
  "bytes",
  "form_urlencoded",
@@ -261,7 +322,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itoa",
- "matchit 0.8.4",
+ "matchit",
  "memchr",
  "mime",
  "percent-encoding",
@@ -273,27 +334,6 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tower",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
-name = "axum-core"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09f2bd6146b97ae3359fa0cc6d6b376d9539582c7b4220f041a33ec24c226199"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "mime",
- "pin-project-lite",
- "rustversion",
- "sync_wrapper",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -704,10 +744,13 @@ name = "durable-acp-rs"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "agent-client-protocol-conductor",
+ "agent-client-protocol-core",
+ "agent-client-protocol-tokio",
  "anyhow",
  "async-stream",
  "async-trait",
- "axum 0.8.8",
+ "axum",
  "bytes",
  "clap",
  "dirs",
@@ -716,9 +759,6 @@ dependencies = [
  "hmac",
  "iocraft",
  "reqwest",
- "sacp",
- "sacp-conductor",
- "sacp-tokio",
  "schemars",
  "serde",
  "serde_json",
@@ -742,7 +782,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1bed9b775163604f89094a08f22457bc7725608a3aae5e4009ae3b20171b981"
 dependencies = [
  "async-stream",
- "axum 0.8.8",
+ "axum",
  "axum-server",
  "base64",
  "bytes",
@@ -1552,12 +1592,6 @@ dependencies = [
 
 [[package]]
 name = "matchit"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
-
-[[package]]
-name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
@@ -2102,107 +2136,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "sacp"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c55e83008bb3aec4bc1348bf1a58dc5d42381ee704697dccb5c59553dce0fc"
-dependencies = [
- "agent-client-protocol-schema",
- "anyhow",
- "boxfnonce",
- "futures",
- "futures-concurrency",
- "jsonrpcmsg",
- "rmcp",
- "rustc-hash",
- "sacp-derive",
- "schemars",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "sacp-conductor"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3eec9bf599a37ce786487a4b79af3c584f921f80a19d481cf711de1314642f2"
-dependencies = [
- "agent-client-protocol-schema",
- "anyhow",
- "async-stream",
- "axum 0.7.9",
- "chrono",
- "clap",
- "futures",
- "futures-concurrency",
- "hyper",
- "rustc-hash",
- "sacp",
- "sacp-tokio",
- "sacp-trace-viewer",
- "serde",
- "serde_json",
- "shell-words",
- "strip-ansi-escapes",
- "thiserror",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "sacp-derive"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab42f7ccff8ab957cb7eaee9727cfca1ba38ea390178cb3d1cdfc1ddbce1ddd8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "sacp-tokio"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04362ee58a350a1405b5a17544f9e18430d474f7edceb0b1d5794c3058352d00"
-dependencies = [
- "futures",
- "sacp",
- "serde",
- "serde_json",
- "shell-words",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "sacp-trace-viewer"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40b5f72a9be6fe42a7892f35021fb2a9e00956ae468e7756de75cc41d1ceacd6"
-dependencies = [
- "anyhow",
- "axum 0.7.9",
- "clap",
- "open",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tower-http",
-]
 
 [[package]]
 name = "schemars"
