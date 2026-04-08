@@ -46,6 +46,25 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@24.12.2)
 
+  packages/server:
+    dependencies:
+      '@durable-acp/transport':
+        specifier: workspace:*
+        version: link:../acp-transport
+      durable-session:
+        specifier: workspace:*
+        version: link:../durable-session
+    devDependencies:
+      '@types/node':
+        specifier: ^24.10.0
+        version: 24.12.2
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@24.12.2)
+
 packages:
 
   '@agentclientprotocol/sdk@0.18.1':

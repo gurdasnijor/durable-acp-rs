@@ -1,0 +1,33 @@
+{
+  "name": "@durable-acp/server",
+  "version": "0.1.0",
+  "description": "Durable ACP conductor server — spawn and connect to agents with one import.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@durable-acp/transport": "workspace:*",
+    "durable-session": "workspace:*"
+  },
+  "optionalDependencies": {
+    "@durable-acp/server-darwin-arm64": "0.1.0",
+    "@durable-acp/server-darwin-x64": "0.1.0",
+    "@durable-acp/server-linux-x64": "0.1.0",
+    "@durable-acp/server-linux-arm64": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.8"
+  }
+}
