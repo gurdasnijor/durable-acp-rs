@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::response::sse::{Event, Sse};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::{IntoResponse, sse::{Event, Sse}};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
@@ -13,8 +14,15 @@ use serde::{Deserialize, Serialize};
 use crate::app::AppState;
 use crate::state::{ChunkRow, ChunkType, CollectionChange, ConnectionRow, PromptTurnRow, PromptTurnState, TerminalRow, TerminalState};
 
-pub fn router(app: Arc<AppState>) -> Router {
-    Router::new()
+/// Config for the WebSocket ACP endpoint — spawns a new conductor per connection.
+#[derive(Clone)]
+pub struct AcpEndpointConfig {
+    pub agent_command: Vec<String>,
+    pub durable_streams: crate::durable_streams::EmbeddedDurableStreams,
+}
+
+pub fn router(app: Arc<AppState>, acp_config: Option<AcpEndpointConfig>) -> Router {
+    let api = Router::new()
         .route("/api/v1/connections", get(list_connections))
         .route("/api/v1/connections/{id}/queue", get(get_queue).delete(clear_queue).put(reorder_queue))
         .route("/api/v1/connections/{id}/queue/{turn_id}", delete(cancel_queued_turn))
@@ -29,7 +37,108 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/api/v1/connections/{id}/terminals", get(list_terminals).post(create_terminal))
         .route("/api/v1/connections/{id}/terminals/{tid}", get(get_terminal).delete(kill_terminal))
         .route("/api/v1/connections/{id}/terminals/{tid}/output", get(stream_terminal_output))
-        .with_state(app)
+        .with_state(app);
+
+    if let Some(config) = acp_config {
+        // /acp has its own state — use .with_state() to erase the type before nesting
+        let acp: Router = Router::new()
+            .route("/acp", get(ws_acp_handler))
+            .with_state(Arc::new(config));
+        Router::new().merge(api).merge(acp)
+    } else {
+        api
+    }
+}
+
+/// WebSocket ACP endpoint — each connection gets its own conductor + agent.
+/// Pure SDK: ConductorImpl::new_agent + ProxiesAndAgent + ByteStreams.
+async fn ws_acp_handler(
+    ws: WebSocketUpgrade,
+    State(config): State<Arc<AcpEndpointConfig>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_acp_session(socket, config))
+}
+
+/// Spawn a conductor for this WebSocket client session.
+async fn handle_acp_session(socket: WebSocket, config: Arc<AcpEndpointConfig>) {
+    use futures::StreamExt;
+    use sacp_conductor::{ConductorImpl, McpBridgeMode, ProxiesAndAgent};
+    use sacp_tokio::AcpAgent;
+
+    // Spawn agent subprocess
+    let agent = match AcpAgent::from_args(config.agent_command.clone()) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("Failed to parse agent command: {}", e);
+            return;
+        }
+    };
+
+    // Create per-session app state (shares durable streams server)
+    let app = match AppState::with_shared_streams(config.durable_streams.clone()).await {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            tracing::error!("Failed to create app state: {}", e);
+            return;
+        }
+    };
+
+    // Bridge WebSocket frames ↔ newline-delimited JSON lines.
+    // Each WS text message = one JSON-RPC message.
+    let (ws_write, ws_read) = socket.split();
+
+    // Convert axum WebSocket to AsyncRead + AsyncWrite via a pipe
+    let (client_read, mut pipe_write) = tokio::io::duplex(64 * 1024);
+    let (mut pipe_read, client_write) = tokio::io::duplex(64 * 1024);
+
+    // WS read → pipe_write (incoming from client)
+    tokio::spawn(async move {
+        let mut ws_read = ws_read;
+        while let Some(Ok(msg)) = ws_read.next().await {
+            if let Message::Text(text) = msg {
+                use tokio::io::AsyncWriteExt;
+                let mut line = text.as_bytes().to_vec();
+                line.push(b'\n');
+                if pipe_write.write_all(&line).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // pipe_read → WS write (outgoing to client)
+    tokio::spawn(async move {
+        use futures::SinkExt;
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(&mut pipe_read).lines();
+        let mut ws_write = ws_write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if ws_write.send(Message::Text(line.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Build conductor using pure SDK — no wrappers
+    let conductor = ConductorImpl::new_agent(
+        "durable-acp".to_string(),
+        ProxiesAndAgent::new(agent)
+            .proxy(crate::durable_state_proxy::DurableStateProxy { app })
+            .proxy(crate::peer_mcp::PeerMcpProxy),
+        McpBridgeMode::default(),
+    );
+
+    // Run conductor on the piped byte streams
+    let result = conductor
+        .run(sacp::ByteStreams::new(
+            tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(client_write),
+            tokio_util::compat::TokioAsyncReadCompatExt::compat(client_read),
+        ))
+        .await;
+
+    if let Err(e) = result {
+        tracing::warn!("ACP WebSocket session ended: {}", e);
+    }
 }
 
 async fn list_connections(State(app): State<Arc<AppState>>) -> Json<Vec<ConnectionRow>> {

@@ -49,7 +49,11 @@ async fn main() -> Result<()> {
 
     tracing::info!(name = %agent_name, api_port, streams_port = cli.port, "Conductor started");
 
-    let api_router = api::router(app.clone());
+    let acp_config = api::AcpEndpointConfig {
+        agent_command: cli.agent_command.clone(),
+        durable_streams: app.durable_streams.clone(),
+    };
+    let api_router = api::router(app.clone(), Some(acp_config));
     spawn_api_server(api_port, api_router).await?;
 
     let agent = AcpAgent::from_args(cli.agent_command).context("parse agent command")?;
