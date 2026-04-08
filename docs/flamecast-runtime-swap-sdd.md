@@ -239,9 +239,11 @@ Per architecture principle: **all prompt submission goes through ACP**.
 No REST bypass of the conductor's proxy chain.
 
 `DurableACPClient` connects to `ws://host:port+1/acp` as a standard ACP
-client — same protocol the Rust dashboard uses via `Client.builder().connect_with()`.
+client using the official TypeScript SDK
+([`@agentclientprotocol/sdk`](https://www.npmjs.com/package/@agentclientprotocol/sdk)).
+Same protocol the Rust dashboard uses via `Client.builder().connect_with()`.
 One WebSocket, one protocol. The conductor handles sessions, proxy chain,
-streaming, permissions — all through standard ACP JSON-RPC:
+streaming, permissions — all through standard ACP:
 
 ```typescript
 // DurableACPClient connects as an ACP client
