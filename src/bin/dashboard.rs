@@ -1,7 +1,8 @@
 //! Multi-agent TUI dashboard — subprocess per agent.
 //!
 //! Spawns each agent as a conductor subprocess, bootstraps via ACP client
-//! (Initialize + NewSession), then uses REST API for prompts/streaming.
+//! (Initialize + NewSession), sends prompts through ACP connection, and
+//! streams responses via SSE (read-only REST API).
 //!
 //! Doubles as a minimal integration test harness: proves a thin ACP client
 //! can wire up conductors with no in-process glue.
@@ -119,6 +120,7 @@ struct AgentUiState {
     api_url: String,
     state: String,
     output: Vec<String>,
+    prompt_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 impl TuiState {
@@ -158,41 +160,18 @@ impl TuiState {
     fn api_url(&self, agent_idx: usize) -> Option<String> {
         self.inner.lock().unwrap().agents.get(agent_idx).map(|a| a.api_url.clone())
     }
+
+    fn send_prompt(&self, agent_idx: usize, text: String) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(a) = inner.agents.get(agent_idx) {
+            let _ = a.prompt_tx.send(text);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// REST API helpers — prompt via HTTP
+// SSE streaming helper (reads from REST, which is read-only)
 // ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConnectionInfo {
-    logical_connection_id: String,
-    latest_session_id: Option<String>,
-    state: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PromptResult {
-    prompt_turn_id: String,
-}
-
-async fn submit_prompt_http(http: &reqwest::Client, api_url: &str, text: &str) -> Result<String> {
-    let connections: Vec<ConnectionInfo> = http
-        .get(format!("{api_url}/api/v1/connections")).send().await?.json().await?;
-    let conn = connections.iter()
-        .find(|c| c.state == "attached")
-        .or(connections.first())
-        .ok_or_else(|| anyhow::anyhow!("no connections"))?;
-    let session_id = conn.latest_session_id.as_deref()
-        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
-    let result: PromptResult = http
-        .post(format!("{api_url}/api/v1/connections/{}/prompt", conn.logical_connection_id))
-        .json(&serde_json::json!({ "sessionId": session_id, "text": text }))
-        .send().await?.json().await?;
-    Ok(result.prompt_turn_id)
-}
 
 async fn stream_response(http: &reqwest::Client, api_url: &str, turn_id: &str, tui: &TuiState, name: &str) {
     let Ok(response) = http
@@ -229,6 +208,33 @@ async fn stream_response(http: &reqwest::Client, api_url: &str, turn_id: &str, t
             }
         }
     }
+}
+
+/// Find the latest active/queued prompt turn for a connection via read-only API.
+async fn find_latest_turn(http: &reqwest::Client, api_url: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TurnInfo {
+        prompt_turn_id: String,
+        state: String,
+    }
+
+    // Get connection ID first
+    let conns: Vec<serde_json::Value> = http
+        .get(format!("{api_url}/api/v1/connections"))
+        .send().await.ok()?.json().await.ok()?;
+    let conn_id = conns.first()
+        .and_then(|c| c.get("logicalConnectionId"))
+        .and_then(|v| v.as_str())?;
+
+    let turns: Vec<TurnInfo> = http
+        .get(format!("{api_url}/api/v1/connections/{conn_id}/prompt-turns"))
+        .send().await.ok()?.json().await.ok()?;
+
+    // Return the latest active or queued turn
+    turns.iter().rev()
+        .find(|t| t.state == "active" || t.state == "queued")
+        .map(|t| t.prompt_turn_id.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -402,17 +408,21 @@ async fn main() -> Result<()> {
         bail!("Conductor binary not found at {}. Run `cargo build` first.", conductor_bin.display());
     }
 
-    // TUI state
+    // TUI state — create a prompt channel per agent
     let tui = TuiState::default();
+    let mut prompt_receivers: Vec<tokio::sync::mpsc::UnboundedReceiver<String>> = Vec::new();
     {
         let mut inner = tui.inner.lock().unwrap();
         for (config, _) in &resolved {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             inner.agents.push(AgentUiState {
                 name: config.name.clone(),
                 api_url: format!("http://127.0.0.1:{}", config.port + 1),
                 state: "starting".to_string(),
                 output: vec![],
+                prompt_tx: tx,
             });
+            prompt_receivers.push(rx);
         }
     }
 
@@ -424,7 +434,7 @@ async fn main() -> Result<()> {
     local
         .run_until(async move {
             // Spawn each conductor subprocess and bootstrap via ACP client
-            for (config, command) in &resolved {
+            for ((config, command), mut prompt_rx) in resolved.iter().zip(prompt_receivers) {
                 let mut conductor_args = vec![
                     "--name".to_string(), config.name.clone(),
                     "--port".to_string(), config.port.to_string(),
@@ -464,51 +474,69 @@ async fn main() -> Result<()> {
                 );
                 tokio::task::spawn_local(handle_io);
 
-                // Initialize + create session, then mark ready
+                // Initialize + create session, then listen for prompts via ACP
                 tokio::task::spawn_local(async move {
-                    match async {
+                    let session_id = match async {
                         conn.initialize(
                             acp::InitializeRequest::new(acp::ProtocolVersion::V1)
                                 .client_info(acp::Implementation::new("durable-acp-dashboard", "0.1.0")
                                     .title("Dashboard")),
                         ).await?;
-                        conn.new_session(
+                        let session = conn.new_session(
                             acp::NewSessionRequest::new(std::env::current_dir()?),
                         ).await?;
-                        Ok::<_, anyhow::Error>(())
+                        Ok::<_, anyhow::Error>(session.session_id.clone())
                     }.await {
-                        Ok(()) => {
+                        Ok(sid) => {
                             tui2.set_state(&name, "ready");
                             tui2.push_text(&name, &format!("[{}] Ready ({})\n", name, api_url));
+                            sid
                         }
                         Err(e) => {
                             tui2.set_state(&name, "error");
                             tui2.push_text(&name, &format!("[error] {}\n", e));
+                            // Keep alive so child doesn't die
+                            let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                            let _ = rx.await;
+                            drop(child);
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                    };
+
+                    // Listen for prompts and send through ACP connection
+                    while let Some(text) = prompt_rx.recv().await {
+                        let prompt = acp::PromptRequest::new(
+                            session_id.clone(),
+                            vec![acp::ContentBlock::from(text)],
+                        );
+                        if let Err(e) = conn.prompt(prompt).await {
+                            tui2.push_text(&name, &format!("[error] {}\n", e));
                         }
                     }
 
-                    // Keep connection alive until dashboard exits
-                    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
-                    let _ = rx.await;
                     drop(child);
                     Ok::<_, anyhow::Error>(())
                 });
             }
 
-            // Prompt callback — submits via REST API
+            // Prompt callback — submits via ACP channel, streams via REST SSE
             let http = reqwest::Client::new();
             let tui_prompt = tui_clone.clone();
             let prompt_fn: Arc<dyn Fn(usize, String) + Send + Sync> = Arc::new(move |idx, text| {
                 let tui = tui_prompt.clone();
                 let http = http.clone();
-                let Some(api_url) = tui.api_url(idx) else { return };
                 let name = tui.inner.lock().unwrap().agents.get(idx)
                     .map(|a| a.name.clone()).unwrap_or_default();
                 tui.push_text(&name, &format!("> {}\n", text));
+                // Send prompt through ACP channel
+                tui.send_prompt(idx, text);
+                // Stream response via SSE (read-only REST endpoint)
+                let Some(api_url) = tui.api_url(idx) else { return };
                 tokio::task::spawn_local(async move {
-                    match submit_prompt_http(&http, &api_url, &text).await {
-                        Ok(turn_id) => stream_response(&http, &api_url, &turn_id, &tui, &name).await,
-                        Err(e) => tui.push_text(&name, &format!("[error] {}\n", e)),
+                    // Poll for the latest prompt turn to stream
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Some(turn_id) = find_latest_turn(&http, &api_url).await {
+                        stream_response(&http, &api_url, &turn_id, &tui, &name).await;
                     }
                     tui.push_text(&name, "\n");
                 });
