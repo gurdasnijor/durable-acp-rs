@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use agent_client_protocol::{PromptRequest, PromptResponse};
-use sacp::{Conductor, ConnectionTo, Responder};
+use sacp::Responder;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -22,7 +22,6 @@ pub struct AppState {
     pub durable_streams: EmbeddedDurableStreams,
     pub runtime: Arc<Mutex<RuntimeState>>,
     pub session_to_prompt_turn: Arc<RwLock<HashMap<String, String>>>,
-    pub proxy_connection: Arc<Mutex<Option<ConnectionTo<Conductor>>>>,
 }
 
 pub struct RuntimeState {
@@ -62,7 +61,6 @@ impl AppState {
                 seq_by_prompt_turn: HashMap::new(),
             })),
             session_to_prompt_turn: Arc::new(RwLock::new(HashMap::new())),
-            proxy_connection: Arc::new(Mutex::new(None)),
         };
 
         let row = ConnectionRow {
@@ -198,14 +196,6 @@ impl AppState {
         let key = row.chunk_id.clone();
         self.write_state_event("chunk", "insert", key, Some(&row))
             .await
-    }
-
-    /// Capture the proxy connection on first use. Subsequent calls are no-ops.
-    pub async fn capture_proxy_connection(&self, cx: ConnectionTo<Conductor>) {
-        let mut guard = self.proxy_connection.lock().await;
-        if guard.is_none() {
-            *guard = Some(cx);
-        }
     }
 
     pub async fn take_next_prompt(&self) -> Option<QueuedPrompt> {
