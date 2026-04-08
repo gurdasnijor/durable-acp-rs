@@ -1,9 +1,11 @@
 # SDD: API Architecture — ACP-Compliant Client Model
 
-## Problem
+> **Status: ✅ IMPLEMENTED** (PR #2)
+>
+> `submit_prompt`, `cancel_turn`, `proxy_connection`, `capture_proxy_connection`
+> all deleted. REST API is read-only + queue management.
 
-The REST API's `submit_prompt` endpoint bypasses the conductor's proxy
-chain. It stashes a `proxy_connection` (the conductor's internal handle)
+## Problem (solved) It stashes a `proxy_connection` (the conductor's internal handle)
 and calls `cx.send_request_to(Agent, ...)` directly, skipping
 `DurableStateProxy`'s handlers. This requires manual state recording
 (~50 lines) that duplicates what the proxy already does.
