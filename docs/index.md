@@ -78,14 +78,14 @@ conductor framework + [durable streams](https://github.com/durable-streams/durab
 | W1 | sacp-proxy migration | ⛔ BLOCKED | `sacp-proxy` 3.0.0 depends on `sacp` 2.0.0; we're on 11.0.0. Wait for upstream. |
 | W2 | Standalone proxy binaries | ✅ Done | [sdk-alignment.md](sdk-alignment.md) §1.2 |
 | W3 | Dashboard → subprocess model | ✅ Done | [sdk-alignment.md](sdk-alignment.md) §1.3 |
-| W4 | API prompt routing fix | 🔄 In progress | Routing `submit_prompt` through `session.connection()` — see [sdk-alignment.md](sdk-alignment.md) §1.5 |
+| W4 | API → read-only (remove prompt bypass) | 🔄 In progress | Remove `submit_prompt`/`cancel_turn` — prompts go through ACP only. See [api-architecture-sdd.md](api-architecture-sdd.md) |
 | W5 | Conductor config support | 🔜 Ready | Depends on W2 (done) |
 | W6 | File-backed storage | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §1 |
 | W7 | ~~EventSubscriber trait~~ | ⏭ ELIMINATED | StreamDB IS the subscriber — see [electric-sync-sdd.md](electric-sync-sdd.md) |
 | W7a | ~~WebSocket subscriber~~ | ⏭ ELIMINATED | StreamDB subscribes via SSE directly |
 | W7b | Webhook forwarder | 🔜 Ready | Tiny SSE→HTTP script (~50 lines) |
 | W7c | ~~Generalized SSE~~ | ⏭ ELIMINATED | DS server SSE already works |
-| W8 | ~~Flamecast TS client~~ | ⏭ ELIMINATED | Already exists (`@durable-acp/client`) — verify schema compat only |
+| W8 | Schema compatibility verified | ✅ Done | Rust ↔ TypeScript match. See [schema-compatibility.md](schema-compatibility.md) |
 | W9 | Pluggable transports (TCP/WS) | 🔜 Ready | [flamecast-integration-sdd.md](flamecast-integration-sdd.md) |
 | W10 | Runtime providers (Docker/E2B) | 🔜 Ready | Depends on W9 |
 | W11 | File system access API | ✅ Done | [known-limitations-sdd.md](known-limitations-sdd.md) §4 |
@@ -94,11 +94,17 @@ conductor framework + [durable streams](https://github.com/durable-streams/durab
 
 ### Remaining Work
 
-- **W4** (in progress) — route API prompts through `session.connection()` instead of bypassing proxy chain
+- **W4** (in progress) — remove REST prompt/cancel endpoints, make API read-only. See [api-architecture-sdd.md](api-architecture-sdd.md).
 - **W5** — conductor config support (`sacp-conductor --config`)
-- **W7b** — webhook forwarder (SSE→HTTP)
+- **W7b** — webhook forwarder (SSE→HTTP, ~50 lines)
 - **W9** — pluggable transports (TCP/WS for remote agents)
 - **W10** — runtime providers (Docker/E2B)
+
+### Architecture Principle
+
+All prompt submission goes through ACP (the paved road per P/ACP spec).
+The REST API is **read-only state observation + queue management**.
+No bypass of the conductor's proxy chain. See [api-architecture-sdd.md](api-architecture-sdd.md).
 
 ## Flamecast Integration Shape
 
@@ -135,11 +141,16 @@ Flamecast reads from durable stream (replaces FlamecastStorage):
 
 | Doc | Status | What It Covers |
 |---|---|---|
-| [sdk-alignment.md](sdk-alignment.md) | 🔄 W4 in progress | Standalone binaries, subprocess model, API fix |
-| [known-limitations-sdd.md](known-limitations-sdd.md) | 🔄 Mostly done | Storage ✅, API routing 🔄, filesystem ✅, terminals ✅, runtime providers 🔜 |
-| [electric-sync-sdd.md](electric-sync-sdd.md) | ✅ Design done | Native StreamDB integration — eliminates W7/W7a/W7c/W8-build |
-| [event-subscribers-sdd.md](event-subscribers-sdd.md) | ⏭ Superseded | Replaced by StreamDB approach in `electric-sync-sdd.md` |
-| [flamecast-integration-sdd.md](flamecast-integration-sdd.md) | 🔜 Track C | Flamecast API, pluggable transports, what to cut |
+| [api-architecture-sdd.md](api-architecture-sdd.md) | 🔄 In progress | REST API is read-only. Prompt submission through ACP only. |
+| [sdk-alignment.md](sdk-alignment.md) | 🔄 W4 in progress | Standalone binaries ✅, subprocess model ✅, API fix 🔄 |
+| [schema-compatibility.md](schema-compatibility.md) | ✅ Done | Rust ↔ TypeScript schema verified compatible |
+| [known-limitations-sdd.md](known-limitations-sdd.md) | 🔄 Mostly done | Storage ✅, filesystem ✅, terminals ✅, runtime providers 🔜 |
+| [electric-sync-sdd.md](electric-sync-sdd.md) | ✅ Design done | Native StreamDB — TS client already exists |
+| [flamecast-integration-sdd.md](flamecast-integration-sdd.md) | 🔜 Track C | Flamecast API, transports, what to cut |
+| [flamecast-capabilities.md](flamecast-capabilities.md) | ✅ Done | Maps each Flamecast guide to our infrastructure |
+| [auth-sdd.md](auth-sdd.md) | 🔜 Ready | JWT auth proxy (Envoy/CF Access) |
+| [deployment-sdd.md](deployment-sdd.md) | 🔜 Ready | Control plane / data plane split |
+| [event-subscribers-sdd.md](event-subscribers-sdd.md) | ⏭ Superseded | Replaced by StreamDB in `electric-sync-sdd.md` |
 
 ## Key References
 
