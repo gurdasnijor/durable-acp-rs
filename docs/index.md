@@ -70,7 +70,7 @@ come from one git repo at one commit — guaranteed compatible.
 
 | W# | Task | Status | Notes |
 |---|---|---|---|
-| W1 | sacp-proxy migration | ⛔ BLOCKED | `sacp-proxy` 3.0.0 depends on `sacp` 2.0.0; we're on 11.0.0. Wait for upstream. |
+| W1 | ~~sacp-proxy migration~~ | ⏭ ELIMINATED | Proxies built natively as `ConnectTo<Conductor>` components — no external crate needed |
 | W2 | Standalone proxy binaries | ✅ Done | `durable-state-proxy`, `peer-mcp-proxy` binaries |
 | W3 | Dashboard → subprocess model | ✅ Done | Uses `Client.builder().connect_with()` (SDK) |
 | W4 | API → read-only (remove prompt bypass) | ✅ Done | REST is read-only; `submit_prompt`/`cancel_turn` removed. See [api-architecture-sdd.md](api-architecture-sdd.md) |
@@ -90,7 +90,6 @@ come from one git repo at one commit — guaranteed compatible.
 
 ### Remaining Work
 
-- **W5** — conductor config support (`sacp-conductor --config`)
 - **W10** — runtime providers (Docker/E2B)
 
 ### Architecture Principle
