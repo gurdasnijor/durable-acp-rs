@@ -126,16 +126,16 @@ class DurableACPStorage implements FlamecastStorage {
 The event bus becomes `client.subscribePromptTurns()`.
 React hooks become `useLiveQuery` from TanStack DB.
 
-## What We Still Need
+## Status
 
-| Need | Solution | Effort |
-|---|---|---|
-| Verify schema compat | Compare Rust `state.rs` types with TS `schema.ts` Zod schemas | 0.5 day |
-| Publish `@durable-acp/state` | npm publish from `distributed-acp` monorepo | config only |
-| Publish `@durable-acp/client` | npm publish from `distributed-acp` monorepo | config only |
-| Point client at Rust DS server | Change `stateStreamUrl` to conductor's port | 1 line |
-| Webhooks | DS server SSE → tiny webhook forwarder (or Postgres if analytics needed) | 0.5 day |
-| Rust-side file storage (W6) | `FileStorage` impl for restart survival | 0.5 day |
+| Need | Status |
+|---|---|
+| Verify schema compat | ✅ Done — see `schema-compatibility.md` |
+| Point client at Rust DS server | ✅ Ready — change `stateStreamUrl` to conductor port |
+| Webhooks | ✅ Done — RFC-aligned forwarder in `src/webhook.rs` |
+| Rust-side file storage (W6) | ✅ Done — `FileStorage` impl |
+| Publish `@durable-acp/state` | 🔜 npm publish from `distributed-acp` monorepo |
+| Publish `@durable-acp/client` | 🔜 npm publish from `distributed-acp` monorepo |
 
 ### Schema compatibility check
 
