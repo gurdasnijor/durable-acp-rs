@@ -22,8 +22,10 @@
       "default": "./dist/vite.js"
     }
   },
+  "files": ["dist", "package.json"],
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "test": "vitest run"
   },
   "dependencies": {

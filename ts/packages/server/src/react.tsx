@@ -2,11 +2,10 @@
  * React bindings for @durable-acp/server.
  *
  * Usage:
- *   import { startServer } from "@durable-acp/server";
- *   import { DurableAcpProvider, useSession } from "@durable-acp/server/react";
+ *   import { DurableAcpProvider, useSession, useCollections } from "@durable-acp/server/react";
  *
- *   const server = await startServer({ agent: "claude-acp" });
- *   <DurableAcpProvider server={server}><App /></DurableAcpProvider>
+ *   <DurableAcpProvider>          // relative paths, works with Vite proxy
+ *   <DurableAcpProvider basePath="http://host:4437">  // explicit base
  */
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
@@ -20,16 +19,56 @@ import {
 } from "@agentclientprotocol/sdk";
 import { fromWebSocket } from "@durable-acp/transport";
 import { createDurableACPDB, type DurableACPDB, type DurableACPCollections } from "durable-session";
-import type { ServerHandle } from "./spawn";
+
+// ============================================================================
+// URL resolution
+// ============================================================================
+
+interface ResolvedEndpoints {
+  acpUrl: string;
+  streamUrl: string;
+  apiUrl: string;
+}
+
+function resolveEndpoints(basePath?: string): ResolvedEndpoints {
+  if (basePath) {
+    // Explicit base: basePath is the streams port, API is port+1
+    const base = basePath.replace(/\/$/, "");
+    const url = new URL(base);
+    const streamsPort = parseInt(url.port || "4437", 10);
+    const apiPort = streamsPort + 1;
+    const wsProtocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return {
+      acpUrl: `${wsProtocol}//${url.hostname}:${apiPort}/acp`,
+      streamUrl: `${base}/streams/durable-acp-state`,
+      apiUrl: `${url.protocol}//${url.hostname}:${apiPort}`,
+    };
+  }
+
+  // Relative paths — works behind Vite proxy or reverse proxy
+  if (typeof window !== "undefined") {
+    const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+    return {
+      acpUrl: `${wsProtocol}//${location.host}/acp`,
+      streamUrl: `${location.origin}/streams/durable-acp-state`,
+      apiUrl: location.origin,
+    };
+  }
+
+  // SSR fallback
+  return {
+    acpUrl: "ws://127.0.0.1:4438/acp",
+    streamUrl: "http://127.0.0.1:4437/streams/durable-acp-state",
+    apiUrl: "http://127.0.0.1:4438",
+  };
+}
 
 // ============================================================================
 // Context
 // ============================================================================
 
 interface DurableAcpContextValue {
-  /** The server handle with endpoint URLs. */
-  server: ServerHandle;
-  /** The materialized durable state database. */
+  endpoints: ResolvedEndpoints;
   db: DurableACPDB;
 }
 
@@ -40,30 +79,28 @@ const DurableAcpContext = createContext<DurableAcpContextValue | null>(null);
 // ============================================================================
 
 export interface DurableAcpProviderProps {
-  /** Server handle from startServer(). */
-  server: ServerHandle;
+  /**
+   * Base URL of the conductor's streams port (e.g., "http://host:4437").
+   * If omitted, uses relative paths (works with Vite proxy or reverse proxy).
+   */
+  basePath?: string;
   children: React.ReactNode;
 }
 
-/**
- * Provides durable ACP context to the React tree.
- *
- * Creates a DurableACPDB (durable-session) from the server's stream URL.
- * Components use useSession() to get an ACP connection + reactive state.
- */
-export function DurableAcpProvider({ server, children }: DurableAcpProviderProps) {
+export function DurableAcpProvider({ basePath, children }: DurableAcpProviderProps) {
+  const endpoints = useMemo(() => resolveEndpoints(basePath), [basePath]);
+
   const db = useMemo(
-    () => createDurableACPDB({ stateStreamUrl: server.streamUrl }),
-    [server.streamUrl],
+    () => createDurableACPDB({ stateStreamUrl: endpoints.streamUrl }),
+    [endpoints.streamUrl],
   );
 
-  // Preload on mount
   useEffect(() => {
     db.preload();
     return () => db.close();
   }, [db]);
 
-  const value = useMemo(() => ({ server, db }), [server, db]);
+  const value = useMemo(() => ({ endpoints, db }), [endpoints, db]);
 
   return (
     <DurableAcpContext.Provider value={value}>
@@ -82,27 +119,19 @@ function useDurableAcp(): DurableAcpContextValue {
   return ctx;
 }
 
-/**
- * Access the durable state collections (reactive, auto-synced via SSE).
- *
- * This is the out-of-band observer — no ACP connection needed.
- */
+/** Reactive state collections from the durable stream (out-of-band observer). */
 export function useCollections(): DurableACPCollections {
   return useDurableAcp().db.collections;
 }
 
-/**
- * Access the raw DurableACPDB instance.
- */
+/** Raw DurableACPDB instance. */
 export function useDb(): DurableACPDB {
   return useDurableAcp().db;
 }
 
-/**
- * Access the server handle (URLs, kill, process).
- */
-export function useServer(): ServerHandle {
-  return useDurableAcp().server;
+/** Resolved conductor endpoint URLs. */
+export function useEndpoints(): ResolvedEndpoints {
+  return useDurableAcp().endpoints;
 }
 
 // ============================================================================
@@ -110,50 +139,36 @@ export function useServer(): ServerHandle {
 // ============================================================================
 
 export interface UseSessionOptions {
-  /** Called on each session update (text chunks, tool calls, etc.) */
   onSessionUpdate?: (notification: SessionNotification) => void;
-  /** Handle permission requests. Default: auto-approve first option. */
   onPermissionRequest?: (
     request: RequestPermissionRequest,
   ) => Promise<RequestPermissionResponse>;
-  /** Working directory for the session. */
   cwd?: string;
 }
 
 export interface SessionState {
-  /** The ACP connection (standard @agentclientprotocol/sdk). */
   connection: ClientSideConnection | null;
-  /** The session ID from the conductor. */
   sessionId: string | null;
-  /** Whether the session is connected and initialized. */
   isReady: boolean;
-  /** Connection error, if any. */
   error: Error | null;
-  /** Send a text prompt. */
   prompt: (text: string) => Promise<void>;
-  /** Cancel the current prompt turn. */
   cancel: () => Promise<void>;
-  /** Disconnect the ACP session. */
   disconnect: () => void;
 }
 
 /**
  * Connect to the conductor as a standard ACP client.
  *
- * Creates a ClientSideConnection (from @agentclientprotocol/sdk) over
- * WebSocket, initializes the protocol, and creates a session.
- *
- * This is the in-band connection — prompts, cancel, permissions all go
- * through the ACP protocol. State observation comes from useCollections().
+ * Creates a ClientSideConnection over WebSocket, initializes the
+ * protocol, and creates a session. Prompts, cancel, permissions go
+ * through ACP. State observation comes from useCollections().
  */
 export function useSession(options?: UseSessionOptions): SessionState {
-  const { server } = useDurableAcp();
+  const { endpoints } = useDurableAcp();
   const [connection, setConnection] = useState<ClientSideConnection | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const streamRef = useRef<ReturnType<typeof fromWebSocket> | null>(null);
-
-  // Stable refs for callbacks so they don't cause reconnects
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
@@ -162,7 +177,7 @@ export function useSession(options?: UseSessionOptions): SessionState {
 
     async function connect() {
       try {
-        const stream = fromWebSocket(server.acpUrl);
+        const stream = fromWebSocket(endpoints.acpUrl);
         streamRef.current = stream;
 
         const conn = new ClientSideConnection(
@@ -171,7 +186,6 @@ export function useSession(options?: UseSessionOptions): SessionState {
               if (optionsRef.current?.onPermissionRequest) {
                 return optionsRef.current.onPermissionRequest(params);
               }
-              // Default: auto-approve first option
               const option = params.options?.[0];
               return {
                 outcome: option
@@ -188,16 +202,14 @@ export function useSession(options?: UseSessionOptions): SessionState {
 
         if (disposed) { stream.close(); return; }
 
-        // Initialize
         await conn.initialize({
           protocolVersion: "2025-03-26",
-          clientInfo: { name: "flamecast", version: "0.1.0" },
+          clientInfo: { name: "durable-acp-client", version: "0.1.0" },
           capabilities: {},
         } as any);
 
         if (disposed) { stream.close(); return; }
 
-        // Create session
         const cwd = optionsRef.current?.cwd ?? "/";
         const sessionResponse = await conn.newSession({ cwd } as any);
 
@@ -221,7 +233,7 @@ export function useSession(options?: UseSessionOptions): SessionState {
       setConnection(null);
       setSessionId(null);
     };
-  }, [server.acpUrl]);
+  }, [endpoints.acpUrl]);
 
   const prompt = async (text: string) => {
     if (!connection || !sessionId) throw new Error("Session not ready");
@@ -243,13 +255,5 @@ export function useSession(options?: UseSessionOptions): SessionState {
     setSessionId(null);
   };
 
-  return {
-    connection,
-    sessionId,
-    isReady: connection !== null && sessionId !== null,
-    error,
-    prompt,
-    cancel,
-    disconnect,
-  };
+  return { connection, sessionId, isReady: !!connection && !!sessionId, error, prompt, cancel, disconnect };
 }

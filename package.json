@@ -1,0 +1,38 @@
+{
+  "name": "@durable-acp/server",
+  "version": "0.1.0",
+  "description": "Durable ACP conductor server — Rust binary + TypeScript wrapper.",
+  "type": "module",
+  "main": "./ts/packages/server/dist/index.js",
+  "types": "./ts/packages/server/dist/index.d.ts",
+  "bin": {
+    "durable-acp-server": "./ts/packages/server/src/cli.ts"
+  },
+  "exports": {
+    ".": {
+      "types": "./ts/packages/server/dist/index.d.ts",
+      "default": "./ts/packages/server/dist/index.js"
+    },
+    "./react": {
+      "types": "./ts/packages/server/dist/react.d.ts",
+      "default": "./ts/packages/server/dist/react.js"
+    },
+    "./vite": {
+      "types": "./ts/packages/server/dist/vite.d.ts",
+      "default": "./ts/packages/server/dist/vite.js"
+    }
+  },
+  "files": [
+    "ts/packages/server/dist",
+    "ts/packages/acp-transport/dist",
+    "ts/packages/durable-session/dist",
+    "target/release/durable-acp-rs",
+    "target/debug/durable-acp-rs"
+  ],
+  "scripts": {
+    "build:rs": "cargo build --release",
+    "build:ts": "cd ts && pnpm exec tsc --build",
+    "build": "npm run build:rs && npm run build:ts",
+    "prepare": "cd ts && pnpm exec tsc --build"
+  }
+}

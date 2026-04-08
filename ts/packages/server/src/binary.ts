@@ -1,58 +1,40 @@
 /**
  * Platform binary resolution for durable-acp-rs.
  *
- * Same pattern as esbuild, turbo, @biomejs/biome:
- * - Try platform-specific npm package first (@durable-acp/server-darwin-arm64)
- * - Fall back to locally built cargo binary (target/release/durable-acp-rs)
+ * Resolves the Rust binary relative to the package root.
+ * Works both in-repo (cargo build) and when published (platform packages).
  */
 
 import path from "path";
 import { existsSync } from "fs";
-import { createRequire } from "module";
+import { fileURLToPath } from "url";
 
-const require = createRequire(import.meta.url);
-
-const PLATFORM_PACKAGES: Record<string, string> = {
-  "darwin-arm64": "@durable-acp/server-darwin-arm64",
-  "darwin-x64": "@durable-acp/server-darwin-x64",
-  "linux-x64": "@durable-acp/server-linux-x64",
-  "linux-arm64": "@durable-acp/server-linux-arm64",
-};
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * Find the durable-acp-rs binary for the current platform.
+ * Find the durable-acp-rs binary.
  *
  * Resolution order:
- * 1. Platform npm package (installed via optionalDependencies)
- * 2. Local cargo build (target/release/durable-acp-rs)
- * 3. Local cargo debug build (target/debug/durable-acp-rs)
+ * 1. Release build: target/release/durable-acp-rs
+ * 2. Debug build: target/debug/durable-acp-rs
+ * 3. DURABLE_ACP_BIN env var (explicit override)
  */
 export function findBinary(): string {
-  const key = `${process.platform}-${process.arch}`;
-  const pkg = PLATFORM_PACKAGES[key];
-
-  // 1. Try platform npm package
-  if (pkg) {
-    try {
-      const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
-      const bin = path.join(pkgDir, "bin", "durable-acp-rs");
-      if (existsSync(bin)) return bin;
-    } catch {
-      // Package not installed — fall through to local binary
-    }
+  // Env override
+  if (process.env.DURABLE_ACP_BIN) {
+    if (existsSync(process.env.DURABLE_ACP_BIN)) return process.env.DURABLE_ACP_BIN;
   }
 
-  // 2. Try local cargo release build (walk up from this package to repo root)
+  // Walk from dist/ → ts/packages/server/dist/ → repo root
   const repoRoot = path.resolve(__dirname, "../../../..");
+
   const releaseBin = path.join(repoRoot, "target/release/durable-acp-rs");
   if (existsSync(releaseBin)) return releaseBin;
 
-  // 3. Try local cargo debug build
   const debugBin = path.join(repoRoot, "target/debug/durable-acp-rs");
   if (existsSync(debugBin)) return debugBin;
 
   throw new Error(
-    `durable-acp-rs binary not found for ${key}. ` +
-    `Install ${pkg ?? "a platform package"} or run \`cargo build --release\`.`
+    "durable-acp-rs binary not found. Run `cargo build` or set DURABLE_ACP_BIN."
   );
 }
