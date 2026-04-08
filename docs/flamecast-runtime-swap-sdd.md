@@ -233,28 +233,20 @@ Nothing code-wise — durable-acp-rs is already complete for this integration.
 W10 (Docker/E2B runtime providers) accelerates Phase 1 but isn't blocking:
 the Dockerfile from `deployment-sdd.md` works today.
 
-## Risk: ACP TypeScript Client
+## Prompt/Control via DurableACPClient
 
-Seam 3 (prompt/control over ACP WS) needs a TypeScript ACP client that
-speaks JSON-RPC over WebSocket. Options:
+`@durable-acp/client` (`distributed-acp/packages/durable-acp-client/`)
+already has full command support via REST POSTs:
 
-1. **`@anthropic/acp-client`** — if it exists/works with our conductor
-2. **`@durable-acp/client` commands** — already has `prompt()`, `cancel()` as REST POSTs. Could add WS transport.
-3. **Raw WebSocket** — send JSON-RPC `initialize`, `newSession`, `prompt` messages directly (~100 lines)
+- `client.prompt(text)` → `POST /connections/{id}/prompt`
+- `client.cancel()` → `POST /connections/{id}/cancel`
+- `client.pause()` / `client.resume()` → `POST /connections/{id}/queue/*`
+- `client.resolvePermission(reqId, optionId)` → `POST /permissions/{id}/resolve`
+- `client.reorder(turnIds)` → `POST /connections/{id}/queue`
 
-Option 2 is the pragmatic path: keep `@durable-acp/client` REST commands
-for prompt/cancel in Phase 1-2, migrate to ACP WS in a later phase.
-This means Phase 1-3 don't need a TypeScript ACP client at all — prompts
-continue via REST POST to the conductor's API, which still works.
+State observation comes via SSE from the durable stream (already working).
 
-**Revised seam 3 for Phase 1-3:**
-```
-Prompt path (Phase 1-3): DurableACPClient.prompt(text)
-  → POST /api/v1/connections/{id}/prompt  ← needs adding to conductor REST
-  → conductor enqueues → ACP to agent
-
-Prompt path (Phase 4+): ACP WS client
-  → ws://host:port+1/acp → full ACP protocol
-```
-
-This defers the TypeScript ACP client work and keeps Phase 1-3 simple.
+**Gap:** The conductor's REST API doesn't currently serve `/connections/{id}/prompt`
+or `/permissions/{id}/resolve` (prompts go through ACP only per architecture
+principle). These two endpoints need adding to `api.rs` — thin handlers that
+enqueue into the conductor's ACP flow. Queue endpoints already exist.
