@@ -30,38 +30,32 @@ sacp::Lines::new(outgoing_sink, incoming_stream)
 
 `ConductorImpl::run(transport: impl ConnectTo<Host>)` accepts any of them.
 
-## Server Side: `--listen` Flag
+## Server Side: Always Available
 
-The conductor (`main.rs`) currently only accepts stdio. Add `--listen`
-to also accept WebSocket connections on the REST API server:
+The conductor already runs a REST API server on `:port+1`. The WebSocket
+ACP endpoint is just another route — no flag, no mode:
 
 ```rust
-#[derive(Debug, Parser)]
-struct Cli {
-    #[arg(long)]
-    listen: bool,  // Accept WebSocket ACP clients on the API server
-    // ... existing args
-}
+// In api.rs router — add alongside existing routes:
+.route("/acp", get(ws_acp_handler))
 ```
 
-When `--listen` is set:
-- The REST API server at `:port+1` adds a `GET /acp` WebSocket route
-- A WebSocket client connects → frames bridge to `ByteStreams`
-- `conductor.run(ByteStreams::new(ws_write, ws_read))` — same conductor
+The conductor accepts clients on **both** transports simultaneously:
+- **stdio** — editors spawn it as a subprocess, connect via stdin/stdout
+- **WebSocket at `/acp`** — remote clients connect via `ws://host:port+1/acp`
 
-When `--listen` is NOT set (default):
-- Stdio mode — editors spawn us, connect via stdin/stdout
-- `conductor.run(ByteStreams::new(stdout, stdin))` — same conductor
+This works because the conductor's internal `ConductorMessage` queue
+serializes all messages regardless of source — the same mechanism that
+handles multiple MCP bridge connections (see `run_tcp_listener` in
+`sacp-conductor`). No single-client constraint.
 
 ```bash
-# Local (editor spawns, stdio)
-durable-acp-rs npx @agentclientprotocol/claude-agent-acp
-
-# Remote (WebSocket on API server)
-durable-acp-rs --listen --port 4437 npx @agentclientprotocol/claude-agent-acp
-# → REST API:   http://host:4438/api/v1/*
-# → ACP WebSocket: ws://host:4438/acp
-# → Durable streams: http://host:4437/streams/*
+# All connections always available:
+durable-acp-rs --port 4437 npx @agentclientprotocol/claude-agent-acp
+# → stdio:           editor connects via stdin/stdout
+# → ACP WebSocket:   ws://host:4438/acp (always available)
+# → REST API:        http://host:4438/api/v1/* (always available)
+# → Durable streams: http://host:4437/streams/* (always available)
 ```
 
 ## Client Side: Dashboard as ACP Client
@@ -183,18 +177,19 @@ stdio, WebSocket, TCP, or in-process channels. Transport is config.
 
 ## Flamecast Integration
 
-Flamecast's runtime returns `websocketUrl`. With `--listen`:
+Flamecast's runtime returns `websocketUrl`. The `/acp` endpoint is
+always available — no special flags:
 
 ```typescript
 // Flamecast runtime provider spawns:
-//   durable-acp-rs --listen --port 4437 npx claude-agent-acp
+//   durable-acp-rs --port 4437 npx claude-agent-acp
 // Returns: { websocketUrl: "ws://host:4438/acp" }
 // Flamecast connects via existing WebSocket mechanism
 ```
 
 For Docker/E2B:
 ```dockerfile
-CMD ["durable-acp-rs", "--listen", "--port", "4437", "npx", "claude-agent-acp"]
+CMD ["durable-acp-rs", "--port", "4437", "npx", "claude-agent-acp"]
 EXPOSE 4437 4438
 ```
 
@@ -214,7 +209,7 @@ let (channel_client, channel_conductor) = sacp::Channel::duplex();
 
 | File | Change |
 |---|---|
-| `src/main.rs` | Add `--listen` flag, branch on stdio vs accept-WebSocket |
+| `src/main.rs` | No changes — stdio always works, WebSocket is on API server |
 | `src/api.rs` | Add `GET /acp` WebSocket upgrade route |
 | `src/bin/dashboard.rs` | Replace custom subprocess glue with `resolve_transport()` + `ConnectTo` |
 | `agents.toml` | Add optional `transport` field |
