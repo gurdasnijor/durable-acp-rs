@@ -56,20 +56,27 @@ async fn main() -> Result<()> {
     let api_router = api::router(app.clone(), Some(acp_config));
     spawn_api_server(api_port, api_router).await?;
 
-    let agent = AcpAgent::from_args(cli.agent_command).context("parse agent command")?;
-
-    let conductor = build_conductor(app, agent);
-
-    let result = conductor
-        .run(ByteStreams::new(
-            tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(tokio::io::stdout()),
-            tokio_util::compat::TokioAsyncReadCompatExt::compat(tokio::io::stdin()),
-        ))
-        .await
-        .context("run conductor");
-
-    let _ = registry::unregister(&agent_name);
-    result
+    // If stdin is a TTY or piped from a parent process, run the stdio conductor.
+    // Otherwise (pure WebSocket mode), just keep the API server alive.
+    if atty::is(atty::Stream::Stdin) || std::env::var("DURABLE_ACP_STDIO").is_ok() {
+        let agent = AcpAgent::from_args(cli.agent_command).context("parse agent command")?;
+        let conductor = build_conductor(app, agent);
+        let result = conductor
+            .run(ByteStreams::new(
+                tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(tokio::io::stdout()),
+                tokio_util::compat::TokioAsyncReadCompatExt::compat(tokio::io::stdin()),
+            ))
+            .await
+            .context("run conductor");
+        let _ = registry::unregister(&agent_name);
+        result
+    } else {
+        tracing::info!("No TTY on stdin — running in WebSocket-only mode (/acp)");
+        // Keep alive until SIGTERM/SIGINT
+        tokio::signal::ctrl_c().await.ok();
+        let _ = registry::unregister(&agent_name);
+        Ok(())
+    }
 }
 
 async fn spawn_api_server(port: u16, router: Router) -> Result<()> {
