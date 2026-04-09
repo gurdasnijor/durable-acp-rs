@@ -138,6 +138,37 @@ async fn proxy_persists_chunks() {
     );
 }
 
+#[tokio::test]
+async fn trace_captures_chunks_from_notifications() {
+    let app = common::test_app().await;
+    let result = run_prompt(app.clone(), &TestyCommand::Greet.to_prompt()).await;
+    assert!(!result.is_empty(), "agent should respond");
+
+    // Give trace events time to flush
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let snapshot = app.stream_server.stream_db.snapshot().await;
+
+    // Diagnostic: dump what we got
+    eprintln!("prompt_turns: {}", snapshot.prompt_turns.len());
+    for (id, t) in &snapshot.prompt_turns {
+        eprintln!("  turn {}: state={:?}", id, t.state);
+    }
+    eprintln!("chunks: {}", snapshot.chunks.len());
+    for (id, c) in &snapshot.chunks {
+        eprintln!("  chunk {}: type={:?} content={:.40}", id, c.chunk_type, c.content);
+    }
+
+    // This is the key assertion: chunks should materialize from trace notifications
+    assert!(
+        !snapshot.chunks.is_empty(),
+        "chunks should materialize from session/update trace notifications. \
+         prompt_turns={}, chunks={}",
+        snapshot.prompt_turns.len(),
+        snapshot.chunks.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // State survives across prompts (same TestApp, same stream)
 // ---------------------------------------------------------------------------

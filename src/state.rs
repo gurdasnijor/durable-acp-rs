@@ -471,8 +471,13 @@ impl StreamDb {
         let Some(prompt_turn_id) = prompt_turn_id else { return Ok(()) };
 
         let update = notif.params.get("update");
-        let (chunk_type, content) = match update.and_then(|u| u.get("type")).and_then(Value::as_str) {
-            Some("agentMessageChunk") => {
+        // The SDK serializes SessionUpdate variants as { "sessionUpdate": "snake_case_type", "content": ... }
+        let update_type = update
+            .and_then(|u| u.get("sessionUpdate").or_else(|| u.get("type")))
+            .and_then(Value::as_str);
+        let (chunk_type, content) = match update_type {
+            Some("agent_message_chunk") | Some("agentMessageChunk") |
+            Some("user_message_chunk") | Some("userMessageChunk") => {
                 let text = update
                     .and_then(|u| u.get("content"))
                     .and_then(|c| c.get("text"))
@@ -480,7 +485,7 @@ impl StreamDb {
                     .unwrap_or("");
                 (ChunkType::Text, text.to_string())
             }
-            Some("agentThoughtChunk") => {
+            Some("agent_thought_chunk") | Some("agentThoughtChunk") => {
                 let text = update
                     .and_then(|u| u.get("content"))
                     .and_then(|c| c.get("text"))
@@ -488,11 +493,11 @@ impl StreamDb {
                     .unwrap_or("");
                 (ChunkType::Thinking, text.to_string())
             }
-            Some("toolCall") => {
+            Some("tool_call") | Some("toolCall") => {
                 let content = update.map(|u| u.to_string()).unwrap_or_default();
                 (ChunkType::ToolCall, content)
             }
-            Some("toolCallUpdate") => {
+            Some("tool_call_update") | Some("toolCallUpdate") => {
                 let content = update.map(|u| u.to_string()).unwrap_or_default();
                 (ChunkType::ToolResult, content)
             }

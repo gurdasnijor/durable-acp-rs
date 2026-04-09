@@ -31,6 +31,8 @@ pub struct ApiState {
 
 pub fn router(api_state: ApiState) -> Router {
     Router::new()
+        // Materialized state snapshot (from StreamDb)
+        .route("/api/v1/state", get(get_state_snapshot))
         // Filesystem access (not in the durable stream)
         .route("/api/v1/connections/{id}/files", get(get_file))
         .route("/api/v1/connections/{id}/fs/tree", get(get_tree))
@@ -45,6 +47,16 @@ pub fn router(api_state: ApiState) -> Router {
             .allow_origin(Any)
             .allow_methods(Any)
             .allow_headers(Any))
+}
+
+// ---------------------------------------------------------------------------
+// Materialized state snapshot
+// ---------------------------------------------------------------------------
+
+async fn get_state_snapshot(
+    State(api): State<ApiState>,
+) -> Json<crate::state::Collections> {
+    Json(api.stream_server.stream_db.snapshot().await)
 }
 
 // ---------------------------------------------------------------------------
