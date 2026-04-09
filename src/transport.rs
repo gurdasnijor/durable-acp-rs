@@ -61,6 +61,9 @@ impl sacp::ConnectTo<sacp::Client> for WebSocketTransport {
 }
 
 /// Server-side WebSocket transport — wraps an already-accepted axum WebSocket.
+///
+/// Uses one JSON-RPC message per WS frame (text or binary), matching the
+/// `@agentclientprotocol/sdk` ClientSideConnection pattern used by Flamecast.
 pub struct AxumWsTransport {
     pub socket: axum::extract::ws::WebSocket,
 }
@@ -78,10 +81,16 @@ impl sacp::ConnectTo<sacp::Agent> for AxumWsTransport {
 
         let incoming = futures::StreamExt::filter_map(read, |msg| async move {
             match msg {
-                Ok(axum::extract::ws::Message::Text(t)) => Some(Ok(t.to_string())),
+                Ok(axum::extract::ws::Message::Text(t)) => {
+                    let s = t.trim().to_string();
+                    if s.is_empty() { None } else { Some(Ok(s)) }
+                }
                 Ok(axum::extract::ws::Message::Binary(b)) => {
-                    // use-acp sends binary frames (ndJsonStream encodes as Uint8Array)
-                    String::from_utf8(b.to_vec()).ok().map(Ok)
+                    String::from_utf8(b.to_vec()).ok().map(|s| {
+                        let s = s.trim().to_string();
+                        if s.is_empty() { return Err(std::io::Error::other("empty")); }
+                        Ok(s)
+                    }).filter(|r| r.is_ok())
                 }
                 Err(e) => Some(Err(std::io::Error::other(e))),
                 _ => None,
