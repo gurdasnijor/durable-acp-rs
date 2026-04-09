@@ -50,14 +50,33 @@ Without falling back to the legacy session-host `/start` + `/prompt` + `/termina
 |---|---|---|
 | Runtime/provider abstraction | `packages/flamecast/src/flamecast/api.ts` | Store ACP endpoint + stream URL as first-class session metadata |
 | ACP client path | `packages/ui/src/hooks/use-durable-acp-session.ts` | Already works — this IS the pattern. Wire it as the primary path, not a fallback. |
-| State observation | `packages/ui/src/hooks/use-session-state.ts` | Switch from legacy state polling to durable stream subscription or `/api/v1/state` |
-| Session metadata | Session/run records in Flamecast DB | Add `acpEndpoint`, `stateStreamUrl`, `helperApiUrl` fields |
+| State observation | `packages/ui/src/hooks/use-session-state.ts` | **Preferred**: subscribe to the durable stream directly. `/api/v1/state` is debug-only fallback. |
+| Session metadata | Session records in Flamecast DB | Add `acpEndpoint`, `stateStreamUrl`, `helperApiUrl` fields. **Source of truth lives on the session record**, not on a runtime/provider record — sessions are the durable object per the architecture SDD. Runtime metadata may also reference these URLs but they are derived, not authoritative. |
+
+### Canonical success path
+
+The session/Agents flow is the canonical path for Spike 3. The runtime page is **not** the success criterion. If runtime UI continues to work that's a bonus, but the spike succeeds when:
+
+1. A user creates a session backed by durable-acp-rs
+2. The session view uses ACP for prompts and the durable stream for state
+3. No legacy session-host REST appears in the happy path
 
 ## What NOT to change in durable-acp-rs
 
-Nothing. The Rust side is ready. Spike 3 is entirely a Flamecast integration spike.
+No Rust changes are expected for the happy path of Spike 3. The hosted conductor surface is sufficient as-is.
 
-The only durable-acp-rs change that might help: adding `--host 0.0.0.0` when starting the conductor for remote Flamecast access (already supported via the `--host` CLI flag).
+If Flamecast integration exposes a real gap (e.g., a missing helper field or a session-metadata endpoint), small Rust tweaks are fine — but treat them as scope additions, not the default mode.
+
+## Out of scope for Spike 3
+
+To prevent scope creep, these are explicitly NOT part of this spike:
+
+- Runtime page redesign or runtime-list UX work
+- Same-session reconnect continuation (reconnecting to an existing ACP session after WS drop)
+- Worker crash recovery via `load_session` replay (that's Spike 6)
+- Runtime/environment snapshotting (Spike 7)
+- Multi-tenant or auth-related Flamecast surface changes
+- Cross-process peer MCP refactoring
 
 ## Suggested implementation order
 
