@@ -247,7 +247,7 @@ function StatePanel() {
         <div style={{ color: "#666" }}>Prompt turns: {turns.length}</div>
         <div style={{ color: "#666" }}>Chunks: {state?.chunks ? Object.keys(state.chunks).length : 0}</div>
       </div>
-      {turns.slice(-5).map((t: any) => (
+      {[...turns].sort((a: any, b: any) => (b.startedAt || 0) - (a.startedAt || 0)).slice(0, 5).map((t: any) => (
         <div key={t.promptTurnId} style={{ padding: "0 12px", fontSize: 11, color: t.state === "completed" ? "#4ade80" : t.state === "active" ? "#fbbf24" : "#888" }}>
           {t.state} — {(t.text || "").slice(0, 50)}
         </div>
