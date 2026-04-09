@@ -107,6 +107,12 @@ impl StreamServer {
     }
 
     pub async fn rebuild_state(&self) -> Result<()> {
+        self.rebuild_state_into(&self.stream_db).await
+    }
+
+    /// Replay the persisted stream into a target StreamDb.
+    /// Used for verifying that replay produces the same state as live processing.
+    pub async fn rebuild_state_into(&self, target: &crate::state::StreamDb) -> Result<()> {
         let read = self
             .storage
             .read(
@@ -115,7 +121,7 @@ impl StreamServer {
             )
             .context("read state stream")?;
         for message in read.messages {
-            self.stream_db.apply_json_message(&message).await?;
+            target.apply_json_message(&message).await?;
         }
         Ok(())
     }

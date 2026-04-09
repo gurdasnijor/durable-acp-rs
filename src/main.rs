@@ -99,9 +99,17 @@ async fn main() -> Result<()> {
     let combined = Router::new().merge(product_api).merge(acp_transport);
     spawn_api_server(api_port, combined).await?;
 
-    // 5. Conductor — run over stdio unless explicitly in WS-only mode.
-    // When spawned as a subprocess (e.g., by the dashboard), stdin is a pipe (not a TTY)
-    // but still connected — we should run the stdio conductor.
+    // 5. Conductor mode selection.
+    //
+    // Default: stdio mode. The conductor reads/writes ACP JSON-RPC over stdin/stdout.
+    // This works for both:
+    //   - TTY usage (human running the binary directly)
+    //   - subprocess usage (dashboard/SDK spawns this binary with piped stdin/stdout)
+    //
+    // WS-only mode: set DURABLE_ACP_WS_ONLY=1 to skip the stdio conductor.
+    // The process stays alive serving only /acp WebSocket connections.
+    // Use this when the binary is started by a process manager that provides
+    // no meaningful stdin (e.g., systemd, Docker without -it).
     let ws_only = std::env::var("DURABLE_ACP_WS_ONLY").is_ok();
     if !ws_only {
         let agent = AcpAgent::from_args(cli.agent_command).context("parse agent command")?;
