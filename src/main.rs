@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -23,6 +23,10 @@ use durable_acp_rs::stream_server::StreamServer;
 struct Cli {
     #[arg(long, default_value_t = 4437)]
     port: u16,
+    /// Bind address for the stream server and API.
+    /// Use 0.0.0.0 for remote access.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
     #[arg(long, default_value = "durable-acp-state")]
     state_stream: String,
     #[arg(long, default_value = "default")]
@@ -39,7 +43,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.port);
+    let host: IpAddr = cli.host.parse().context("invalid --host address")?;
+    let bind = SocketAddr::new(host, cli.port);
 
     // 1. Infrastructure
     let stream_server = if let Ok(dir) = std::env::var("DATA_DIR") {
@@ -97,7 +102,7 @@ async fn main() -> Result<()> {
         connection_id: connection_id.clone(),
     });
     let combined = Router::new().merge(product_api).merge(acp_transport);
-    spawn_api_server(api_port, combined).await?;
+    spawn_api_server(host, api_port, combined).await?;
 
     // 5. Conductor mode selection.
     //
@@ -141,8 +146,8 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn spawn_api_server(port: u16, router: Router) -> Result<()> {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+async fn spawn_api_server(host: IpAddr, port: u16, router: Router) -> Result<()> {
+    let listener = TcpListener::bind(SocketAddr::new(host, port)).await?;
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

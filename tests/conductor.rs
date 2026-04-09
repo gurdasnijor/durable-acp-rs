@@ -2,7 +2,7 @@
 //!
 //! Uses `Testy` (the SDK's mock agent) + `yopo::prompt` (one-shot client)
 //! to test: Client → PeerMcpProxy → Agent with passive trace observation.
-//! State materialization comes from TraceEvents, not DurableStateProxy.
+//! State materialization comes from TraceEvents via DurableStreamTracer.
 
 use std::sync::Arc;
 

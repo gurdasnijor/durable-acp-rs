@@ -21,6 +21,7 @@ use common::TestApp;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum TestEvent {
     Ready(String),
     Text(String, String),

@@ -1,4 +1,4 @@
-//! Shared test helpers — replaces ConductorState for test setup.
+//! Shared test helpers for integration tests.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -9,15 +9,16 @@ use tokio::sync::Mutex;
 use durable_acp_rs::state::*;
 use durable_acp_rs::stream_server::StreamServer;
 
-/// Lightweight replacement for ConductorState in tests.
 /// Owns a StreamServer and connection identity, provides helpers
 /// for writing StateEnvelope events to the durable stream.
+#[allow(dead_code)]
 pub struct TestApp {
     pub stream_server: StreamServer,
     pub connection_id: String,
     seq: Mutex<HashMap<String, i64>>,
 }
 
+#[allow(dead_code)]
 impl TestApp {
     pub async fn new(ds: StreamServer) -> Self {
         let connection_id = uuid::Uuid::new_v4().to_string();
@@ -117,6 +118,7 @@ impl TestApp {
     }
 }
 
+#[allow(dead_code)]
 pub async fn test_ds() -> StreamServer {
     let tmp = tempfile::tempdir().unwrap();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -127,6 +129,7 @@ pub async fn test_ds() -> StreamServer {
     ds
 }
 
+#[allow(dead_code)]
 pub async fn test_app() -> Arc<TestApp> {
     let ds = test_ds().await;
     Arc::new(TestApp::new(ds).await)
